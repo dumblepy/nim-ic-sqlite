@@ -1,0 +1,90 @@
+## Stable-memory abstraction. All offsets and sizes are byte based.
+
+const StablePageSize* = 64'u64 * 1024'u64
+
+type StableBackend* = ref object of RootObj
+
+method sizePages*(backend: StableBackend): uint64 {.base.} =
+  raise newException(CatchableError, "StableBackend.sizePages is not implemented")
+
+method grow*(backend: StableBackend; pages: uint64): bool {.base.} =
+  raise newException(CatchableError, "StableBackend.grow is not implemented")
+
+method read*(backend: StableBackend; offset: uint64; dst: pointer; size: uint64) {.base.} =
+  raise newException(CatchableError, "StableBackend.read is not implemented")
+
+method write*(backend: StableBackend; offset: uint64; src: pointer; size: uint64) {.base.} =
+  raise newException(CatchableError, "StableBackend.write is not implemented")
+
+type OffsetStableBackend* = ref object of StableBackend
+  raw: StableBackend
+  baseOffset: uint64
+
+proc newOffsetStableBackend*(raw: StableBackend; baseOffset: uint64): OffsetStableBackend =
+  if raw.isNil: raise newException(ValueError, "nil raw stable backend")
+  if baseOffset mod StablePageSize != 0:
+    raise newException(ValueError, "stable region offset must be page aligned")
+  OffsetStableBackend(raw: raw, baseOffset: baseOffset)
+
+method sizePages*(backend: OffsetStableBackend): uint64 =
+  let basePages = backend.baseOffset div StablePageSize
+  let physicalPages = backend.raw.sizePages
+  if physicalPages <= basePages: 0 else: physicalPages - basePages
+
+method grow*(backend: OffsetStableBackend; pages: uint64): bool =
+  let basePages = backend.baseOffset div StablePageSize
+  let physicalPages = backend.raw.sizePages
+  if physicalPages < basePages and not backend.raw.grow(basePages - physicalPages):
+    return false
+  backend.raw.grow(pages)
+
+method read*(backend: OffsetStableBackend; offset: uint64; dst: pointer; size: uint64) =
+  if offset > high(uint64) - backend.baseOffset:
+    raise newException(ValueError, "stable region read offset overflow")
+  backend.raw.read(backend.baseOffset + offset, dst, size)
+
+method write*(backend: OffsetStableBackend; offset: uint64; src: pointer; size: uint64) =
+  if offset > high(uint64) - backend.baseOffset:
+    raise newException(ValueError, "stable region write offset overflow")
+  backend.raw.write(backend.baseOffset + offset, src, size)
+
+type VecStableBackend* = ref object of StableBackend
+  bytes: seq[byte]
+
+proc newVecStableBackend*(): VecStableBackend =
+  VecStableBackend(bytes: @[])
+
+proc byteLen(backend: VecStableBackend): uint64 {.inline.} =
+  uint64(backend.bytes.len)
+
+proc inRange(backend: VecStableBackend; offset, size: uint64): bool {.inline.} =
+  offset <= backend.byteLen and size <= backend.byteLen - offset
+
+method sizePages*(backend: VecStableBackend): uint64 =
+  uint64(backend.bytes.len) div StablePageSize
+
+method grow*(backend: VecStableBackend; pages: uint64): bool =
+  if pages == 0:
+    return true
+  if pages > uint64(high(int)) div StablePageSize:
+    return false
+  let extra = pages * StablePageSize
+  if extra > uint64(high(int)) - backend.byteLen:
+    return false
+  let oldLen = backend.bytes.len
+  backend.bytes.setLen(oldLen + int(extra))
+  true
+
+method read*(backend: VecStableBackend; offset: uint64; dst: pointer; size: uint64) =
+  if size == 0:
+    return
+  if dst.isNil or not backend.inRange(offset, size):
+    raise newException(ValueError, "stable read is outside allocated pages")
+  copyMem(dst, unsafeAddr backend.bytes[int(offset)], int(size))
+
+method write*(backend: VecStableBackend; offset: uint64; src: pointer; size: uint64) =
+  if size == 0:
+    return
+  if src.isNil or not backend.inRange(offset, size):
+    raise newException(ValueError, "stable write is outside allocated pages")
+  copyMem(addr backend.bytes[int(offset)], src, int(size))

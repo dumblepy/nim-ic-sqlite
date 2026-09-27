@@ -1,0 +1,129 @@
+import std/[strutils, tables]
+import ../stable/[backend, superblock]
+import ./[lock, overlay, temp_file]
+
+const
+  SqliteOk* = 0.cint
+  SqliteCantOpen* = 14.cint
+  SqliteIoErr* = 10.cint
+  SqliteIoErrRead* = 266.cint
+  SqliteIoErrWrite* = 778.cint
+  SqliteIoErrShortRead* = 522.cint
+  SqliteReadOnly* = 8.cint
+
+type FileKind* = enum fkMainDb, fkTemp
+type FileState* = ref object
+  kind*: FileKind
+  temp: TempFile
+  lock: LockState
+
+var storage*: StableBackend
+var databaseSize*: uint64
+var activeOverlay*: Overlay
+var overlayActive*: bool
+var nextHandleId = 1'u32
+var files = initTable[uint32, FileState]()
+var lastError = ""
+var randomState = 1'u64
+var currentTimeNanoseconds*: uint64
+var configuredMaxDirtyPages = high(uint64)
+var configuredMaxDirtyBytes = high(uint64)
+
+when defined(wasm32):
+  proc ic0TimeNanoseconds(): uint64 {.importc: "ic0_time", cdecl, header: "ic0.h".}
+
+proc vfsTimeNanoseconds*(): uint64 =
+  ## Native tests inject a deterministic value; canisters use consensus time.
+  when defined(wasm32): ic0TimeNanoseconds()
+  else: currentTimeNanoseconds
+
+proc setLastError*(message: string) = lastError = message
+proc lastErrorMessage*(): string = lastError
+proc initVfs*(backend: StableBackend; dbSize = 0'u64; seed = 1'u64;
+              maxDirtyPages = high(uint64); maxDirtyBytes = high(uint64)) =
+  storage = backend; databaseSize = dbSize; randomState = seed; files.clear(); nextHandleId = 1
+  configuredMaxDirtyPages = maxDirtyPages; configuredMaxDirtyBytes = maxDirtyBytes
+  overlayActive = false
+proc beginOverlay*(pageSize = 16384'u32) =
+  if storage.isNil: raise newException(ValueError, "VFS backend is not configured")
+  activeOverlay = initOverlay(databaseSize, pageSize,
+    maxDirtyPages = configuredMaxDirtyPages, maxDirtyBytes = configuredMaxDirtyBytes)
+  overlayActive = true
+proc endOverlay*(publish = false) =
+  if publish: activeOverlay.publishDirtyPages(storage); databaseSize = activeOverlay.size
+  activeOverlay.discardOverlay(); overlayActive = false
+proc openFile*(name: string; flags: cint; handleId: var uint32; outFlags: var cint): cint =
+  if name.endsWith("-wal"): return SqliteCantOpen
+  let state = FileState(kind: if name == "/main.db": fkMainDb else: fkTemp,
+    temp: initTempFile(), lock: initLockState())
+  if nextHandleId == 0: return SqliteIoErr
+  handleId = nextHandleId; inc nextHandleId; files[handleId] = state; outFlags = flags; SqliteOk
+proc closeFile*(handleId: uint32): cint =
+  if not files.hasKey(handleId): return SqliteIoErr
+  files.del(handleId); SqliteOk
+proc stateFor(handleId: uint32): FileState =
+  if not files.hasKey(handleId): raise newException(ValueError, "unknown VFS handle")
+  files[handleId]
+proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cint =
+  if dst.isNil or amount < 0 or offset < 0: return SqliteIoErrRead
+  try:
+    let state = stateFor(handleId); let size = int(amount)
+    var bytes: seq[byte]
+    var short = false
+    if state.kind == fkTemp:
+      short = int(offset) + size > state.temp.len; bytes = state.temp.readAt(int(offset), size)
+    elif overlayActive:
+      short = uint64(offset) + uint64(size) > activeOverlay.size
+      bytes = activeOverlay.readAt(storage, uint64(offset), uint64(size))
+    else:
+      bytes = newSeq[byte](size); short = uint64(offset) + uint64(size) > databaseSize
+      let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
+      if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), addr bytes[0], readable)
+    if size > 0: copyMem(dst, addr bytes[0], size)
+    if short: SqliteIoErrShortRead else: SqliteOk
+  except CatchableError as error: setLastError(error.msg); SqliteIoErrRead
+proc writeFile*(handleId: uint32; src: pointer; amount: cint; offset: int64): cint =
+  if src.isNil or amount < 0 or offset < 0: return SqliteIoErrWrite
+  try:
+    let state = stateFor(handleId); let size = int(amount); var bytes = newSeq[byte](size)
+    if size > 0: copyMem(addr bytes[0], src, size)
+    if state.kind == fkTemp: state.temp.writeAt(int(offset), bytes)
+    elif not overlayActive: return SqliteReadOnly
+    else: activeOverlay.writeAt(storage, uint64(offset), bytes)
+    SqliteOk
+  except CatchableError as error: setLastError(error.msg); SqliteIoErrWrite
+proc truncateFile*(handleId: uint32; size: int64): cint =
+  if size < 0: return SqliteIoErr
+  try:
+    let state = stateFor(handleId)
+    if state.kind == fkTemp: state.temp.truncate(int(size))
+    elif overlayActive: activeOverlay.truncate(uint64(size))
+    else: return SqliteReadOnly
+    SqliteOk
+  except CatchableError as error: setLastError(error.msg); SqliteIoErr
+proc fileSize*(handleId: uint32; size: var int64): cint =
+  try:
+    let state = stateFor(handleId)
+    size = if state.kind == fkTemp: state.temp.len.int64
+      elif overlayActive: activeOverlay.size.int64 else: databaseSize.int64
+    SqliteOk
+  except CatchableError as error: setLastError(error.msg); SqliteIoErr
+proc lockFile*(handleId: uint32; level: cint): cint =
+  try:
+    if stateFor(handleId).lock.lock(LockLevel(level)): SqliteOk else: SqliteIoErr
+  except CatchableError: SqliteIoErr
+proc unlockFile*(handleId: uint32; level: cint): cint =
+  try:
+    if stateFor(handleId).lock.unlock(LockLevel(level)): SqliteOk else: SqliteIoErr
+  except CatchableError: SqliteIoErr
+proc reservedFile*(handleId: uint32; reserved: var cint): cint =
+  try:
+    reserved = if stateFor(handleId).lock.checkReservedLock: 1 else: 0
+    SqliteOk
+  except CatchableError: SqliteIoErr
+proc randomBytes*(dst: pointer; amount: cint): cint =
+  if dst.isNil or amount < 0: return 0
+  for index in 0 ..< int(amount):
+    randomState = randomState xor (randomState shl 13); randomState = randomState xor (randomState shr 7); randomState = randomState xor (randomState shl 17)
+    cast[ptr UncheckedArray[byte]](dst)[index] = byte(randomState)
+  amount

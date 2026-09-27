@@ -1,0 +1,98 @@
+import nicp_cdk
+import std/options
+import ic_sqlite
+import ic_sqlite/stable/ic_backend
+
+var database: Db
+var databaseReady = false
+
+proc greet() {.query.} =
+  let request = Request.new()
+  reply("Hello, " & request.getStr(0) & "!")
+
+proc ensureDatabase(): string =
+  if databaseReady: return ""
+  let initialized = database.init(newIcStableBackend())
+  if not initialized.isOk: return initialized.error.message
+  databaseReady = true
+  ""
+
+proc selectOne() {.update.} =
+  ## Intentionally fixed SQL: the example must not expose arbitrary SQL over
+  ## the public canister interface.
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let executed = database.exec("SELECT 1")
+  if not executed.isOk:
+    reply("error: " & executed.error.message)
+    return
+  reply("ok")
+
+proc createTable() {.update.} =
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let created = database.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
+  if not created.isOk:
+    reply("error: " & created.error.message)
+    return
+  reply("ok")
+
+proc put() {.update.} =
+  let request = Request.new()
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let saved = database.execText(
+    "INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [request.getStr(0), request.getStr(1)])
+  if not saved.isOk:
+    reply("error: " & saved.error.message)
+    return
+  reply("ok")
+
+proc get() {.update.} =
+  let request = Request.new()
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let found = database.queryOneText("SELECT value FROM kv WHERE key = ?", [request.getStr(0)])
+  if not found.isOk:
+    reply("error: " & found.error.message)
+  elif found.value.isSome:
+    reply(found.value.get)
+  else:
+    reply("not_found")
+
+proc update() {.update.} =
+  let request = Request.new()
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let changed = database.execText("UPDATE kv SET value = ? WHERE key = ?", [request.getStr(1), request.getStr(0)])
+  if not changed.isOk:
+    reply("error: " & changed.error.message)
+  elif changed.value == 1:
+    reply("ok")
+  else:
+    reply("not_found")
+
+proc deleteValue() {.update.} =
+  let request = Request.new()
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let changed = database.execText("DELETE FROM kv WHERE key = ?", [request.getStr(0)])
+  if not changed.isOk:
+    reply("error: " & changed.error.message)
+  elif changed.value == 1:
+    reply("ok")
+  else:
+    reply("not_found")

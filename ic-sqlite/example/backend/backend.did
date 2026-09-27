@@ -1,0 +1,9 @@
+service : {
+  greet : (text) -> (text) query;
+  selectOne : () -> (text);
+  createTable : () -> (text);
+  put : (text, text) -> (text);
+  get : (text) -> (text);
+  update : (text, text) -> (text);
+  deleteValue : (text) -> (text);
+};

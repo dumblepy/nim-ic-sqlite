@@ -1,0 +1,180 @@
+---
+description: ic-sqlite / nicp_cdk integration project rules
+alwaysApply: true
+---
+
+# プロジェクトルール
+
+このプロジェクトの主目的は、`ic-sqlite` を **Nim + nicp_cdk で実装した Internet Computer (ICP) キャニスターから、stable memory 上の SQLite を実用的かつ安全に利用できる完成したライブラリ**にすることである。
+
+設計書は `/application/design/nim_ic_sqlite_vfs_design.md` を参照すること。
+
+実装先は `/application/ic-sqlite/` とする。`/application/` 直下には設計書 (`design/`)・Dockerfile・compose.yaml・PROGRESS.md・エージェントルールのみを配置し、コードはすべて `/application/ic-sqlite/` 以下に配置する。
+
+## 0. 規範表現
+
+この文書では RFC 2119 相当の意味で以下を用いる。
+
+- **MUST**: 必須。満たさない変更は完成とみなさない。
+- **MUST NOT**: 禁止。
+- **SHOULD**: 強い推奨。採用しない場合は理由を明示する。
+- **MAY**: 任意。
+
+規範ルールには `NISQL-<DOMAIN>-<NNN>` 形式の Rule ID を付ける。
+
+## 1. 実装対象
+
+### 1.1 ic-sqlite — 主実装対象
+
+[NISQL-ARCH-001][MUST] 実装先は `/application/ic-sqlite/` とする。
+
+[NISQL-ARCH-002][MUST] 設計書 `/application/design/nim_ic_sqlite_vfs_design.md` の全セクションを実装する。ただしフェーズ順（設計書 54節）に従い、Phase 0 → Phase 1 → ... と段階的に進めてよい。
+
+[NISQL-ARCH-003][MUST] `PROGRESS.md` に定義された完了条件をすべて満たすまで完成扱いしない。
+
+[NISQL-ARCH-004][MUST] Nim 利用者は通常のアプリケーションコードから Rust の型、Rust の所有権、raw C pointer、static archive のパス、SQLite C API の詳細を意識せず SQLite を利用できるようにする。
+
+[NISQL-ARCH-005][MUST] 低水準 FFI と高水準 Nim API を分離する。`src/nim_ic_sqlite_vfs/ffi/` に `importc`、`cdecl`、header、link、target 判定を閉じ込め、一般利用者は `import nim_ic_sqlite_vfs` を正規入口とする。
+
+### 1.2 nicp_cdk — Nim ICP 実行基盤
+
+[NISQL-CDK-001][MUST] SQLite の永続領域は `nicp_cdk` の stable memory API と共存できるようにし、他の stable data structure の領域を破壊してはならない。
+
+[NISQL-CDK-002][SHOULD] `nicp_cdk` 自体への変更は、`ic-sqlite` だけの都合で入れるのではなく、CDK として妥当な一般的修正が必要な場合に限定する。
+
+## 2. 正規アーキテクチャ
+
+正規の呼び出し経路は以下とする（設計書 5節）。
+
+```text
+Nim ICP canister
+    │
+    │ nicp_cdk
+    ▼
+ic-sqlite DB facade
+    │
+    ▼
+sqlite_api.nim (FFI bindings)
+    │
+    ▼
+SQLite C core (sqlite3.c)
+    │
+    ▼
+C ABI shim (sqlite3_vfs / sqlite3_io_methods)
+    │
+    ▼
+Nim VFS implementation
+    │
+    ▼
+Stable backend (ic0_stable64_*)
+    │
+    ▼
+ICP Stable memory
+```
+
+[NISQL-ARCH-006][MUST] SQLite のデータ本体は stable memory に置き、POSIX filesystem や通常の WASI filesystem を永続ストレージとして必要としない構成を正規とする。
+
+## 3. C ABI / FFI
+
+[NISQL-FFI-001][MUST] ABI 境界へ出してよい型は、固定幅整数、C互換 scalar、pointer、length、callback function pointer、`repr(C)` struct など C ABI 互換型のみとする。
+
+[NISQL-FFI-002][MUST NOT] Nim exception を C/SQLite callback 境界の外へ伝播させない。すべての export callback は `raises: []` を原則とし、失敗は SQLite error code へ変換する（設計書 6節）。
+
+[NISQL-FFI-003][MUST] callback が受け取る pointer は callback の呼び出し中だけ有効とする。Nim 側は必要なデータを callback 内でコピーし、pointer を保存してはならない。
+
+[NISQL-FFI-004][MUST] C shim の struct layout（`IcFile` の `sqlite3_file` 先頭フィールド等）と Nim 側の handle registry の整合性を担保する。
+
+## 4. Stable memory
+
+[NISQL-MEM-001][MUST] IC stable memory の page size は 64 KiB として扱う。
+
+[NISQL-MEM-002][MUST] 最初の実装は exclusive stable memory mode（設計書 9.1節）とし、superblock を offset 0、DB image を offset 64 KiB から配置する。
+
+[NISQL-MEM-003][MUST] superblock は Nim object の binary dump ではなく、固定 little-endian encoding（設計書 11節）で serialize/deserialize する。
+
+[NISQL-MEM-004][MUST] foreign stable memory 検出（設計書 12節）を実装し、magic "NIMSQLV1" 不一致時はエラーを返す。
+
+## 5. Update transaction / Overlay
+
+[NISQL-TXN-001][MUST] update 中の xWrite は stable memory へ直接書き込まず、heap overlay（設計書 18節）へ書き込む。
+
+[NISQL-TXN-002][MUST] SQLite COMMIT 成功後に dirty page を stable memory へ反映し、最後に superblock を更新する（設計書 20-21節）。
+
+[NISQL-TXN-003][MUST] stable publish 開始後の不可逆段階でエラーが発生した場合は、`ic0_trap` して message rollback に任せる（設計書 21節）。
+
+[NISQL-TXN-004][MUST] update transaction 中は `await` / inter-canister call / `ic0.call_perform` を禁止する。`withUpdate` の body は同期 proc に限定する（設計書 22節）。
+
+[NISQL-TXN-005][MUST] `synchronous=OFF`、`journal_mode=MEMORY`、`temp_store=MEMORY`、`locking_mode=EXCLUSIVE` を write connection の PRAGMA として適用する（設計書 17節）。
+
+## 6. Build
+
+[NISQL-BLD-001][MUST] SQLite を `SQLITE_OS_OTHER=1`、`SQLITE_THREADSAFE=0`、`SQLITE_OMIT_WAL`、`SQLITE_TEMP_STORE=3`、`SQLITE_OMIT_LOAD_EXTENSION`、`SQLITE_OMIT_SHARED_CACHE` でビルドする（設計書 7節）。
+
+[NISQL-BLD-002][MUST] WASI SDK の clang で wasm32-wasi 向け static archive を生成する（設計書 8節）。
+
+[NISQL-BLD-003][MUST] 最終 Wasm は ic-wasi-polyfill + wasi2ic 経由で ICP canister WASM を生成する。
+
+## 7. ディレクトリ構造
+
+[NISQL-DIR-001][MUST] 設計書 38節の推奨ディレクトリ構成に従い、`/application/ic-sqlite/` 以下に構築する。
+
+```
+/application/ic-sqlite/
+├── nim_ic_sqlite_vfs.nimble
+├── README.md
+├── LICENSE
+├── build/
+├── scripts/
+│   └── build_sqlite.sh
+├── vendor/
+│   └── sqlite/
+│       ├── sqlite3.c
+│       └── sqlite3.h
+├── c/
+│   ├── ic_sqlite_vfs_shim.c
+│   ├── ic_sqlite_vfs_shim.h
+│   └── sqlite_helpers.c
+├── src/
+│   └── nim_ic_sqlite_vfs/
+│       ├── db.nim
+│       ├── connection.nim
+│       ├── statement.nim
+│       ├── value.nim
+│       ├── migration.nim
+│       ├── ffi/
+│       │   ├── sqlite_api.nim
+│       │   └── vfs_exports.nim
+│       ├── vfs/
+│       │   ├── vfs.nim
+│       │   ├── file.nim
+│       │   ├── temp_file.nim
+│       │   ├── overlay.nim
+│       │   └── lock.nim
+│       └── stable/
+│           ├── backend.nim
+│           ├── ic_backend.nim
+│           ├── region.nim
+│           ├── superblock.nim
+│           ├── stable_blob.nim
+│           └── checksum.nim
+├── tests/
+│   ├── test_superblock.nim
+│   ├── test_overlay.nim
+│   ├── test_stable_blob.nim
+│   ├── test_sqlite_vfs.nim
+│   └── test_upgrade/
+└── examples/
+    └── minimal_kv/
+```
+
+## 8. 実装フェーズ
+
+設計書 54節のフェーズに従う。
+
+[NISQL-PHASE-001][MUST] Phase 0 (build PoC) → Phase 1 (C VFS shim) → Phase 2 (stable main DB) → Phase 3 (transaction overlay) → Phase 4 (DB facade) の順で実装する。
+
+[NISQL-PHASE-002][MUST] 各 Phase の完了条件を `PROGRESS.md` で検証可能な形で定義し、満たしてから次の Phase に進む。
+
+[NISQL-PHASE-003][MUST] Phase 3 (overlay) 完了前の実装は production で write を許可しない。
+
+
