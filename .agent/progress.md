@@ -88,8 +88,8 @@
 
 ## 作業記録
 
-- 現在の問題: なし。example canister の実行経路を含む統合テストを追加・検証済み。
-- 試したこと: existing `example` canister に migration-aware 初期化、migration 数を返す query、query annotation を追加し、Nim の `osproc` から `icp` を実行する統合テストを追加した。
+- 現在の問題: なし。example canister の実行経路を含む統合テストと英語の利用ガイドを追加済み。
+- 試したこと: existing `example` canister に migration-aware 初期化、migration 数を返す query、query annotation を追加し、Nim の `osproc` から `icp` を実行する統合テストを追加した。README を英語の API・canister 利用ガイドに拡充した。
 - 結果: test は deploy、migration、CRUD、upgrade 後の stable-memory 永続化を一連で検証する構成になった。初回コンパイルでは Nim の予約語 `method` を引数名に使ったため失敗し、`methodName` へ修正した。初回実行では残存 local network により起動できなかったため、開始前・終了時に対象 project の network を停止するよう修正した。さらに daemonized network start の stdout を `execCmdEx` が待ち続けることを確認し、起動だけは出力非捕捉の `execShellCmd` に切り替えた。`nimble test`（終了コード 0）、`nimble build`、`actionlint .github/workflows/ci.yml`、`git diff --check` は成功した。
 - 否定された仮説: native `initMemoryForTest` だけで canister の実行経路を十分に検証できるという仮説。wasm build・lifecycle hook・Candid call を通らないため採用しない。
 - 次に試すこと: なし。
