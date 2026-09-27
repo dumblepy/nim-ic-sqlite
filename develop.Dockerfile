@@ -91,12 +91,6 @@ RUN sh init.sh -y
 RUN rm -f init.sh
 ENV PATH $PATH:/root/.nimble/bin
 
-# `ic_sqlite.nimble` requires nicp_cdk by package name. Install it while the
-# image is built so fresh CI containers can resolve the dependency without a
-# pre-populated Nimble cache or a workspace-local `nimble develop` step.
-RUN nimble install -y https://github.com/dumblepy/nicp_cdk && \
-    nimble path nicp_cdk
-
 # nimlangserver
 # https://github.com/nim-lang/langserver/releases/latest
 WORKDIR /root
@@ -106,6 +100,13 @@ RUN curl -o nimlangserver.tar.gz -L https://github.com/nim-lang/langserver/relea
 RUN tar zxf nimlangserver.tar.gz
 RUN rm -f nimlangserver.tar.gz
 RUN mv nimlangserver /root/.nimble/bin/
+
+# `ic_sqlite.nimble` requires nicp_cdk by package name. Install it while the
+# image is built so fresh CI containers can resolve the dependency without a
+# pre-populated Nimble cache or a workspace-local `nimble develop` step.
+RUN nimble install -y https://github.com/dumblepy/nicp_cdk && \
+    nimble path nicp_cdk
+RUN nicp cHeaders
 
 
 # check command installed successfully
