@@ -11,7 +11,7 @@
 - git add, git commitのコマンド操作は禁止。
 - 常に日本語で回答する。
 
-# Autonomous development policy
+<!-- # Autonomous development policy
 
 このプロジェクトでは、タスク実装時に以下の自律ループを完了条件が満たされるまで繰り返す。
 
@@ -76,4 +76,4 @@
 - 変更内容
 - 原因
 - 実行した検証
-- 各完了条件の結果
+- 各完了条件の結果 -->

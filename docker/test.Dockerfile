@@ -105,7 +105,7 @@ RUN mv nimlangserver /root/.nimble/bin/
 # `/opt` is not hidden when Compose bind-mounts the workspace at /application.
 COPY nicp_cdk /opt/nicp_cdk
 RUN cd /opt/nicp_cdk && \
-    nimble develop -y && \
+    nimble --sync -y install && \
     nimble path nicp_cdk
 RUN nicp cHeaders
 

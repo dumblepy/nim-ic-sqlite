@@ -24,6 +24,12 @@
 - `actionlint .github/workflows/ci.yml` が終了コード 0 で完了する。
 - workflow が recursive submodule checkout 後に、コンテナ内で `nimble test` を実行し、その task 内で `./scripts/build_sqlite.sh` と canister integration test を実行する。
 
+### GitHub Actions の nicp_cdk インストール
+
+完了条件:
+- `docker/test.Dockerfile` が submodule の `nicp_cdk` を `nimble --sync -y install` で導入し、その直後の `nimble path nicp_cdk` でパッケージを解決する。
+- 空の Nimble ディレクトリで `cd nicp_cdk && nimble --sync -y install` が終了コード 0 で完了し、`nimble path nicp_cdk` と `nicp` CLI が利用できる。
+
 ### Example canister integration
 
 完了条件:
@@ -87,6 +93,12 @@
 - [x] NISQL-GOAL-001: 全完了条件を再実行して成功
 
 ## 作業記録
+
+- 現在の問題: GitHub Actions の Docker image build で `nicp_cdk` の `nimble develop -y` が依存解決に失敗し、`base32`、`illwill`、`cligen`、`nim-rustcrypto` が欠落した。
+- 試したこと: 隔離した空の Nimble ディレクトリで逐次解決 `--sync` を使って依存を取得し、`develop` と `install` の登録結果を比較した。
+- 結果: `--sync` では依存取得が成功。`develop` では `nimble path nicp_cdk` が失敗したが、`install` は CLI をビルドし `nimble path nicp_cdk` と `nicp --help` が成功した。Dockerfile を `nimble --sync -y install` に変更した。`cd ic-sqlite && nimble test` は native test、WASI SQLite build、canister deploy・CRUD を含め終了コード 0 で完了した。`nimble build` と `git diff --check` も成功した。
+- 否定された仮説: `develop` だけで Dockerfile 後続の `nimble path nicp_cdk` と `nicp cHeaders` のための CLI 配置まで保証できるという仮説。
+- 次に試すこと: GitHub Actions で image build を再実行して確認する。この環境には Docker CLI/daemon がないため Docker build 自体は未実行。
 
 - 現在の問題: canister の `config.nims` が一時的な `build/` 配下の SQLite archive と C object を直接参照しており、fresh checkout と bind mount のいずれでも成果物の場所が明確でなかった。
 - 試したこと: `nim-rustcrypto` の vendor-first・target別配置を参考に、`build_sqlite.sh` の wasm32-wasi 成果物を `vendor/sqlite/wasm32-wasi/` へ統一した。両 example の `config.nims` は同ディレクトリを変数化して archive と C shim object を link するよう変更し、生成物は専用 `.gitignore` で非追跡にした。
