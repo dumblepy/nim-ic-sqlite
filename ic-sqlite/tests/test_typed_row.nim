@@ -62,3 +62,29 @@ suite "typed row reader":
     check not write.isOk
     check write.error.kind == dekInvalidQuery
     db.close()
+
+  test "enforces result-row and parameter limits":
+    var config = defaultDbConfig()
+    config.maxResultRows = 1
+    config.maxQueryParams = 1
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    let tooManyRows = readRows[RequiredId](db,
+      "SELECT 1 AS id UNION ALL SELECT 2 AS id")
+    check not tooManyRows.isOk
+    check tooManyRows.error.kind == dekResourceLimit
+    let tooManyParams = readRows[RequiredId](db,
+      "SELECT ? AS id WHERE ? = ?", [sqlInt(1), sqlInt(1), sqlInt(1)])
+    check not tooManyParams.isOk
+    check tooManyParams.error.kind == dekResourceLimit
+    db.close()
+
+  test "enforces result byte limit using SQLite column sizes":
+    var config = defaultDbConfig()
+    config.maxResultBytes = 3
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    let tooLarge = readRows[RequiredName](db, "SELECT 'four' AS name")
+    check not tooLarge.isOk
+    check tooLarge.error.kind == dekResourceLimit
+    db.close()

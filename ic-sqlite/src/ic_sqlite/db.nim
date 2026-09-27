@@ -32,6 +32,9 @@ type
     maxDirtyBytes*: uint64
     maxSqlBytes*: uint64
     maxBlobBytes*: uint64
+    maxResultRows*: uint64
+    maxResultBytes*: uint64
+    maxQueryParams*: uint64
   Db* = object
     raw: ptr Sqlite3
     backend: StableBackend
@@ -58,11 +61,18 @@ const Wasi2icReservedStablePages = 1025'u64
 
 proc defaultDbConfig*(): DbConfig =
   DbConfig(maxDirtyPages: 4096, maxDirtyBytes: 64'u64 * 1024 * 1024,
-    maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024)
+    maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
+    maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
+    maxQueryParams: 999)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
-    config.maxSqlBytes > 0 and config.maxBlobBytes > 0
+    config.maxSqlBytes > 0 and config.maxBlobBytes > 0 and
+    config.maxResultRows > 0 and config.maxResultBytes > 0 and
+    config.maxQueryParams > 0
+
+proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
+  (db.config.maxResultRows, db.config.maxResultBytes, db.config.maxQueryParams)
 
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
   ## wasi2ic reserves stable memory under the MGR+version header. Preserve that
@@ -321,6 +331,7 @@ proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
 
 proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
 
+
 proc withQuery*[T](db: var Db;
                    body: proc(conn: var Connection): Result[T, DbError] {.closure.}
                   ): Result[T, DbError] =
@@ -375,6 +386,9 @@ proc finalize*(statement: var Statement) =
 proc parameterCount*(statement: Statement): int =
   if statement.raw.isNil: 0 else: int(sqlite3_bind_parameter_count(statement.raw))
 
+proc queryLimits*(statement: Statement): tuple[maxRows, maxBytes, maxParams: uint64] =
+  if statement.db.isNil: (0'u64, 0'u64, 0'u64) else: statement.db[].queryLimits()
+
 proc isReadonly*(statement: Statement): bool =
   not statement.raw.isNil and sqlite3_stmt_readonly(statement.raw) != 0
 
@@ -424,6 +438,9 @@ proc columnName*(statement: Statement; index: int): string =
   if statement.raw.isNil: return ""
   let name = sqlite3_column_name(statement.raw, index.cint)
   if name.isNil: "" else: $name
+
+proc columnBytes*(statement: Statement; index: int): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_column_bytes(statement.raw, index.cint))
 
 proc columnInt64*(statement: Statement; index: int): int64 =
   sqlite3_column_int64(statement.raw, index.cint)

@@ -53,3 +53,28 @@ suite "query compiler":
     check compiled.value.sql == "SELECT * FROM \"users\" WHERE \"id\" IN (?, ?) AND 1 AND \"age\" BETWEEN ? AND ?"
     check compiled.value.params.len == 4
     check db.table("users").whereIn("id", newSeq[int64]()).compile().value.sql == "SELECT * FROM \"users\" WHERE 0"
+
+  test "groups OR conditions without interpolating values":
+    var db: Db
+    let compiled = db.table("users").where("active", "=", true)
+      .whereGroup(proc(b: var PredicateBuilder) =
+        b.where("role", "=", "admin")
+        b.orWhere("role", "=", "moderator")
+      ).compile()
+    check compiled.isOk
+    check compiled.value.sql == "SELECT * FROM \"users\" WHERE \"active\" = ? AND (\"role\" = ? OR \"role\" = ?)"
+    check compiled.value.params.len == 3
+
+  test "compiles GROUP BY and HAVING after WHERE":
+    var db: Db
+    let compiled = db.table("events")
+      .select("kind")
+      .where("active", "=", true)
+      .groupBy("kind")
+      .having("kind", "!=", "ignored")
+      .orderBy("kind")
+      .compile()
+    check compiled.isOk
+    check compiled.value.sql == "SELECT \"kind\" FROM \"events\" WHERE \"active\" = ? GROUP BY \"kind\" HAVING \"kind\" != ? ORDER BY \"kind\" ASC"
+    check compiled.value.params.len == 2
+    check not db.table("events").having("kind", "=", "x").compile().isOk

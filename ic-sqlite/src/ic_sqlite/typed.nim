@@ -87,6 +87,17 @@ proc decodeRow*[T](statement: Statement; typ: typedesc[T]; rowIndex: int): Resul
     field = decoded.value
   Result[T, DbError](isOk: true, value: row)
 
+proc rowBytes(statement: Statement): uint64 =
+  for index in 0 ..< statement.columnCount:
+    case statement.columnType(index)
+    of SqliteText, SqliteBlob:
+      let bytes = statement.columnBytes(index)
+      if bytes > 0: result += uint64(bytes)
+    of SqliteInteger, SqliteFloat:
+      result += 8
+    else:
+      discard
+
 proc readRows*[T](db: var Db; sql: string; params: openArray[SqlValue] = []): Result[seq[T], DbError] =
   let boundValues = @params
   db.withQuery(proc(conn: var Connection): Result[seq[T], DbError] =
@@ -94,6 +105,10 @@ proc readRows*[T](db: var Db; sql: string; params: openArray[SqlValue] = []): Re
     if not prepared.isOk: return Result[seq[T], DbError](isOk: false, error: prepared.error)
     var statement = prepared.value
     defer: statement.finalize()
+    let limits = statement.queryLimits()
+    if uint64(boundValues.len) > limits.maxParams:
+      return Result[seq[T], DbError](isOk: false, error: decodeError(dekResourceLimit,
+        "query parameter count exceeds maxQueryParams", $limits.maxParams, $boundValues.len))
     if statement.parameterCount != boundValues.len:
       return Result[seq[T], DbError](isOk: false, error: decodeError(dekBind,
         "SQL placeholder count does not match bound values", $statement.parameterCount, $boundValues.len))
@@ -104,12 +119,21 @@ proc readRows*[T](db: var Db; sql: string; params: openArray[SqlValue] = []): Re
       let bound = statement.bind(index + 1, value)
       if not bound.isOk: return Result[seq[T], DbError](isOk: false, error: bound.error)
     var rowIndex = 0
+    var resultBytes = 0'u64
     while true:
       let stepped = statement.step()
       if not stepped.isOk: return Result[seq[T], DbError](isOk: false, error: stepped.error)
       if stepped.value == srDone: break
       let decoded = decodeRow(statement, T, rowIndex)
       if not decoded.isOk: return Result[seq[T], DbError](isOk: false, error: decoded.error)
+      if uint64(rowIndex) >= limits.maxRows:
+        return Result[seq[T], DbError](isOk: false, error: decodeError(dekResourceLimit,
+          "result row count exceeds maxResultRows", $limits.maxRows, $(rowIndex + 1)))
+      let bytes = rowBytes(statement)
+      if bytes > limits.maxBytes - min(resultBytes, limits.maxBytes):
+        return Result[seq[T], DbError](isOk: false, error: decodeError(dekResourceLimit,
+          "result data exceeds maxResultBytes", $limits.maxBytes, $(resultBytes + bytes)))
+      resultBytes += bytes
       result.value.add(decoded.value)
       inc rowIndex
     Result[seq[T], DbError](isOk: true, value: result.value)

@@ -7,7 +7,7 @@ import ./stable/superblock
 
 type
   SortOrder* = enum Asc, Desc
-  PredicateKind* = enum pkCompare, pkNull, pkNotNull, pkIn, pkNotIn, pkBetween
+  PredicateKind* = enum pkCompare, pkNull, pkNotNull, pkIn, pkNotIn, pkBetween, pkGroup
   Predicate* = object
     kind*: PredicateKind
     column*: string
@@ -15,6 +15,9 @@ type
     value*: SqlValue
     values*: seq[SqlValue]
     connector*: string
+    children*: seq[Predicate]
+  PredicateBuilder* = object
+    predicates: seq[Predicate]
   JoinClause* = object
     tableName*: string
     alias*: string
@@ -34,6 +37,8 @@ type
     predicates*: seq[Predicate]
     joins*: seq[JoinClause]
     orders*: seq[OrderClause]
+    groupColumns*: seq[string]
+    havingPredicates*: seq[Predicate]
     limitValue*: Option[int64]
     offsetValue*: Option[int64]
   CompiledQuery* = object
@@ -98,6 +103,19 @@ proc whereBetween*[T](q: Query; column: string; low, high: T): Query =
   result.predicates.add(Predicate(kind: pkBetween, column: column,
     values: @[toSqlValue(low), toSqlValue(high)], connector: "AND"))
 
+proc where*[T](b: var PredicateBuilder; column, op: string; value: T) =
+  b.predicates.add(Predicate(kind: pkCompare, column: column, op: op, value: toSqlValue(value), connector: "AND"))
+
+proc orWhere*[T](b: var PredicateBuilder; column, op: string; value: T) =
+  b.predicates.add(Predicate(kind: pkCompare, column: column, op: op, value: toSqlValue(value), connector: "OR"))
+
+proc whereGroup*(q: Query; body: proc(builder: var PredicateBuilder) {.closure.}): Query =
+  var builder: PredicateBuilder
+  body(builder)
+  result = q
+  if builder.predicates.len > 0:
+    result.predicates.add(Predicate(kind: pkGroup, connector: "AND", children: builder.predicates))
+
 proc join*(q: Query; tableName, alias, leftColumn, op, rightColumn: string): Query =
   result = q
   result.joins.add(JoinClause(tableName: tableName, alias: alias, leftColumn: leftColumn, op: op, rightColumn: rightColumn))
@@ -109,6 +127,15 @@ proc leftJoin*(q: Query; tableName, alias, leftColumn, op, rightColumn: string):
 proc orderBy*(q: Query; column: string; direction = Asc): Query =
   result = q
   result.orders.add(OrderClause(column: column, direction: direction))
+
+proc groupBy*(q: Query; columns: varargs[string]): Query =
+  result = q
+  for column in columns: result.groupColumns.add(column)
+
+proc having*[T](q: Query; column, op: string; value: T): Query =
+  result = q
+  result.havingPredicates.add(Predicate(kind: pkCompare, column: column, op: op,
+    value: toSqlValue(value), connector: "AND"))
 
 proc limit*(q: Query; count: int64): Query =
   result = q
@@ -149,9 +176,21 @@ proc compile*(q: Query): Result[CompiledQuery, DbError] =
     sql.add(if join.leftOuter: " LEFT JOIN " else: " JOIN ")
     sql.add(tableName.value & " AS " & alias.value & " ON " & leftColumn.value & " " & join.op & " " & rightColumn.value)
   for index, predicate in q.predicates:
+    sql.add(if index == 0: " WHERE " else: " " & predicate.connector & " ")
+    if predicate.kind == pkGroup:
+      sql.add("(")
+      for childIndex, child in predicate.children:
+        if child.kind != pkCompare or child.op notin ["=", "!=", "<", "<=", ">", ">=", "LIKE"]:
+          return Result[CompiledQuery, DbError](isOk: false, error: queryError("whereGroup supports comparison predicates only"))
+        let childColumn = quoteIdentifier(child.column)
+        if not childColumn.isOk: return Result[CompiledQuery, DbError](isOk: false, error: childColumn.error)
+        if childIndex > 0: sql.add(" " & child.connector & " ")
+        sql.add(childColumn.value & " " & child.op & " ?")
+        result.value.params.add(child.value)
+      sql.add(")")
+      continue
     let column = quoteIdentifier(predicate.column)
     if not column.isOk: return Result[CompiledQuery, DbError](isOk: false, error: column.error)
-    sql.add(if index == 0: " WHERE " else: " " & predicate.connector & " ")
     case predicate.kind
     of pkNull: sql.add(column.value & " IS NULL")
     of pkNotNull: sql.add(column.value & " IS NOT NULL")
@@ -174,6 +213,27 @@ proc compile*(q: Query): Result[CompiledQuery, DbError] =
     of pkCompare:
       if predicate.op notin ["=", "!=", "<", "<=", ">", ">=", "LIKE"]:
         return Result[CompiledQuery, DbError](isOk: false, error: queryError("unsupported comparison operator: " & predicate.op))
+      sql.add(column.value & " " & predicate.op & " ?")
+      result.value.params.add(predicate.value)
+    of pkGroup:
+      discard
+  if q.groupColumns.len > 0:
+    sql.add(" GROUP BY ")
+    for index, groupColumn in q.groupColumns:
+      let column = quoteIdentifier(groupColumn)
+      if not column.isOk: return Result[CompiledQuery, DbError](isOk: false, error: column.error)
+      if index > 0: sql.add(", ")
+      sql.add(column.value)
+  if q.havingPredicates.len > 0:
+    if q.groupColumns.len == 0:
+      return Result[CompiledQuery, DbError](isOk: false, error: queryError("HAVING requires GROUP BY"))
+    sql.add(" HAVING ")
+    for index, predicate in q.havingPredicates:
+      if predicate.kind != pkCompare or predicate.op notin ["=", "!=", "<", "<=", ">", ">=", "LIKE"]:
+        return Result[CompiledQuery, DbError](isOk: false, error: queryError("unsupported HAVING predicate"))
+      let column = quoteIdentifier(predicate.column)
+      if not column.isOk: return Result[CompiledQuery, DbError](isOk: false, error: column.error)
+      if index > 0: sql.add(" " & predicate.connector & " ")
       sql.add(column.value & " " & predicate.op & " ?")
       result.value.params.add(predicate.value)
   if q.orders.len > 0:

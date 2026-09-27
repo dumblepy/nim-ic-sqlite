@@ -132,5 +132,6 @@ sqlite3_vfs IC_VFS = {
   NULL, NULL, NULL, NULL
 };
 
-int sqlite3_os_init(void) { return sqlite3_vfs_register(&IC_VFS, 1); }
+int ic_sqlite_register_vfs(void) { return sqlite3_vfs_register(&IC_VFS, 1); }
+int sqlite3_os_init(void) { return ic_sqlite_register_vfs(); }
 int sqlite3_os_end(void) { return SQLITE_OK; }
