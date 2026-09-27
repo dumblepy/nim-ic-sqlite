@@ -1,0 +1,359 @@
+---
+description: 7-cost-performance-test ブランチでの開発時に読み込む
+alwaysApply: false
+---
+
+# nim-ic-sqlite / ic-sqlite-vfs 比較テスト設計書
+
+- 文書ID: NISQL-BENCH-DESIGN-001
+- 版: 1.0（実装前設計）
+- 作成日: 2026-09-27
+- 主言語: **Nim**（テストハーネス、Nim製ベンチマークCanister、Native単体テスト）
+- 比較対象: `dumblepy/nim-ic-sqlite`、`humandebri/ic-sqlite-vfs`
+- 実施状況: **設計のみ。ベンチマーク値、合否および実行成功を示すものではない。**
+
+## 1. 目的・判定対象
+
+「Nim版がRust版と同等にメモリを扱え、ICPのランニングコストを削減できるか」を、説明文ではなく**同じ入力・同じメッセージ境界・観測可能な数値とデータ整合性**で検証する。下記を別個に判定する。
+
+1. **正しさ**: CRUD、トランザクション、失敗時のrollback、upgrade、truncate後の再拡張でデータが正しいこと。
+2. **容量再利用**: 同じ論理データ範囲に対する反復更新、delete/insertで、確保済み容量を再利用し物理Stable Memoryが不必要に増加しないこと。
+3. **メモリ所有・共存**: Nim単独領域、`MGR`接頭部検出時、別のstable利用者との衝突・領域外I/Oに関する挙動を明示すること。
+4. **実行コスト**: 同一workloadのUpdate命令数を両実装で測ること。query命令数は性能指標として別掲し、そのまま課金Cyclesと見なさない。
+5. **長期費用**: raw Stable Memory、Heap、命令数および構成条件から、同一Subnet料金表・保有期間を用いて推計し、可能な場合は管理APIの消費Cycles分類で照合すること。
+
+**非目標**: Rust実装をNimに移植すること、ライブラリの全APIの優劣を評点化すること、メインネットの実料金をローカル計測値だけで断定すること、他実装間でSQLite DBの生バイトイメージが互換であると仮定すること。
+
+## 2. 根拠となる現行実装と前提
+
+### 2.1 Nim側
+
+- 独自VFS、Heap Overlay、`publishDirtyPages` は [`vfs.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/vfs/vfs.nim)、[`overlay.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/vfs/overlay.nim)。
+- `IcStableBackend` は64KiBページの `stable64_size/grow/read/write` を使用。[`ic_backend.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/stable/ic_backend.nim)。
+- `DbConfig` の初期値は `maxDirtyPages=4096`、`maxDirtyBytes=64MiB`。SQLiteページサイズ16384、`journal_mode=MEMORY`、`synchronous=OFF`、`temp_store=MEMORY`、`cache_size=-32768`。[`db.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/db.nim)。
+- `sqliteStableBackend` はraw先頭に `MGR` を検出した場合、1025 stable pagesをSQLite用領域の前に置く。これは固定オフセット方式であり、Rust版のMemoryId仮想メモリと同義ではない。
+- `Superblock` に `zeroExtents` のフィールドとencode/decodeは存在する一方、現状の `persistMetadata` はそれを設定しておらず、`beginOverlay` も復元しない。**正しさを検証する対象**であり、テスト側で修正済みと仮定しない。
+- 既存の[`test_example_canister.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/tests/test_example_canister.nim) はdeploy/CRUD/upgrade確認を行う。実際の容量・命令数の継続比較とは別。
+
+### 2.2 Rust側
+
+- 既存ベンチマーク [`benchmarks/kv-canister`](https://github.com/humandebri/ic-sqlite-vfs/tree/main/benchmarks/kv-canister) と [`kv_bench.did`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/benchmarks/kv-canister/kv_bench.did) を基準に使う。
+- 既存churn試験は初期5,000件、各周回で1,000件DELETE→1,000件INSERTを100周回。[`churn_capacity.test.mjs`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/tests/pocketic/churn_capacity.test.mjs)。
+- Rust側 `memory::size_pages()` はSQLiteに渡された**選択中のVirtualMemory**を計測する。Nim側のraw `ic0_stable64_size()` とはそのまま比較しない。Rust側のraw物理ページ数も、比較用の観測専用endpointを追加して収集する。
+- 両側の比較用KVテーブルは `WITHOUT ROWID`、SQLite page size 16,384 bytes、同一PRAGMAを使用する。コンパイルフラグ、SQLite本体バージョン、Wasm最適化フラグをマニフェストに残し、差がある場合は交絡要因として明記する。
+
+### 2.3 再現性の固定
+
+初回実行前に両repoの**完全なGit commit SHA**、submodule SHA、Rust toolchain、Nim・WASI SDK・SQLiteバージョン、PocketIC/ICP CLIバージョン、Subnet構成、WasmファイルのSHA-256を保存する。`main` を参照するURLは参考リンクであり、評価本番ではSHA固定のcheckoutを使う。実装の修正前・修正後は別run IDにする。
+
+## 3. テストアーキテクチャ
+
+```text
+Nim host runner (testament / std unittest / osproc)
+  ├── Workload spec / generator / assertions / CSV+JSONL writer
+  ├── Candid transport adapter (PocketIC HTTP または検証済み icp CLI)
+  └── 1 run = 独立した初期状態・設定・Wasmハッシュ
+       ├── Nim benchmark canister  -> nim-ic-sqlite -> custom VFS -> raw stable memory
+       ├── Rust benchmark canister -> ic-sqlite-vfs -> VirtualMemory -> raw stable memory
+       └── 任意の既存 wasi2ic benchmark canister（第三の参考比較）
+```
+
+**Nimでテストを書く**とは、テスト制御とNim側CanisterをNimで実装する意味である。Rust側は既存RustベンチマークCanisterをコンパイル・デプロイしてCandid経由で呼び出す。RustライブラリをNimプロセスへリンクしない。
+
+原則として各実装のCanisterは**同じSubnet種類・同じPocketIC/Replica版、同じ初期Cycles、同じfresh state**で実行する。`bench_reset` はDBテーブルを初期化するだけでStable Memoryのhigh-waterをゼロに戻さないため、異なるシナリオでCanisterを使い回さない。長期churn内では逆に同一Canisterを保持して伸長を追跡する。
+
+### 3.1 提案するディレクトリ
+
+```text
+ic-sqlite/
+  benchmarks/comparison/
+    DESIGN.md                       # この設計書の配置先
+    bench_manifest.json             # version, SHA, build flags
+    shared/bench_spec.nim           # SQL、キー、値、workload定義
+    shared/bench_report.nim         # 結果/指標の型と単位
+    nim_canister/backend/src/main.nim
+    nim_canister/backend/bench.did
+    nim_canister/backend/config.nims
+    runner/main.nim                 # Nimテスト入口
+    runner/transport.nim            # Candidを返す抽象インターフェース
+    runner/validate.nim             # cross-implのassertion
+    runner/report.nim               # csv/jsonl/md書き出し
+    tests/test_keys.nim
+    tests/test_overlay_growth.nim
+    tests/test_zero_extent_persistence.nim
+    tests/test_failure_atomicity.nim
+    tests/test_memory_region.nim
+    results/<run-id>/manifest.json
+    results/<run-id>/measurements.csv
+    results/<run-id>/measurements.jsonl
+    results/<run-id>/summary.md
+```
+
+既存のRust側 [`kv_bench.did`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/benchmarks/kv-canister/kv_bench.did) を変更せず利用するのが第一選択。raw物理ページ数や追加観測点が必要な場合のみ、**計測用ブランチ**に`bench_host_stats`等のread-only endpointを追加し、オリジナルとの差分・Wasmハッシュを残す。
+
+### 3.2 Transportとデータ整形
+
+`Transport` の責務: `install(wasm, initArgs)`, `upgrade(wasm)`, `update(canister, method, args)`, `query(...)`, `readCanisterMetrics(...)`（環境が対応する場合）、`snapshot(...)`。テスト本体にはCLI出力文字列の正規表現解析を置かず、**CandidバイナリまたはCLIで検証済みのmachine-readable形式**をデコードする。CLIにJSON出力オプションがあると決め打ちしない。PocketICの直接クライアントをNimで実装する場合も、CandidとREST仕様のバージョンを固定する。
+
+## 4. 比較用DB・データ・メッセージ境界
+
+### 4.1 スキーマ
+
+```sql
+CREATE TABLE bench (
+  key TEXT PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE churn_bench (
+  key TEXT PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL
+) WITHOUT ROWID;
+```
+
+通常のKVとchurn用テーブルは分離する。Nim版サンプル既存の `kv` テーブルのまま比較しない（`WITHOUT ROWID` の有無で結果が変わる）。`PRAGMA page_size`, `page_count`, `freelist_count`, `journal_mode`, `synchronous`, `temp_store`, `cache_size`, `auto_vacuum` を初期化直後に採取する。自動VACUUMを片側だけで有効にしない。
+
+### 4.2 データ生成（Rust版既存fixtureに合わせる）
+
+| 値 | 生成ルール | index=42の例 |
+|---|---|---|
+| `bench_key(i)` | `k` + 8桁ゼロ詰め | `k00000042` |
+| `churn_key(i)` | `c` + 8桁ゼロ詰め | `c00000042` |
+| `bench_value(i)` | `value-` + 8桁 + `-stable-vfs` | `value-00000042-stable-vfs` |
+| `updated_value(i)` | `updated-` + 8桁 + `-stable-vfs` | `updated-00000042-stable-vfs` |
+
+Nimで固定長ASCII生成器を実装し、0、42、9,999、10,000、99,999,999でRust `key.rs` の結果と照合する。ベンチマーク内の乱数、時計、外部HTTP、ログ出力、未確定のハッシュマップ反復順序は避ける。`BenchReport.checksum` はRust既存実装に合わせて**メソッド別**に定義する（`bench_reset`/`bench_insert_only`/`bench_update_only` は対象行数、`bench_read` は読んだTEXT値のバイト長の合計）。このフィールドだけでは全レコードの内容一致を証明できないため、別の非計測 `verify_fixture` で行数・決定論的キー/値ダイジェストを照合する。非ASCIIを使う追加ケースでは文字数とUTF-8バイト長を区別する。
+
+### 4.3 APIと計測窓
+
+Rust既存Candid APIに合わせ、Nim側に少なくとも下記を追加する。
+
+```candid
+// 実装時はRust版 kv_bench.did と正確に型を一致させる。
+type BenchReport = record {
+  rows : nat64; instructions : nat64; checksum : nat64;
+  db_size : nat64; stable_pages : nat64; stable_bytes : nat64;
+};
+type BenchChurnStepReport = record {
+  cycle : nat64; phase : text; rows : nat64; instructions : nat64;
+  row_count : nat64; db_size : nat64; stable_pages : nat64;
+  stable_bytes : nat64; sqlite_page_size : nat64;
+  sqlite_page_count : nat64; sqlite_freelist_count : nat64;
+};
+type DbStatsReport = record {
+  db_size : nat64; stable_pages : nat64; stable_bytes : nat64;
+  sqlite_page_size : nat64; sqlite_page_count : nat64;
+  sqlite_freelist_count : nat64;
+};
+service : {
+  bench_reset : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_insert_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_read : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
+  bench_churn_reset : (nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  bench_churn_delete : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  bench_churn_insert : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  db_stats : () -> (variant { Ok : DbStatsReport; Err : text }) query;
+};
+```
+
+`DbStatsReport` を含む全定義は実装時にRust `kv_bench.did` の固定commitと照合する。追加の物理・仮想観測値は拡張endpoint `bench_host_stats` に分け、Rust版既存の `stable_pages` の意味を黙って変更しない。Nim版 `stable_pages` は「SQLite領域の論理page数」、物理ページ数は別名 `raw_stable_pages` とする。選択中のVirtualMemoryとrawを混同しない。
+
+Nim側Canisterの性能カウンタは [`nicp_cdk/ic0/ic0.nim`](https://github.com/dumblepy/nicp_cdk/blob/main/src/nicp_cdk/ic0/ic0.nim) にある `ic0_performance_counter(0'u32)` を使う。**core命令数**は `start` を対象処理直前、`stop` をSQLite COMMIT直後・DB statsやレスポンス組立てより前に置く。Rust版 `BenchReport` の通常の `report()` はメタデータ収集前に命令数を確定するが、既存 `churn_report()` はstats/行数照会**後**にカウンタ差分を取る。したがってchurnには (a) Rust既存のlegacy窓にNimも合わせた `instructions_legacy`、(b) 両側の計測用ブランチにCOMMIT直後の採取点を追加した `instructions_core` を**別系列**で記録する。(b)が未実装ならchurnのcore命令数を比較不能とし、legacy同士のみ比較する。`report`生成やchecksum全走査を一方だけ計測窓へ含めない。同期 `withUpdate` 一回を一つのUpdate messageとし、計測窓内で `await`、inter-canister call、管理Canister callを行わない。失敗時は `Err` またはtrapを記録して、存在しない命令数値で平均化しない。
+
+**Prepared statementの公平性**: Rust側が一度prepareしてbind/stepを繰り返すworkloadでは、Nim側も同様のstatement再利用ができるベンチマーク専用経路を用いる。Nimの `queryOneText()` をキーごとに繰り返してRustのprepared point-readと比較し「VFS差」と解釈しない。別に「公開APIそのまま」試験を設け、API設計・接続生成の差として報告する。現行Nimの安定したreset/rebind公開経路で同条件を作れない場合はbenchmark-only FFI adapterを追加して差分を明記し、実装できるまでその項目を「比較不能」とする。
+
+## 5. 観測値と単位
+
+| フィールド | 取得方法 | 単位・解釈 |
+|---|---|---|
+| `instructions_update` / `instructions_query` | performance_counter(0)の差 | 命令数、別集計 |
+| `db_size` | SQLiteファイル論理サイズまたはsuperblockのDBサイズ | bytes |
+| `sqlite_page_size`, `sqlite_page_count`, `sqlite_freelist_count` | 各PRAGMA | bytes、pages、pages |
+| `sqlite_used_bytes` | `(page_count - freelist_count) * page_size` | 推定値。DBページの厳密な空き容量ではない |
+| `sqlite_virtual_pages` | SQLite専用backend `sizePages()` / Rust selected VirtualMemory `size_pages` | 64KiB pages。各backendの定義を併記 |
+| `raw_stable_pages` | **双方で** `ic0_stable64_size` | Canister全体の物理Stable Memoryのhigh-water pages |
+| `raw_stable_bytes` | `raw_stable_pages * 65536` | bytes |
+| `grow_calls`, `grow_pages`, `read_bytes`, `write_bytes` | 観測専用ラッパーを介して集計 | 対象をrawかvirtualか明記。計測instrumentationの負荷は分離 |
+| `dirty_pages_peak`, `dirty_bytes_peak` | Overlayにread-only統計を追加 | Heap上のdirty page概算 |
+| `wasm_heap_bytes` | 使用可能なCanister/管理API指標 | raw Stableとは別。未取得なら`null` |
+| `cycles_balance`, `cycles_consumed_*` | `canister_status` / 対応環境の`canister_metrics` | cycles。採取時刻、初期補充額と経過時間を記録 |
+| `row_count`, `value_checksum` | SQL/共通算式 | 正しさの判定指標 |
+| `duration` | ホスト計測（参考） | ms。PocketIC/CLI通信時間込み、課金額ではない |
+
+**必須**: raw physical pagesとSQLite virtual pagesの両方を収集する。`memory.size_pages()` と `ic0_stable64_size()` の差は「同じものの誤差」ではなく、MemoryManagerメタデータ、予約域、他構造物等の差である。最低でも `init前`、`init後`、`seed後`、`各churn後`、`upgrade後` を採取。加えて `raw_stable_pages` の開始値を差し引く増分指標と、開始値を含む絶対値の双方を示す。
+
+## 6. テストマトリクス・期待結果
+
+合否は各実装について独立に付け、次に同じ指標で比較する。最初から「両者の全数値が一致」を合格条件にしない。最重要のfail-fast条件は**データ不整合、隣接領域破壊、rollback後の変更残存**。
+
+| ID | 区分 | 手順・パラメータ | 主なassertion / 結果 |
+|---|---|---|---|
+| N01 | Native backend | `VecStableBackend`、64KiB grow、境界read/write、オフセット外アクセス | 範囲内のみ成功、外部sentinel不変 |
+| N02 | In-place write | 基底の1ページへ同じサイズで100回書く | 変更ページだけpublish、上書きで追加growなし |
+| N03 | dirty制限 | `maxDirtyPages`と`maxDirtyBytes`をそれぞれ超過 | publish前エラー、旧DB不変 |
+| C01 | Fresh footprint | Fresh Canisterへinstall、migrationのみ | raw/virtual/heapの絶対値、SQLite設定記録 |
+| C02 | INSERT | Fresh状態に1,000/5,000件、1 Update message | 同じ行数・キー・checksum。命令数・grow量記録 |
+| C03 | Update | 1,000/5,000件seed後、同件数のPK UPDATE | checksum正、前後raw pagesとinstructions記録 |
+| C04 | Point read | `1,10,100,1000`件 | 同一準備方式、query命令数とchecksum。公開API版は別系列 |
+| C05 | Existing-capacity | 1,000件seed後、既存キーへサイズ一定の更新を128回 | warm-up後のraw pages増分=0を期待する。virtual pagesも観察 |
+| C06 | Churn | 5,000件seed、DELETE1,000→新規INSERT1,000を100周 | 各DELETE後4,000、INSERT後5,000行。raw/virtual pages、`page_count/freelist_count`全段階を出力 |
+| C07 | Growth then reuse | 5,000件seed後に成長させ、既存ページを256回更新 | 追加growしないか、capacity報告の前後値を検証 |
+| C08 | Upgrade | データ、checksum、statsを採取→同一版Wasm upgrade→再照会 | 値・行数・DBサイズが保たれ、追加grow理由を記録 |
+| C09 | Rollback | 複数write後、bodyが`Err`を返す／捕捉例外を投げる | old row、DB checksum、物理DBイメージの関連bytes不変。trap経路は別テスト |
+| C10 | Publish failure | `grow`前、最初のwrite前、複数page中、superblock前の注入 | publish開始後はtrap等で**ICP message単位**rollback。再入後に旧データを照合 |
+| C11 | Truncate/re-grow | 大きなDBを縮小、同じ物理位置を再拡張→再起動 | 古いtailデータがSQL/VFSで見えない。ZeroExtent復元を検証 |
+| C12 | Reservation | Nim fresh/raw空、MGR検出あり、MGR以外のforeign headerを別々に実行 | 1025ページoffset発生条件、raw増分、他データ保全、非対応なら安全に拒否 |
+| C13 | Isolation | 異なるメモリ利用者のsentinelとSQLite操作を混在 | 互いの領域が不変。Nimの複数DB同時利用は未対応ならその旨を記録し、成功扱いしない |
+| C14 | Resource budget | 64KiB/256KiB blob、結果件数上限、巨大更新 | 失敗時の整合性、命令上限超過の有無、dirty上限 |
+| C15 | Cost accounting | C01–C07で採取したmetricから同じ料金表でモデル計算 | 更新費用と継続保管費用の内訳、追加固定費、測定不能値を明示 |
+
+### 6.1 Churnの正確なキー範囲
+
+```
+seed:      c00000000 .. c00004999
+cycle j:   delete [j*1000, j*1000+999]
+           insert [5000+j*1000, 5999+j*1000]
+           0 <= j < 100
+```
+
+DELETEとINSERTは**それぞれ独立したUpdate message・SQLite transaction**。各段階ごとに `row_count`、`db_size`、raw/virtual page数、SQLite freelistを保存。Rust既存テストと同じ条件にし、初回INSERT後以降の容量変化と最終high-waterを別々に集計する。容量を増やすケースは即「Rustに劣る」とはせず、SQLテーブル設定、MGR予約、SQLiteバージョン、NimのOverlay経路、計測対象の違いを先に分解する。
+
+### 6.2 Zero Extentと失敗注入は2層で実施
+
+- **Native決定論的試験**: `VecStableBackend` または `FailingBackend` に旧データ・nonzero sentinelを予め配置し、`truncate -> persist/reopen -> grow` の各境界で読み出す。Superblock `zeroExtents` の実値、checksum、有効範囲をassertする。`grow` / `write` のn回目を失敗させるinjectorでpublishの段階を覆う。
+- **Canister統合試験**: テスト用endpointだけにfailpointを導入し、trap後のICPメッセージrollbackとupgradeを検証。Nativeでwrite途中にエラーが発生した状態の永続化を模倣するだけでは、ICPのrollbackを検証したことにはならない。通常のSQL `VACUUM` が所望のページ配置・truncateを再現できない場合、ベンチマーク専用VFS診断口を使い、その試験を「内部storage試験」と「実SQL経由試験」に分ける。
+
+**既知の検証仮説**: Nim側 `persistMetadata` が `zeroExtents` を書き出さず、`beginOverlay` が復元しない場合、C11の一部に失敗する可能性がある。失敗を隠す修正をテストへ先行して入れず、まず再現ログを取る。修正版との比較はcommitを分離する。
+
+### 6.3 MGR/他構造物との共存の扱い
+
+Nimの `sqliteStableBackend()` はMGRヘッダー検出で**固定1025ページ**の開始オフセットを使う。Rustの `MemoryManager` はMemoryIdを持つ仮想領域を動的に割り当てる。したがって、比較条件を次のように分離する。
+
+- **Nim A**: 空のraw Stable MemoryでSQLiteが先頭から所有するケース。
+- **Nim B**: テスト専用の既存MGR形式のraw領域を使うケース。適法なmetadata配置と初期raw page数を明示し、他コンポーネントのデータを破壊しないことを検査。`MGR`の3バイトだけを書いて実装可能な共存を証明したと扱わない。
+- **Rust C**: MemoryId=120にSQLiteを割り当てるケース。他IDのsentinelも確認する。
+
+比較表には rawの**絶対ページ数**とbaseline差分に加え、SQLite専用仮想ページ数を並べる。Nim Bに対して「1025ページは常に新規課金される」と断定せず、事前確保済みraw pagesとテスト中の新規growを別計上する。
+
+## 7. 計測・分析・料金換算
+
+### 7.1 反復と測定方法
+
+- 各短期シナリオはfresh Canisterで少なくとも**5独立run**。コンパイル・installを測るかどうかは別指標とし、通常のSQL操作時間に混ぜない。
+- 1回目はcold、2回目以降をwarmとラベルし、メディアン、最小/最大、各runのrawデータを保存。PocketICは決定論的でも、温度・状態・Wasm差をメタデータ化する。
+- 既存prepared queryを温める操作は計測窓外で行い、warm実施を両実装に揃える。追加のHeap/キャッシュが生じる場合はstatsへ記録。
+- 実装差以外にメッセージの個数が異なると、基本料金やページキャッシュが変わる。1 transaction = 1 messageを維持し、DB接続・prepare/rebindを含む範囲を明記する。
+- 実行超過やtrapは試行結果として残す。成功した試行だけを集めて「同じ負荷を完走した」としない。
+
+### 7.2 指標と演算
+
+```
+raw_growth_pages = max(raw_stable_pages_step) - raw_stable_pages_initial
+storage_high_water_bytes = 65536 * max(raw_stable_pages_step)
+virtual_growth_pages = max(sqlite_virtual_pages_step) - sqlite_virtual_pages_initial
+instruction_ratio = median(Nim instructions_update) / median(Rust instructions_update)
+storage_ratio_abs = Nim raw_stable_bytes / Rust raw_stable_bytes  # 同一条件・同一時点のみ
+storage_ratio_incremental = Nim raw_growth_bytes / Rust raw_growth_bytes
+```
+
+分母0の場合は比率を`null`にし、**差分のバイト数**を表示する。`page_count`と`freelist_count`を併記し、「DB論理ファイルが大きい」ことと「Canister全体のraw物理使用量が大きい」ことを区別する。100周回のchurnは総命令数、周回ごとの命令数、最大raw pages、初期/最終DBサイズを併記する。
+
+### 7.3 Cycles換算
+
+主報告は**観測値**、費用は**明示した前提の推計値**として別の表にする。料金係数は実行日に [ICP公式Cycle Costs](https://docs.internetcomputer.org/references/cycle-costs/) から取得し、値・取得日・Subnetノード数をmanifestに保存する。
+
+```
+estimated_update_cycles = sum(update_base_fee_per_message + instruction_fee_per_instruction * instructions_update)
+estimated_storage_cycles = sum_over_intervals((allocated_stable_bytes + allocated_heap_bytes) / GiB * price_per_GiB_per_second * interval_seconds)
+```
+
+この式はUpdateと保管費用の簡略モデル。ingress byte、ネットワーク、compute allocation、storage reservation、その他管理処理は別項目とする。Canisterの残高差だけを「DB実行Cycles」と扱わない。管理Canister `canister_metrics` が対象環境で使える場合、`cycles_consumed.instructions`、`.memory` 等の差分も取得する。PocketICがその計測に対応しない場合は `not_available` と記録し、推測値で埋めない。local queryのperformance-counter命令数からmainnet query課金を推定しない。
+
+**ランニングコストの報告例（数値は実測後に記入）**: 「5,000件を保持し毎日1,000件を更新、30日」の仮定のもとで、初期/最大/定常raw memory、Heap、1日当たりUpdate件数、実測中央値命令数をモデルへ入れ、Nim A、Nim B、Rust Cの3系列を算出する。価格・期間・処理量は必ず同じにする。
+
+## 8. 結果ファイル・トレーサビリティ
+
+`measurements.csv` は1行を「実装×run×シナリオ×ステップ」にする。推奨カラム:
+
+```csv
+run_id,implementation,repo_sha,wasm_sha256,scenario,trial,cycle,phase,rows,success,error_kind,instructions_update,instructions_query,db_size,sqlite_page_size,sqlite_page_count,sqlite_freelist_count,sqlite_virtual_pages,raw_stable_pages,raw_stable_bytes,raw_growth_pages,dirty_pages_peak,heap_bytes,row_count,value_checksum,instruction_window
+```
+
+`measurements.jsonl` にはCSVで表せないbuild flags、各grow/read/write instrumentation、cycles API応答、実行前後時刻、APIエラー、未取得理由を保存。`summary.md` は次の順序で生成する。
+
+1. 使用した全バージョン・commit・Wasmハッシュと測定環境。
+2. correctness / rollback / upgrade / isolation試験の合否（SKIPや比較不能を区別）。
+3. Fresh footprint、INSERT/UPDATE/READ/Churnのraw/virtual/Heapの別集計。
+4. Update命令数の中央値・runごとの生データ・計測窓。
+5. 同一料金係数で計算したCycles推計と感度分析。
+6. 未解決の差分と再現手順。未測定を「差なし」と書かない。
+
+## 9. 実装順序と受け入れ条件
+
+| Phase | 実装内容 | 完了条件 |
+|---|---|---|
+| P0 | manifest、キー/値fixture、CSV/JSONL型、Native unit tests | Nim/Rustの生成値一致、型と単位が明示される |
+| P1 | Nim bench canister、`db_stats`、`bench_reset/insert/update/read`、raw/virtual観測 | Candid呼出し成功、SQL結果が既存Rust canisterと一致 |
+| P2 | Nim runnerから両Wasmをfresh環境にinstall、PocketIC/CLI transportを統一 | 同一入力を5run実行、SHA付きartifactが出る |
+| P3 | churn/growth/upgrade/失敗注入/ZeroExtent/MGR試験 | 各stepと異常系の結果を保存、再現可能な失敗ログが残る |
+| P4 | performance-counter、Heap、cycles metrics、料金係数の導入 | 命令数と物理/仮想メモリを混同せず集計可能 |
+| P5 | 自動レポート・回帰試験をCIへ追加 | 成功・失敗・SKIP・比較不能が機械判定される |
+
+**受け入れ基準**: (a) 正しさの差分が説明できる、(b) 物理/仮想メモリの二重計測がある、(c) 5,000件×100churn全ステップが欠測なく記録される、(d) 比較可能なUpdate命令数が取得される、(e) 同じ料金係数・期間で推計できる、(f) 既知のZeroExtent・1025ページ・global VFS制約が試験対象に含まれる。性能の合格ライン（例: Rust比1.0以下）は**事前の仕様では設けない**。まず事実を取得して、機能保証のpass/failと性能差を別々に提示する。
+
+## 10. リスク・留意事項
+
+- **最大の交絡**: Rust既存 `stable_pages`（選択VirtualMemory）とNim/raw `stable64_size` の直接比較、`WITHOUT ROWID` の有無、SQLite版差、1 Updateあたりtransaction数の違い。
+- **MGRへの対応**: 接頭部検出と完全なMemoryManager互換性は別。異なる所有者の動的growを同時に行う試験で初めて共存性を確認できる。
+- **Nim側VFSのグローバル変数**: 単一DB前提の測定と複数DB試験を混ぜない。未対応をテスト用の共有state改造で隠さない。
+- **ZeroExtent**: 再open時まで含めて検証する。Overlayだけのnativeテスト成功を永続化成功の根拠にしない。
+- **計測負荷**: ホットパスへ毎回ログを出すと命令数が変わる。カウンタ付きinstrumented buildとproduction-like buildの値を分離する。
+- **Wasm/Heap**: Nim版のWASI polyfill・予約領域の影響をHeap/絶対raw memoryに分解する。Nim AとNim Bは異なる構成として報告する。
+- **料金**: Storageはhigh-waterや保有期間に依存する。DELETEだけで物理容量が縮むと仮定しない。料金表は固定の古いUSD値を使い回さない。
+
+## 11. 参照先
+
+### 実装・テスト
+
+- Nim: https://github.com/dumblepy/nim-ic-sqlite
+- Nim DB/VFS: https://github.com/dumblepy/nim-ic-sqlite/tree/main/ic-sqlite/src/ic_sqlite
+- Rust: https://github.com/humandebri/ic-sqlite-vfs
+- Rust Candid benchmark contract: https://github.com/humandebri/ic-sqlite-vfs/blob/main/benchmarks/kv-canister/kv_bench.did
+- Rust deterministic key fixtures: https://github.com/humandebri/ic-sqlite-vfs/blob/main/benchmarks/kv-canister/src/key.rs
+- Rust churn test: https://github.com/humandebri/ic-sqlite-vfs/blob/main/tests/pocketic/churn_capacity.test.mjs
+- Rust capacity reasoning: https://github.com/humandebri/ic-sqlite-vfs/blob/main/docs/CAPACITY_GROWTH_PROOF.md
+
+### IC仕様・費用
+
+- Interface Specification（performance counter / stable memory）: https://docs.internetcomputer.org/references/ic-interface-spec/
+- Official Cycle Costs: https://docs.internetcomputer.org/references/cycle-costs/
+- Management canister（canister_metrics）: https://docs.internetcomputer.org/references/management-canister/
+- PocketIC: https://docs.internetcomputer.org/guides/testing/pocket-ic/
+
+---
+
+**この文書の使い方**: 実装前にP0でGit SHAと両側Candid契約を固定し、P1・P2で短期比較を成立させ、その後P3のメモリ正しさ試験、P4の費用推計を追加する。結果の数値は本設計書に書き込まず、run IDを持つ別artifactとして保存する。
+
+## 実装進捗
+
+- [x] P0: `bench_manifest.json` に Nim (`cd426eb2e7d0f35807f032a7dee61fe14d04c286`) と Rust (`1386239acff1dd7ede5ac78a2f0a22ef495195de`) の比較対象を固定し、SQLite/Nim/nicp_cdk の現行値を記録した。
+- [x] P0: Rust固定commitの `kv_bench.did` と `key.rs` を照合し、固定長キー・値・churn範囲をNimで実装して境界値試験を追加した。
+- [x] P0: CSV/JSONLの共通measurement型を追加し、命令数未取得を `null` / 空欄で保持してゼロ扱いしないことを検証した。
+- [ ] P1: reset/insert/update/append/prepared read/churn/statsのNim endpointを実Canisterで確認済み。Rust契約のprofile、join、large blob等の全endpointは未実装。
+- [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。
+- [ ] P3: 両実装の5,000件×100周回churn（全402ステップ）とupgrade後の行数、Native rollback/region試験を確認。ZeroExtentの既知不具合を再現済み。適法なMGR metadataを持つ共存・Wasm failpoint試験が残る。
+- [ ] P4: 更新命令数、両実装のraw/virtual stable memoryを採取し、公式料金の日時付きスナップショットで30日推計を作成。Heap、管理APIのCycles分類、実行費用の照合が残る。
+- [ ] P5: 自動summaryと欠測検査を追加。CIでの両Wasm build・比較回帰試験は未追加。
+
+## 調査結果・設計まとめ（2026-09-27）
+
+- Rust側の固定commitでは `BenchReport`、`DbStatsReport`、`BenchChurnStepReport` に加え、read/write/growth profile endpointが存在する。P1では基礎endpointの型と意味を同一にし、raw physical pagesなどNim固有の観測値は既存 `stable_pages` を上書きせず拡張endpointへ分離する。
+- Rustの固定幅キーは `index < 100_000_000`、範囲はexclusive endが同値まで許容される。Nim側も同じ境界規則にした。`stable_pages` はRustでは選択VirtualMemoryのページ数であるため、Nimのraw stable pagesとの直接比較を禁止する方針は維持する。
+- P1のNim Canisterは `storageStats()` を通じてSQLite backendのvirtual pagesを返す。raw physical pagesは同じ名前へ混入させず、次の拡張観測endpointで `ic0_stable64_size` として追加する。
+- `nicp_cdk` のobject→Candid変換に `uint64` 分岐がなく、Nat64レポートを返すCanisterが応答しなかった。CDK共通の変換を修正し、Native round-tripと実Canisterで確認した。比較CanisterはローカルCDK sourceを明示参照する。
+- `icp` CLI 1.5.0 は `canister call --json` で `response_bytes` を返すため、transportはそのCandidバイト列を復号する。CLIの整形済みCandid文字列は数値解析に使わない。
+- Rust側のraw物理ページは固定commitへ `rust_host_stats.patch` を適用した計測用Wasmのread-only endpointで採取する。元のcommit SHAとパッチSHA、最終Wasm SHAをrun manifestで別々に記録する。
+- Nimの `sqliteStableBackend` によるMGR接頭部検出は固定1025ページ方式で、現在のNim Canisterでも大きなraw初期領域として観測された。RustのMemoryId仮想ページと混同せず、両側のrawページを同じ `ic0_stable64_size` で比較する。適法なMGR metadataを用いた共存試験は未実施。
+- VFSのtruncate→再拡張→再openではゼロ化済み領域の情報が維持されず、旧stable bytesを再読出しできることをNative診断テストで再現した。修正済みと見なさず、既知不具合として残す。
+- 公式Cycle Costsの2026-09-27取得値（13-node: Update基本5,000,000 cycles、1命令1 cycle、保管127,000 cycles/GiB/s）で推計する。Heap・ingress・storage reservation・管理API実測値は未取得として明示し、推計を実料金と呼ばない。

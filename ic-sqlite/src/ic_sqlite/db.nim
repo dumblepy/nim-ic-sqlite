@@ -22,6 +22,11 @@ type
   StatementCacheStats* = object
     hits*: uint64
     misses*: uint64
+  DbStorageStats* = object
+    ## `sqliteVirtualPages` is the page count of the backend passed to SQLite.
+    ## It is deliberately distinct from canister-wide raw stable pages.
+    dbSize*: uint64
+    sqliteVirtualPages*: uint64
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
     dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
@@ -91,6 +96,13 @@ proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
   (db.config.maxResultRows, db.config.maxResultBytes, db.config.maxQueryParams)
 
 proc statementCacheStats*(db: Db): StatementCacheStats = db.statementCacheStats
+
+proc storageStats*(db: Db): DbStorageStats =
+  ## Read-only storage metadata for benchmark and operational observation.
+  ## Canister-wide raw stable memory must be sampled separately via ic0.
+  result.dbSize = databaseSize
+  if not db.backend.isNil:
+    result.sqliteVirtualPages = db.backend.sizePages()
 
 proc clearStatementCache(db: var Db) =
   for _, statement in db.statementCache:
@@ -360,6 +372,10 @@ proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
 
 proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
 
+proc changes*(conn: UpdateConnection): int =
+  if conn.db.isNil or conn.db[].raw.isNil: 0
+  else: int(sqlite3_changes(conn.db[].raw))
+
 proc transactionLease*(conn: UpdateConnection): TransactionLease = conn.lease
 
 proc withUpdateQueryRead*[T](lease: TransactionLease;
@@ -449,6 +465,19 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
+proc prepare*(conn: var UpdateConnection; sql: string): Result[Statement, DbError] =
+  ## A prepared statement used only inside the current update transaction.
+  if conn.db.isNil or conn.db[].raw.isNil or conn.lease.isNil or not conn.lease.active:
+    return Result[Statement, DbError](isOk: false,
+      error: DbError(code: -1, message: "update connection is not active", kind: dekInvalidState))
+  var raw: ptr Sqlite3Stmt
+  let code = sqlite3_prepare_v2(conn.db[].raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code != sqlite_api.SqliteOk:
+    if not raw.isNil: discard sqlite3_finalize(raw)
+    return Result[Statement, DbError](isOk: false, error: sqliteError(conn.db[].raw, code))
+  Result[Statement, DbError](isOk: true,
+    value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw))
+
 proc finalize*(statement: var Statement) =
   if not statement.raw.isNil:
     if statement.cached:
@@ -457,6 +486,16 @@ proc finalize*(statement: var Statement) =
     else:
       discard sqlite3_finalize(statement.raw)
     statement.raw = nil
+
+proc reset*(statement: var Statement): Result[bool, DbError] =
+  if statement.raw.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  let code = sqlite3_reset(statement.raw)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  discard sqlite3_clear_bindings(statement.raw)
+  Result[bool, DbError](isOk: true, value: true)
 
 proc parameterCount*(statement: Statement): int =
   if statement.raw.isNil: 0 else: int(sqlite3_bind_parameter_count(statement.raw))

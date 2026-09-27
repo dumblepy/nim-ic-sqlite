@@ -118,3 +118,14 @@
 - 結果: SQLite の source は従来どおり `vendor/sqlite/` に保持し、target依存の `.o` / `.a` は固定の vendor subdirectory にのみ置かれる。`./scripts/build_sqlite.sh` は archive と両 object を生成し、変更後の path を使う `test_example_canister.nim`（wasm build・deploy・migration・CRUD・upgrade）は終了コード 0 で完了した。ライブラリ直下の wasm `config.nims` も同じ参照先へ統一した。
 - 否定された仮説: `build/` を共有の linker input 置き場として使い続ければ CI とローカルの双方で十分に再現可能、という仮説。ビルドディレクトリは transient であり、config の依存先として不適切なため採用しない。
 - 次に試すこと: なし。この変更に関する build script・deployed-canister integration・shell syntax・差分チェックは成功した。`actionlint` は実行環境に未導入のため、この環境では再実行できない（workflow の変更自体は本作業では行っていない）。
+
+## 進捗管理: 7-cost-performance-test
+
+- P0（再現可能な比較入力・結果形式・Native単体試験）を完了。詳細な設計判断と残タスクは `.agent/rules/branch/7-cost-performance-test.mdc` に記録した。
+- `ic-sqlite/benchmarks/comparison/` に固定commitを含むマニフェスト、Rust `key.rs` と照合したNim fixture、CSV/JSONL measurement型を追加した。
+- `scripts/test.sh` は既存Testamentに加えて比較基盤のP0テストを実行する。
+- P1の基礎Canisterを追加し、`nicp developmentBuild` と `wasm-objdump` で基礎4 endpointのWasm exportを確認した。比較実行に必要なprepared read、churn、PocketIC runnerは未実装。
+- P1の基礎APIにprepared read、append、churn、実測SQLite統計とraw stable memory観測を追加し、`icp` の実CanisterでCRUDを確認した。`nicp_cdk` のobject→Candid変換に欠けていた `uint64` 対応を修正し、同CDKのNative試験で確認した。
+- P2のNim CLI transportは `icp --json` のCandidバイト列を復号する。固定Rust commitにread-only raw memory endpointパッチを適用し、fresh Canister 5組の比較を `ic-sqlite/benchmarks/comparison/results/20260927T153154Z/` に保存した。
+- P3の5,000件×100周回churnを両実装で完走し、各201ステップを `ic-sqlite/benchmarks/comparison/results/churn-20260927T153429Z/` に保存した。両実装のupgrade後churn継続、Native rollback、bounded region隔離も確認した。ZeroExtentの再open不具合は診断テストで再現しており未修正。
+- P4の公式Cycle Costs料金スナップショットと30日シナリオ推計を同churn runの `cost_estimate.json` に保存した。Heapと管理APIのCycles分類は未取得で、推計はstable memoryとUpdateのみ。

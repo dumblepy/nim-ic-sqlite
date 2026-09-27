@@ -1,0 +1,10 @@
+.cache/
+results/
+nim_canister/.icp/
+nim_canister/main.wasm
+nim_canister/backend/main.wasm
+nim_canister/backend/wasi.wasm
+nim_canister/backend/main_ic_wasm.wasm
+runner/main
+runner/churn
+runner/cost_report

@@ -1,0 +1,10 @@
+{
+  "source": "https://docs.internetcomputer.org/references/cycle-costs/",
+  "retrieved_utc": "2026-09-27",
+  "subnet_nodes": 13,
+  "update_base_cycles_per_message": 5000000,
+  "instruction_cycles_per_instruction": 1,
+  "storage_cycles_per_gib_second": 127000,
+  "seconds_per_day": 86400,
+  "model": "stable_memory_and_update_only"
+}
