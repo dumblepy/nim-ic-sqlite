@@ -68,15 +68,15 @@
 - [x] Phase 1: SQLite Typed Executor
 - [x] Phase 2: 基本 Query Builder
 - [ ] Phase 3: 条件式と JOIN（whereGroup / GROUP BY / HAVING は未実装）
-- [ ] Phase 4: 型付き更新（insertId / UpdateConnection 統合は未実装）
+- [x] Phase 4: 型付き更新
 - [ ] Phase 5: トランザクション統合
 - [ ] Phase 6: 型拡張・最適化
 - [ ] NISQL-GOAL-001: 全完了条件を再実行して成功
 
 ## 作業記録
 
-- 現在の問題: Phase 3 の再帰条件グループ・集約と、Phase 4〜6 の残機能が未実装。
-- 試したこと: immutable Query、識別子ホワイトリスト、SELECT/WHERE/OR/NULL/IN/BETWEEN/JOIN/ORDER/LIMIT、型付き CRUD を追加した。
-- 結果: `test_typed_row`、`test_query_compiler`、`test_query_builder`、`test_typed_write` は成功した。
-- 否定された仮説: `readRows` は prepare 後に bind しなくても既存値を参照できるという仮説。未 bind のため空結果となり、明示的 bind ループを追加した。
-- 次に試すこと: whereGroup、GROUP BY/HAVING、insertId、UpdateConnection 上の Query、トランザクション・stable 再初期化テストを実装する。
+- 現在の問題: Phase 3 の再帰条件グループ・集約と、Phase 5〜6 の残機能が未実装。
+- 試したこと: `insertId`、`UpdateConnection.table()`、トランザクション内の型付き CRUD、捕捉可能な例外での rollback を追加した。
+- 結果: `test_typed_write` と `test_query_transaction` が成功した。
+- 否定された仮説: なし。
+- 次に試すこと: whereGroup、GROUP BY/HAVING、トランザクション内 SELECT、stable 再初期化テストを実装する。

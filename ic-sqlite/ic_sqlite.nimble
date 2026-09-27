@@ -27,3 +27,4 @@ task test, "Run native unit tests":
   exec "nim c -r --path:src --nimcache:build/nimcache/test_query_compiler tests/test_query_compiler.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_query_builder tests/test_query_builder.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_typed_write tests/test_typed_write.nim"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_query_transaction tests/test_query_transaction.nim"

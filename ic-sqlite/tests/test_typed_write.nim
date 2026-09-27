@@ -13,8 +13,8 @@ suite "typed query writes":
   test "inserts, updates, and deletes object values through parameters":
     var db: Db
     check db.initMemoryForTest().isOk
-    check db.exec("CREATE TABLE users (name TEXT, active INTEGER, email TEXT)").isOk
-    let inserted = db.table("users").insert(NewUser(name: "Ada', 1); DROP TABLE users; --", active: true, email: none(string)))
+    check db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER, email TEXT)").isOk
+    let inserted = db.table("users").insertId(NewUser(name: "Ada', 1); DROP TABLE users; --", active: true, email: none(string)))
     check inserted.isOk
     check inserted.value == 1
     check db.queryOneText("SELECT name FROM users", []).value.get == "Ada', 1); DROP TABLE users; --"

@@ -27,6 +27,7 @@ type
     direction*: SortOrder
   Query* = object
     owner: ptr Db
+    updateOwner: ptr UpdateConnection
     tableName*: string
     tableAlias*: string
     columns*: seq[string]
@@ -56,6 +57,9 @@ proc quoteIdentifier*(name: string): Result[string, DbError] =
 
 proc table*(db: var Db; name: string; alias = ""): Query =
   Query(owner: addr db, tableName: name, tableAlias: alias)
+
+proc table*(conn: var UpdateConnection; name: string; alias = ""): Query =
+  Query(owner: conn.ownerDb(), updateOwner: addr conn, tableName: name, tableAlias: alias)
 
 proc select*(q: Query; columns: varargs[string]): Query =
   result = q
@@ -207,6 +211,7 @@ proc find*[T](q: Query; id: int64; typ: typedesc[T]; key = "id"): Result[Option[
 
 proc executeWrite(q: Query; sql: string; params: openArray[SqlValue]): Result[int, DbError] =
   if q.owner.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "query has no database", kind: dekInvalidState))
+  if not q.updateOwner.isNil: return q.updateOwner[].execValues(sql, params)
   q.owner[].execValues(sql, params)
 
 proc insert*[T](q: Query; value: T): Result[int, DbError] =
@@ -222,6 +227,12 @@ proc insert*[T](q: Query; value: T): Result[int, DbError] =
     params.add(toSqlValue(field))
   if columns.len == 0: return Result[int, DbError](isOk: false, error: queryError("INSERT object has no fields"))
   executeWrite(q, "INSERT INTO " & tableName.value & " (" & columns.join(", ") & ") VALUES (" & marks.join(", ") & ")", params)
+
+proc insertId*[T](q: Query; value: T): Result[int64, DbError] =
+  let inserted = q.insert(value)
+  if not inserted.isOk: return Result[int64, DbError](isOk: false, error: inserted.error)
+  if not q.updateOwner.isNil: return q.updateOwner[].lastInsertId()
+  q.owner[].lastInsertId()
 
 proc delete*(q: Query): Result[int, DbError] =
   if q.joins.len > 0: return Result[int, DbError](isOk: false, error: queryError("DELETE does not support JOIN"))

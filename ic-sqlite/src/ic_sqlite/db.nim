@@ -276,6 +276,12 @@ proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[i
   if not finished.isOk: return Result[int, DbError](isOk: false, error: finished.error)
   Result[int, DbError](isOk: true, value: int(sqlite3_changes(db.raw)))
 
+proc lastInsertId*(db: Db): Result[int64, DbError] =
+  if db.raw.isNil:
+    return Result[int64, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not initialized", kind: dekInvalidState))
+  Result[int64, DbError](isOk: true, value: sqlite3_last_insert_rowid(db.raw))
+
 proc exec*(conn: var UpdateConnection; sql: string): Result[int, DbError] =
   if conn.db.isNil:
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
@@ -285,6 +291,35 @@ proc execText*(conn: var UpdateConnection; sql: string; values: openArray[string
   if conn.db.isNil:
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
   conn.db[].execTextRaw(sql, values)
+
+proc execValues*(conn: var UpdateConnection; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
+  ## Executes inside the active withUpdate transaction; it never starts an overlay.
+  if conn.db.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection", kind: dekInvalidState))
+  var raw: ptr Sqlite3Stmt
+  var code = sqlite3_prepare_v2(conn.db[].raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code == sqlite_api.SqliteOk and int(sqlite3_bind_parameter_count(raw)) != values.len: code = -1
+  if code == sqlite_api.SqliteOk:
+    var statement = Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw)
+    for index, value in values:
+      let bound = statement.bind(index + 1, value)
+      if not bound.isOk:
+        statement.finalize()
+        return Result[int, DbError](isOk: false, error: bound.error)
+    code = sqlite3_step(raw)
+    statement.finalize()
+  elif not raw.isNil:
+    discard sqlite3_finalize(raw)
+  if code != sqlite_api.SqliteDone:
+    return Result[int, DbError](isOk: false, error: conn.db[].dbError(code))
+  Result[int, DbError](isOk: true, value: int(sqlite3_changes(conn.db[].raw)))
+
+proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
+  if conn.db.isNil:
+    return Result[int64, DbError](isOk: false,
+      error: DbError(code: -1, message: "nil update connection", kind: dekInvalidState))
+  Result[int64, DbError](isOk: true, value: sqlite3_last_insert_rowid(conn.db[].raw))
+
+proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
 
 proc withQuery*[T](db: var Db;
                    body: proc(conn: var Connection): Result[T, DbError] {.closure.}
@@ -424,7 +459,14 @@ proc withUpdate*[T](db: var Db;
     discard db.finishStableOperation(begun.value, false)
     return Result[T, DbError](isOk: false, error: beginResult.error)
   var connection = UpdateConnection(db: addr db)
-  let bodyResult = body(connection)
+  var bodyResult: Result[T, DbError]
+  try:
+    bodyResult = body(connection)
+  except CatchableError as error:
+    discard db.execRaw("ROLLBACK")
+    discard db.finishStableOperation(begun.value, false)
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: error.msg, kind: dekInvalidState))
   if not bodyResult.isOk:
     discard db.execRaw("ROLLBACK")
     discard db.finishStableOperation(begun.value, false)
