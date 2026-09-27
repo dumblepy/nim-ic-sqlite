@@ -1,0 +1,3 @@
+[submodule "nicp_cdk"]
+	path = nicp_cdk
+	url = https://github.com/dumblepy/nicp_cdk
