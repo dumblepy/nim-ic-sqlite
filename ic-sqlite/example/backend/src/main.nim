@@ -1,4 +1,5 @@
 import nicp_cdk
+import nicp_cdk/ic0/ic0
 import std/options
 import ic_sqlite
 import ic_sqlite/stable/ic_backend
@@ -10,11 +11,26 @@ proc greet() {.query.} =
   let request = Request.new()
   reply("Hello, " & request.getStr(0) & "!")
 
+proc initializeDatabase() =
+  ## Both lifecycle hooks recreate transient SQLite/VFS state from the stable
+  ## image. A failure must reject install/upgrade rather than leave a canister
+  ## that might later overwrite a foreign stable-memory image.
+  database.close()
+  let initialized = database.initDatabase(newIcStableBackend())
+  if not initialized.isOk:
+    let message = "ic-sqlite initialization failed: " & initialized.error.message
+    ic0_trap(cast[int](message.cstring), message.len)
+  databaseReady = true
+
+proc canister_init() {.exportwasm.} =
+  initializeDatabase()
+
+proc canister_post_upgrade() {.exportwasm.} =
+  initializeDatabase()
+
 proc ensureDatabase(): string =
   if databaseReady: return ""
-  let initialized = database.init(newIcStableBackend())
-  if not initialized.isOk: return initialized.error.message
-  databaseReady = true
+  initializeDatabase()
   ""
 
 proc selectOne() {.update.} =

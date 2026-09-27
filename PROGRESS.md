@@ -9,16 +9,16 @@
 
 [設計書](./design/nim_ic_sqlite_vfs_design.md) の全セクションを実装し、以下の検証可能な条件を満たす。
 
-- [ ] 1. SQLite を `SQLITE_OS_OTHER=1` で static archive にビルドできる。
-- [ ] 2. C shim → Nim VFS exports → stable backend の呼び出し経路が native test で通る。
-- [ ] 3. Superblock が stable memory へ正しく read/write できる。
-- [ ] 4. Overlay が dirty page を保持し、read/write/commit を正しく処理する。
+- [x] 1. SQLite を `SQLITE_OS_OTHER=1` で static archive にビルドできる。
+- [x] 2. C shim → Nim VFS exports → stable backend の呼び出し経路が native test で通る。
+- [x] 3. Superblock が stable memory へ正しく read/write できる。
+- [x] 4. Overlay が dirty page を保持し、read/write/commit を正しく処理する。
 - [x] 5. VFS 経由で `sqlite3_open_v2` が成功し、`CREATE TABLE`, `INSERT`, `SELECT` が stable memory 上で動作する。
-- [ ] 6. SQLite transaction commit 後に dirty page が stable memory へ反映される。
-- [ ] 7. ROLLBACK 後に stable memory が変更されない。
-- [ ] 8. heap temp file (journal) が正しく動作する。
-- [ ] 9. 空 stable memory → fresh DB 作成 → reopen で既存 DB を読める。
-- [ ] 10. foreign stable memory 検出 ("NIMSQLV1" magic) が動作する。
+- [x] 6. SQLite transaction commit 後に dirty page が stable memory へ反映される。
+- [x] 7. ROLLBACK 後に stable memory が変更されない。
+- [x] 8. heap temp file (journal) が正しく動作する。
+- [x] 9. 空 stable memory → fresh DB 作成 → reopen で既存 DB を読める。
+- [x] 10. foreign stable memory 検出 ("NIMSQLV1" magic) が動作する。
 - [x] 11. wasm32-wasi 向けにクロスコンパイルでき、ic-wasi-polyfill / wasi2ic 経由で ICP canister WASM が生成できる。
 - [x] 12. local ICP 上で canister を deploy し、SQLite CRUD + upgrade persistence を実証できる。
 
@@ -250,21 +250,21 @@
 ### Task 10: DB facade (db.nim + connection.nim + statement.nim + value.nim + migration.nim)
 
 **完了条件:**
-- [ ] `IcSqliteDb` (設計書 29節) が実装されている:
+- [x] `IcSqliteDb` (設計書 29節) が実装されている:
   - `init(config)`, `withUpdate(body)`, `withQuery(body)`
   - `migrate(migrations)`
-- [ ] `Connection` / `UpdateConnection` が実装されている
-- [ ] `Statement` が実装されている (prepare/bind/step/column access)
-- [ ] `SqlValue` / `SqlValueKind` (設計書 30節) が実装されている
-- [ ] `DbError` (設計書 29節) が実装されている
-- [ ] Migration framework (設計書 31節) が実装されている
-- [ ] 設計書 20節の transaction lifecycle が `withUpdate` で実装されている
-- [ ] 設計書 21節: `publishOverlayOrTrap` が atomic publish を実装している
-- [ ] 設計書 17節: write connection 用 PRAGMA / read-only connection 用 PRAGMA が適用される
-- [ ] 設計書 22節: `withUpdate` の body は同期 proc (`{.closure.}`) に限定されている
-- [ ] 設計書 37節: `arbitrary SQL endpoint を公開しない` 方針が守られている
-- [ ] 設計書 36節: `DbConfig` に `maxDirtyPages` / `maxDirtyBytes` / `maxSqlBytes` / `maxBlobBytes` が含まれている
-- [ ] native test (VecStableBackend) で CRUD が通る
+- [x] `Connection` / `UpdateConnection` が実装されている
+- [x] `Statement` が実装されている (prepare/bind/step/column access)
+- [x] `SqlValue` / `SqlValueKind` (設計書 30節) が実装されている
+- [x] `DbError` (設計書 29節) が実装されている
+- [x] Migration framework (設計書 31節) が実装されている
+- [x] 設計書 20節の transaction lifecycle が `withUpdate` で実装されている
+- [x] 設計書 21節: `publishOverlayOrTrap` が atomic publish を実装している
+- [x] 設計書 17節: write connection 用 PRAGMA / read-only connection 用 PRAGMA が適用される
+- [x] 設計書 22節: `withUpdate` の body は同期 proc (`{.closure.}`) に限定されている
+- [x] 設計書 37節: `arbitrary SQL endpoint を公開しない` 方針が守られている
+- [x] 設計書 36節: `DbConfig` に `maxDirtyPages` / `maxDirtyBytes` / `maxSqlBytes` / `maxBlobBytes` が含まれている
+- [x] native test (VecStableBackend) で CRUD が通る
 
 **詳細:**
 - 設計書 29-33節, 17節, 20-22節, 36-37節を実装
@@ -276,11 +276,11 @@
 ### Task 11: canister lifecycle integration
 
 **完了条件:**
-- [ ] 設計書 32節・33節の upgrade lifecycle が実装されている:
+- [x] 設計書 32節・33節の upgrade lifecycle が実装されている:
   - `initDatabase()` を `init` / `post_upgrade` の両方から呼ぶ
   - VFS global state → stable backend bind → superblock load → SQLite reopen → migration
-- [ ] 設計書 12節: foreign stable memory 検出で既存データ破壊を防止
-- [ ] `nim_ic_sqlite_vfs.nim` に公開 API が集約されている
+- [x] 設計書 12節: foreign stable memory 検出で既存データ破壊を防止
+- [x] `nim_ic_sqlite_vfs.nim` に公開 API が集約されている
 
 **詳細:**
 - `nicp_cdk` の lifecycle hook を利用
@@ -291,13 +291,13 @@
 ### Task 12: examples/minimal_kv
 
 **完了条件:**
-- [ ] `examples/minimal_kv/` に Canister プロジェクトが作成されている
-- [ ] `init` と `post_upgrade` で DB 再初期化が行われる
-- [ ] `get(key)`, `put(key, value)` の update endpoint が提供される
-- [ ] `get(key)` の query endpoint が提供される
-- [ ] build スクリプトで WASM → ic-wasi-polyfill → wasi2ic の chain が通る
-- [ ] local ICP で deploy して CRUD が動作する
-- [ ] upgrade 後もデータが保持される
+- [x] `examples/minimal_kv/` に Canister プロジェクトが作成されている
+- [x] `init` と `post_upgrade` で DB 再初期化が行われる
+- [x] `get(key)`, `put(key, value)` の update endpoint が提供される
+- [x] `get(key)` の query endpoint が提供される
+- [x] build スクリプトで WASM → ic-wasi-polyfill → wasi2ic の chain が通る
+- [x] local ICP で deploy して CRUD が動作する
+- [x] upgrade 後もデータが保持される
 
 **詳細:**
 - 設計書 31節の migration + 32節の upgrade を実証
@@ -308,12 +308,12 @@
 ### Task 13: 全テスト + 最終検証
 
 **完了条件:**
-- [ ] 全 native test が `nimble test` で通る
-- [ ] wasm32-wasi 向け static archive build が成功する
+- [x] 全 native test が `nimble test` で通る
+- [x] wasm32-wasi 向け static archive build が成功する
 - [x] 最終 Wasm (ic-wasi-polyfill + wasi2ic) が生成できる
 - [x] local ICP で canister install + CRUD が trap せず動作する
 - [x] canister upgrade 後もデータが保持される
-- [ ] 異なる MemoryId の stable data と共存できる (region mode)
+- [x] 異なる MemoryId の stable data と共存できる (region mode)
 
 **詳細:**
 - 設計書 35節の error code mapping の網羅
@@ -710,6 +710,102 @@ native CRUD / transaction / resource-limit test、library build、`nicp developm
 
 **次に試すこと:**
 backend failpoint を追加し、publish 前 error と publish 後 trap の境界を機械的に検証する。
+
+### 反復 20 — 2026-09-27
+
+**現在の問題:**
+stable publish の不可逆境界と、設計書29--31節の typed statement / migration API が native test で十分に検証されていなかった。
+
+**試したこと:**
+2回目の stable page write を失敗させる backend を overlay test に追加し、1枚目の write 後の失敗が
+`PublishStartedError` になることを検証した。公開 API に `SqlValue`（NULL / INTEGER / REAL / TEXT / BLOB）、
+`Connection`、`Statement`、同期 `withQuery`、prepare/bind/step/column access、および順序・冪等性を
+検証する migration framework を追加した。
+
+**結果:**
+overlay の不可逆失敗境界、typed statement での全基本値の read、migration の初回適用・再実行時の
+非重複・version順序拒否が native test で成功した。
+
+**否定された仮説:**
+`openArray[Migration]` のループ変数を `withUpdate` closure が安全に捕捉できるという仮説。
+Nim の lent iterator 制約により、version と SQL を loop 内で値コピーして closure に渡す必要があった。
+
+**次に試すこと:**
+read-only query connection の分離と read PRAGMA を実装し、Task 10 の残条件を満たす。その後 Task 11 の
+canister lifecycle 公開 API を実装する。
+
+### 反復 21 — 2026-09-27
+
+**現在の問題:**
+`withQuery` が write connection を共有しており、設計書17節・23節の read-only connection と read PRAGMA を満たしていなかった。また lifecycle の init/post-upgrade で共有する再初期化手順が公開 API に存在しなかった。
+
+**試したこと:**
+stable DB では `SQLITE_OPEN_READONLY` で別接続を開き、`cache_size`、`query_only`、`locking_mode`、`foreign_keys`、`temp_store` を設定して callback 終了時に close するようにした。native `:memory:` test は共有可能な別接続を持てないため、callback 中だけ同一接続へ `query_only=ON` を設定し、defer で必ず解除するようにした。さらに init と upgrade の双方から使う `initDatabase` / `reopenDatabaseAfterUpgrade` API を追加した。
+
+**結果:**
+typed query test と query callback 内 INSERT の SQLite 拒否を native test で確認した。Task 10 の完了条件をすべて満たした。lifecycle API は公開モジュールから import 可能であることを layout test で確認した。
+
+**次に試すこと:**
+Task 11 として、nicp_cdk が提供する canister init/post-upgrade hook への接続方法を確定し、example から `initDatabase` を呼ぶ。
+
+### 反復 22 — 2026-09-27
+
+**現在の問題:**
+`nicp_cdk` には init/post-upgrade 専用 macro がなく、example の lifecycle export と VFS callback link が検証されていなかった。
+
+**試したこと:**
+`exportwasm` で canonical `canister_init` / `canister_post_upgrade` export を追加し、両方から `initDatabase` を呼ぶようにした。初期化失敗は `ic0_trap` に変換する。WASM build 時に VFS callback export が欠落したため、facade が `vfs_exports` を import して linker の生成対象に固定した。
+
+**結果:**
+`nicp developmentBuild` 成功後、`wasm-objdump -x main.wasm` で両 lifecycle export を確認した。local ICP で `createTable`、`put("lifecycle:key", "before-upgrade")`、`get`、upgrade、再度 `get` を実行し、upgrade 後にも `"before-upgrade"` が返った。Task 11 の完了条件を満たした。
+
+**否定された仮説:**
+native library build が成功すれば WASM link でも VFS callback が到達可能という仮説。export callback を含む Nim module が到達グラフから外れると、C shim の未解決 symbol が WASM link で発生した。
+
+**次に試すこと:**
+Task 12 として、設計書どおり `examples/minimal_kv` に独立した canister project を配置し、同じ lifecycle / CRUD / upgrade 検証を再現可能にする。
+
+### 反復 23 — 2026-09-27
+
+**現在の問題:**
+検証済み canister example は `example/` 配下にあり、設計書38節・Task 12 が要求する独立した `examples/minimal_kv` プロジェクトではなかった。
+
+**試したこと:**
+`examples/minimal_kv` に icp-cli project、Nimble metadata、canister build 設定、Candid、migration-aware lifecycle、`put` update と `get` query endpoint を作成した。既存 local network と競合しない port 8001 の専用 replica で build/deploy/upgrade を実行した。
+
+**結果:**
+`nicp developmentBuild` により WASM → wasi2ic → Candid metadata chain が成功した。local ICP で `put("minimal:key", "stable-value")`、`get`、upgrade、再度 `get` を実行し、upgrade 後にも `"stable-value"` が返った。検証後に専用 replica を停止した。Task 12 の完了条件をすべて満たした。
+
+**否定された仮説:**
+`icp.yaml` の canister 名は任意の表示名でよいという仮説。icp-cli は manifest の `name` と project の canister 名の一致を要求するため、独立例では `backend` に統一した。
+
+**次に試すこと:**
+Task 13 の最終検証として、全 native test、WASM build、region mode の stable data 共存テストを再実行・拡充する。
+
+### 反復 24 — 2026-09-27
+
+**現在の問題:**
+region mode は runtime prefix 用の offset backend だけで、固定範囲を越える SQLite write を防ぐ境界と foreign data 保全の直接検証が不足していた。
+
+**試したこと:**
+`StableRegion(baseOffset, maxBytes)` と bounded `OffsetStableBackend` を追加した。region 内の write、raw backend prefix の sentinel 保持、region 容量を越える grow/write の拒否を native test に追加した。全 native test と SQLite 3.53.4 wasm32-wasi archive build を再実行した。
+
+**結果:**
+foreign prefix は変更されず、region 外 write は `ValueError`、全 `nimble test`、`nimble build`、`build_sqlite.sh`、`git diff --check` は成功した。Task 13 とプロジェクト全体の機械的完了条件を満たした。
+
+### 反復 21 — 2026-09-27
+
+**現在の問題:**
+`withQuery` が write connection を共有しており、設計書17節・23節の read-only connection と read PRAGMA を満たしていなかった。
+
+**試したこと:**
+stable DB では `SQLITE_OPEN_READONLY` で別接続を開き、`cache_size`、`query_only`、`locking_mode`、`foreign_keys`、`temp_store` を設定して callback 終了時に close するようにした。native `:memory:` test は共有可能な別接続を持てないため、callback 中だけ同一接続へ `query_only=ON` を設定し、defer で必ず解除するようにした。
+
+**結果:**
+typed query test と query callback 内 INSERT の SQLite 拒否を native test で確認した。Task 10 の完了条件をすべて満たした。
+
+**次に試すこと:**
+Task 11 として、canister init/post-upgrade から再初期化を呼べる lifecycle integration API を追加する。
 
 ### 反復 6 — 2026-09-18
 

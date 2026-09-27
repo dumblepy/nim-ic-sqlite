@@ -1,9 +1,11 @@
 ## High-level database entry point. SQLite C pointers remain private here.
 import std/options
-import ./ffi/[sqlite_api, vfs_exports]
+import ./ffi/sqlite_api
+import ./ffi/vfs_exports
 import ./stable/[backend, superblock]
 import ./vfs/vfs
 import ./vfs/overlay
+import ./value
 
 when defined(wasm32):
   proc ic0Trap(src, length: uint32) {.importc: "ic0_trap", cdecl, header: "ic0.h".}
@@ -30,6 +32,19 @@ type
     config: DbConfig
   UpdateConnection* = object
     db: ptr Db
+  Connection* = object
+    db: ptr Db
+    raw: ptr Sqlite3
+  Statement* = object
+    raw: ptr Sqlite3Stmt
+    db: ptr Db
+    errorSource: ptr Sqlite3
+  StepResult* = enum
+    srRow, srDone
+  Migration* = object
+    version*: uint64
+    sql*: string
+  IcSqliteDb* = Db
 
 const Wasi2icReservedStablePages = 1025'u64
 
@@ -54,8 +69,10 @@ proc sqliteStableBackend(backend: StableBackend): StableBackend =
     discard
   backend
 
-proc dbError(db: Db; code: cint): DbError =
-  DbError(code: code, message: if db.raw.isNil: "SQLite open failed" else: $sqlite3_errmsg(db.raw))
+proc sqliteError(raw: ptr Sqlite3; code: cint): DbError =
+  DbError(code: code, message: if raw.isNil: "SQLite open failed" else: $sqlite3_errmsg(raw))
+
+proc dbError(db: Db; code: cint): DbError = sqliteError(db.raw, code)
 
 proc persistMetadata(db: Db): Result[bool, DbError] =
   ## This is deliberately written after DB pages have been published.  A
@@ -230,6 +247,110 @@ proc execText*(conn: var UpdateConnection; sql: string; values: openArray[string
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
   conn.db[].execTextRaw(sql, values)
 
+proc withQuery*[T](db: var Db;
+                   body: proc(conn: var Connection): Result[T, DbError] {.closure.}
+                  ): Result[T, DbError] =
+  ## Stable DB queries use a distinct read-only SQLite connection. Native
+  ## `:memory:` tests cannot share a second connection, so only that test-only
+  ## backend reuses its handle.
+  if db.raw.isNil:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not initialized"))
+  if db.backend.isNil:
+    let queryOnlyCode = sqlite3_exec(db.raw, "PRAGMA query_only=ON".cstring, nil, nil, nil)
+    if queryOnlyCode != sqlite_api.SqliteOk:
+      return Result[T, DbError](isOk: false, error: db.dbError(queryOnlyCode))
+    defer: discard sqlite3_exec(db.raw, "PRAGMA query_only=OFF".cstring, nil, nil, nil)
+    var memoryConnection = Connection(db: addr db, raw: db.raw)
+    return body(memoryConnection)
+  var queryRaw: ptr Sqlite3
+  let openCode = sqlite3_open_v2("/main.db", addr queryRaw,
+    SqliteOpenReadOnly or SqliteOpenNoMutex, "icstable")
+  if openCode != sqlite_api.SqliteOk:
+    let error = sqliteError(queryRaw, openCode)
+    if not queryRaw.isNil: discard sqlite3_close(queryRaw)
+    return Result[T, DbError](isOk: false, error: error)
+  defer: discard sqlite3_close(queryRaw)
+  let pragmaCode = sqlite3_exec(queryRaw,
+    "PRAGMA cache_size=-32768; PRAGMA query_only=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
+    nil, nil, nil)
+  if pragmaCode != sqlite_api.SqliteOk:
+    return Result[T, DbError](isOk: false, error: sqliteError(queryRaw, pragmaCode))
+  var connection = Connection(db: addr db, raw: queryRaw)
+  body(connection)
+
+proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
+  if conn.db.isNil or conn.raw.isNil:
+    return Result[Statement, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not initialized"))
+  if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
+    return Result[Statement, DbError](isOk: false,
+      error: DbError(code: -1, message: "SQL exceeds configured limit"))
+  var raw: ptr Sqlite3Stmt
+  let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code != sqlite_api.SqliteOk:
+    return Result[Statement, DbError](isOk: false, error: sqliteError(conn.raw, code))
+  Result[Statement, DbError](isOk: true,
+    value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
+
+proc finalize*(statement: var Statement) =
+  if not statement.raw.isNil:
+    discard sqlite3_finalize(statement.raw)
+    statement.raw = nil
+
+proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError] =
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if index <= 0:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
+  var code: cint
+  case value.kind
+  of svNull: code = sqlite3_bind_null(statement.raw, index.cint)
+  of svInt: code = sqlite3_bind_int64(statement.raw, index.cint, value.intValue)
+  of svFloat: code = sqlite3_bind_double(statement.raw, index.cint, value.floatValue.cdouble)
+  of svText:
+    if uint64(value.textValue.len) > statement.db[].config.maxBlobBytes:
+      return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+    code = ic_sqlite_bind_text(statement.raw, index.cint, value.textValue.cstring, value.textValue.len.cint)
+  of svBlob:
+    if uint64(value.blobValue.len) > statement.db[].config.maxBlobBytes:
+      return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+    let data = if value.blobValue.len == 0: nil else: unsafeAddr value.blobValue[0]
+    code = ic_sqlite_bind_blob(statement.raw, index.cint, data, value.blobValue.len.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc step*(statement: var Statement): Result[StepResult, DbError] =
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[StepResult, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  let code = sqlite3_step(statement.raw)
+  if code == sqlite_api.SqliteRow:
+    return Result[StepResult, DbError](isOk: true, value: srRow)
+  if code == sqlite_api.SqliteDone:
+    return Result[StepResult, DbError](isOk: true, value: srDone)
+  Result[StepResult, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+
+proc columnIsNull*(statement: Statement; index: int): bool =
+  not statement.raw.isNil and sqlite3_column_type(statement.raw, index.cint) == 5
+
+proc columnInt64*(statement: Statement; index: int): int64 =
+  sqlite3_column_int64(statement.raw, index.cint)
+
+proc columnFloat64*(statement: Statement; index: int): float64 =
+  float64(sqlite3_column_double(statement.raw, index.cint))
+
+proc columnText*(statement: Statement; index: int): string =
+  let text = sqlite3_column_text(statement.raw, index.cint)
+  if text.isNil: "" else: $text
+
+proc columnBlob*(statement: Statement; index: int): seq[byte] =
+  let length = sqlite3_column_bytes(statement.raw, index.cint)
+  let source = sqlite3_column_blob(statement.raw, index.cint)
+  if length <= 0 or source.isNil: return @[]
+  result = newSeq[byte](int(length))
+  copyMem(addr result[0], source, int(length))
+
 proc withUpdate*[T](db: var Db;
                     body: proc(conn: var UpdateConnection): Result[T, DbError] {.closure.}
                    ): Result[T, DbError] =
@@ -268,18 +389,62 @@ proc queryOneText*(db: var Db; sql: string; values: openArray[string]): Result[O
   for item in values:
     if uint64(item.len) > db.config.maxBlobBytes:
       return Result[Option[string], DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
-  var statement: ptr Sqlite3Stmt
-  var code = sqlite3_prepare_v2(db.raw, sql.cstring, sql.len.cint, addr statement, nil)
-  if code == sqlite_api.SqliteOk:
-    for index, value in values:
-      code = ic_sqlite_bind_text(statement, cint(index + 1), value.cstring, value.len.cint)
-      if code != sqlite_api.SqliteOk: break
-  if code == sqlite_api.SqliteOk: code = sqlite3_step(statement)
-  var value: Option[string]
-  if code == sqlite_api.SqliteRow:
-    let text = sqlite3_column_text(statement, 0)
-    if not text.isNil: value = some($text)
-  if not statement.isNil: discard sqlite3_finalize(statement)
-  if code != sqlite_api.SqliteRow and code != sqlite_api.SqliteDone:
-    return Result[Option[string], DbError](isOk: false, error: db.dbError(code))
-  Result[Option[string], DbError](isOk: true, value: value)
+  let queryValues = @values
+  db.withQuery(proc(conn: var Connection): Result[Option[string], DbError] =
+    let prepared = conn.prepare(sql)
+    if not prepared.isOk:
+      return Result[Option[string], DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index, item in queryValues:
+      let bound = statement.bind(index + 1, sqlText(item))
+      if not bound.isOk:
+        return Result[Option[string], DbError](isOk: false, error: bound.error)
+    let stepped = statement.step()
+    if not stepped.isOk:
+      return Result[Option[string], DbError](isOk: false, error: stepped.error)
+    if stepped.value == srDone:
+      return Result[Option[string], DbError](isOk: true, value: none(string))
+    if statement.columnIsNull(0):
+      return Result[Option[string], DbError](isOk: true, value: none(string))
+    Result[Option[string], DbError](isOk: true, value: some(statement.columnText(0)))
+  )
+
+proc migrate*(db: var Db; migrations: openArray[Migration]): Result[bool, DbError] =
+  ## Applies trusted, static migrations once in strictly increasing version
+  ## order.  Application input must never be interpolated into `Migration.sql`.
+  var previous = 0'u64
+  for migration in migrations:
+    if migration.version == 0 or migration.version <= previous:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, message: "migration versions must be strictly increasing and non-zero"))
+    if migration.sql.len == 0 or uint64(migration.sql.len) > db.config.maxSqlBytes:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, message: "migration SQL exceeds configured limit"))
+    previous = migration.version
+  let table = db.exec("CREATE TABLE IF NOT EXISTS __nim_ic_sqlite_migrations (version INTEGER PRIMARY KEY NOT NULL)")
+  if not table.isOk:
+    return Result[bool, DbError](isOk: false, error: table.error)
+  for migration in migrations:
+    let migrationVersion = migration.version
+    let migrationSql = migration.sql
+    let applied = db.queryOneText(
+      "SELECT CAST(version AS TEXT) FROM __nim_ic_sqlite_migrations WHERE version = ?",
+      [$migrationVersion])
+    if not applied.isOk:
+      return Result[bool, DbError](isOk: false, error: applied.error)
+    if applied.value.isSome:
+      continue
+    let transactionResult = db.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+      let executed = conn.exec(migrationSql)
+      if not executed.isOk:
+        return Result[bool, DbError](isOk: false, error: executed.error)
+      let recorded = conn.execText(
+        "INSERT INTO __nim_ic_sqlite_migrations(version) VALUES (?)", [$migrationVersion])
+      if not recorded.isOk:
+        return Result[bool, DbError](isOk: false, error: recorded.error)
+      Result[bool, DbError](isOk: true, value: true)
+    )
+    if not transactionResult.isOk:
+      return transactionResult
+  Result[bool, DbError](isOk: true, value: true)

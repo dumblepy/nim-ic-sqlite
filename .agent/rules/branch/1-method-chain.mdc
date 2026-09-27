@@ -1,0 +1,895 @@
+# nim-ic-sqlite Query Builder / Typed ORM 実装設計書
+
+- **対象:** [`dumblepy/nim-ic-sqlite`](https://github.com/dumblepy/nim-ic-sqlite)
+- **参考実装:** [`dumblepy/nim-allographer`](https://github.com/dumblepy/nim-allographer)
+- **設計バージョン:** 1.0
+- **作成日:** 2026年9月27日
+
+## 1. 設計概要
+
+本設計では、`nim-ic-sqlite` に Allographer と同様のメソッドチェーン型 Query Builder を追加し、Nim の静的型システムを利用して SQLite の検索結果を型付きオブジェクトとして取得できるようにする。
+
+基本方針は、**Allographer の操作体系を踏襲しながら、SQL の生成・実行と型変換を分離し、既存の stable memory VFS とトランザクション処理を変更しないこと**である。
+
+- `table().select().where().orderBy().get()` 形式のクエリ記述。
+- `get(User)` で `seq[User]`、`first(User)` で `Option[User]` を取得。
+- JSON を中間表現として経由せず、SQLite のカラム値から Nim の型へ直接変換。
+- SQL の値は Prepared Statement のパラメータとして渡す。
+- ICP Canister の同期実行、stable memory、rollback 保証を維持する。
+- 既存の `exec()`、`execText()`、`queryOneText()`、`withUpdate()` との後方互換性を維持する。
+
+### 1.1 調査対象の固定
+
+| リポジトリ | 対象コミット |
+|---|---|
+| [nim-ic-sqlite](https://github.com/dumblepy/nim-ic-sqlite/tree/0c0af872d2f6bb69d295909205be863a10c71bbb) | `0c0af872` |
+| [nim-allographer](https://github.com/dumblepy/nim-allographer/tree/a4ef1b47f56401acc422432681dcfeee4b94c91b) | `a4ef1b47` |
+
+### 1.2 既存実装の調査結果
+
+#### nim-ic-sqlite
+
+| ファイル | 現在の役割 |
+|---|---|
+| `src/ic_sqlite.nim` | ライブラリの公開入口 |
+| `src/ic_sqlite/db.nim` | `Db`、`DbError`、SQL 実行、トランザクション |
+| `src/ic_sqlite/ffi/sqlite_api.nim` | SQLite C API の宣言 |
+| `src/ic_sqlite/vfs/` | stable memory 用 VFS と overlay |
+| `src/ic_sqlite/stable/` | 永続領域、superblock、stable backend |
+
+`db.nim` の公開 API：
+
+```nim
+db.exec(sql)
+db.execText(sql, values)
+db.queryOneText(sql, values)
+
+db.withUpdate(proc(conn: var UpdateConnection): Result[T, DbError] =
+  ...
+)
+```
+
+低水準 SQLite API には `sqlite3_prepare_v2`、`sqlite3_bind_int64`、`sqlite3_bind_double`、`sqlite3_bind_null`、各種 `sqlite3_column_*` などが既に宣言されている。したがって SQLite 本体や VFS の再実装は不要である。
+
+一方、現在の `queryOneText()` は最初の行の最初の列を文字列として取得する API であり、複数行・複数列・BLOB・数値型を汎用的に取得する公開 API は存在しない。**まず汎用的な Prepared Statement 実行・行取得層を追加し、その上に Query Builder と型付きデコーダを構築する。**
+
+#### nim-allographer
+
+- `sqlite_query.nim`：`table()`、`where()`、`select()` などのチェーン API。
+- `sqlite_builder.nim`：SQL 生成順序の制御。
+- `sqlite_generator.nim`：各 SQL 句の生成。
+- `sqlite_exec.nim`：SQL の実行、行取得、更新。
+- `orm.nim`：JSON の取得結果から Nim object への変換。
+
+Allographer は `get().orm(User)` のような API を提供する。既存の `orm.nim` は JSON デシリアライズを用いて `Future[seq[T]]` や `Future[Option[T]]` を返す構造である。本設計では API の使いやすさを継承しながら ICP と SQLite の特性に合わせて独立実装する。
+
+| 項目 | Allographer | nim-ic-sqlite の新設計 |
+|---|---|---|
+| クエリ記述 | メソッドチェーン | メソッドチェーン |
+| 内部クエリ表現 | JSON ベース | 専用 Query AST |
+| データ取得 | 非同期 `Future` | 同期 `Result` |
+| 型付き取得 | JSON 経由の ORM 変換 | SQLite から直接デコード |
+| パラメータ | プレースホルダー | SQLite storage class に応じた bind |
+| 接続管理 | Connection Pool | 既存の `Db` を利用 |
+| 永続化 | 通常の DB 接続 | 既存 stable memory VFS |
+| トランザクション | 一般的な RDB トランザクション | ICP message と overlay に整合 |
+
+## 2. 完成時の公開 API
+
+### 2.1 モデル定義
+
+```nim
+import std/options
+import ic_sqlite
+
+type
+  User = object
+    id: int64
+    name: string
+    email: Option[string]
+    age: int64
+    isActive: bool
+
+  NewUser = object
+    name: string
+    email: Option[string]
+    age: int64
+    isActive: bool
+```
+
+SQLite の `NULL` は `Option[T]` で表現する。モデルは通常の Nim `object` とし、専用基底クラスの継承を必要としない。
+
+### 2.2 SELECT
+
+```nim
+let users = database
+  .table("users")
+  .select("id", "name", "email", "age", "isActive")
+  .where("age", ">=", 18)
+  .where("isActive", "=", true)
+  .orderBy("id", Desc)
+  .limit(20)
+  .get(User)
+```
+
+戻り値は `Result[seq[User], DbError]`。
+
+```nim
+if users.isOk:
+  for user in users.value:
+    echo user.id
+    echo user.name
+    if user.email.isSome:
+      echo user.email.get
+else:
+  echo users.error.message
+```
+
+`user.id` は `int64`、`user.name` は `string`、`user.email` は `Option[string]` としてコンパイル時に型が確定する。
+
+### 2.3 単一レコードの取得
+
+```nim
+let user = database
+  .table("users")
+  .where("id", "=", 100'i64)
+  .first(User)
+```
+
+戻り値は `Result[Option[User], DbError]`。存在しない場合は `isOk == true` かつ `value.isNone` とし、検索失敗とレコード不存在を区別する。
+
+Allographer の `find()` 相当の省略形も提供する。
+
+```nim
+let user = database.table("users").find(100'i64, User)
+```
+
+主キー名のデフォルトは `id` とし、異なる場合は明示指定する。
+
+### 2.4 型付きカラム選択
+
+```nim
+type UserSummary = object
+  id: int64
+  name: string
+
+let users = database
+  .table("users")
+  .select("id", "name")
+  .get(UserSummary)
+```
+
+部分 SELECT にはその結果に対応する型を明示する。取得されていない必須フィールドがあればマッピングエラーとする。取得されていないカラムに暗黙のデフォルト値を設定しない。
+
+### 2.5 JOIN
+
+```nim
+type UserWithProfile = object
+  id: int64
+  name: string
+  bio: Option[string]
+
+let rows = database
+  .table("users", "u")
+  .select("u.id", "u.name")
+  .selectAs("p.bio", "bio")
+  .leftJoin("profiles", "p", "u.id", "=", "p.user_id")
+  .where("u.isActive", "=", true)
+  .get(UserWithProfile)
+```
+
+JOIN 後に名前が重複するカラムは SQL alias で解決する。LEFT JOIN の右辺の欠損は `Option[T]` とする。
+
+### 2.6 INSERT / UPDATE / DELETE
+
+```nim
+let inserted = database
+  .table("users")
+  .insert(NewUser(
+    name: "Alice",
+    email: some("alice@example.com"),
+    age: 25,
+    isActive: true
+  ))
+
+type UserPatch = object
+  name: string
+  isActive: bool
+
+let updated = database
+  .table("users")
+  .where("id", "=", 100'i64)
+  .update(UserPatch(name: "Alice Smith", isActive: true))
+
+let deleted = database
+  .table("users")
+  .where("id", "=", 100'i64)
+  .delete()
+```
+
+それぞれ `Result[int, DbError]` を返し、成功時の値は変更行数とする。採番 ID 用の `insertId()` は `Result[int64, DbError]` を返す。
+
+### 2.7 明示的なトランザクション
+
+```nim
+let result = database.withUpdate(
+  proc(conn: var UpdateConnection): Result[bool, DbError] =
+    let inserted = conn
+      .table("users")
+      .insert(NewUser(
+        name: "Alice",
+        email: none(string),
+        age: 25,
+        isActive: true
+      ))
+
+    if not inserted.isOk:
+      return Result[bool, DbError](isOk: false, error: inserted.error)
+
+    Result[bool, DbError](isOk: true, value: true)
+)
+```
+
+従来の SQL 直接実行と Query Builder の更新処理は同一トランザクション機構を利用する。
+
+## 3. アーキテクチャ
+
+### 3.1 レイヤー構成
+
+```text
+Application / ICP Canister
+         │
+         ▼
+Query Builder（メソッドチェーン、Query AST）
+         │
+         ▼
+SQL Compiler（Query AST → SQL + Parameters）
+         │
+         ▼
+Typed Executor / Row Mapper（prepare、bind、型検証）
+         │
+         ▼
+Existing Db Facade / SQLite FFI
+         │
+         ▼
+Existing SQLite / VFS / Stable Backend
+```
+
+Query Builder と SQL Compiler は SQLite や stable memory に直接アクセスしない。DB の実行経路は既存の `Db` facade を通す。
+
+### 3.2 ディレクトリ構成
+
+```text
+ic-sqlite/
+└── src/
+    ├── ic_sqlite.nim
+    └── ic_sqlite/
+        ├── db.nim
+        ├── query_builder.nim       # 公開API
+        ├── query/
+        │   ├── types.nim           # Query / AST
+        │   ├── builder.nim         # メソッドチェーン
+        │   ├── compiler.nim        # SQLite SQL生成
+        │   ├── identifier.nim      # 識別子の検証
+        │   └── predicates.nim      # WHERE条件
+        ├── typed/
+        │   ├── value.nim           # SqlValue
+        │   ├── codec.nim           # Nim ⇔ SQLite
+        │   ├── row_mapper.nim      # objectへのマッピング
+        │   └── derive.nim          # マクロ
+        ├── executor/
+        │   ├── statement.nim       # prepare/bind/finalize
+        │   ├── reader.nim          # 行取得
+        │   └── writer.nim          # 書き込み
+        ├── ffi/
+        │   └── sqlite_api.nim      # 既存FFIを拡張
+        ├── stable/                 # 変更しない
+        └── vfs/                    # 変更しない
+```
+
+`ic_sqlite.nim` で従来 API と `query_builder` を export し、既存の `import ic_sqlite` だけで利用できるようにする。
+
+## 4. Query Builder の内部設計
+
+### 4.1 SQL 文字列を途中で生成しない
+
+各メソッド呼び出しで SQL を連結せず、クエリの構造を表す AST を保持する。`get()` などの終端操作で SQL Compiler が最終 SQL を生成する。
+
+```text
+Query
+  Table: users
+  Select: *
+  Predicates: age >= SqlValue(18)
+  Order: name ASC
+  Limit: 10
+```
+
+### 4.2 AST のデータ構造
+
+以下は概念的な型定義であり、実装時には JOIN、GROUP BY、HAVING、DISTINCT、更新対象カラムのノードも追加する。
+
+```nim
+type
+  QueryKind* = enum
+    qkSelect, qkInsert, qkUpdate, qkDelete
+
+  SortOrder* = enum
+    Asc, Desc
+
+  PredicateKind* = enum
+    pkCompare, pkNull, pkNotNull, pkBetween,
+    pkIn, pkNotIn, pkAnd, pkOr
+
+  Predicate* = object
+    kind*: PredicateKind
+    # 実装では variant object または専用子ノードを使用する
+
+  OrderClause* = object
+    column*: string
+    direction*: SortOrder
+
+  QueryAst* = object
+    kind*: QueryKind
+    tableName*: string
+    tableAlias*: string
+    columns*: seq[string]
+    predicates*: seq[Predicate]
+    orders*: seq[OrderClause]
+    limitValue*: Option[int64]
+    offsetValue*: Option[int64]
+```
+
+`Predicate` は AND / OR のグループ構造を表現できる再帰的 AST とする。
+
+### 4.3 メソッドチェーンの実装方式
+
+`Query` は DB への非所有参照と AST を持つ。次は概念的シグネチャであり、所有期間を保証する内部実装は別途定義する。
+
+```nim
+type Query* = object
+  owner: ptr Db
+  ast: QueryAst
+  # 実行コンテキストも保持する
+
+proc table*(db: var Db; name: string): Query
+proc select*(q: Query; columns: varargs[string]): Query
+proc where*[T](q: Query; column, op: string; value: T): Query
+proc orderBy*(q: Query; column: string; direction: SortOrder): Query
+proc limit*(q: Query; count: int64): Query
+proc get*[T](q: Query; typ: typedesc[T]): Result[seq[T], DbError]
+proc first*[T](q: Query; typ: typedesc[T]): Result[Option[T], DbError]
+```
+
+**Query は原則 immutable に扱う。** 各操作は新しい Query を返し、元の Query の状態を変更しない。AST 内の変更対象となる配列も新しい配列を生成する。
+
+```nim
+let base = database.table("users").where("isActive", "=", true)
+let adults = base.where("age", ">=", 18)
+let children = base.where("age", "<", 18)
+```
+
+`adults` と `children` は互いに影響しない。DB を close した後の Query 実行はエラーとし、初期版では Query を単一の同期処理内で構築・実行する。
+
+### 4.4 WHERE 条件のグループ化
+
+```nim
+.where("age", ">=", 18)
+.whereGroup(proc(w: var PredicateBuilder) =
+  w.where("role", "=", "admin")
+  w.orWhere("role", "=", "moderator")
+)
+```
+
+生成 SQL：
+
+```sql
+WHERE "age" >= ?
+  AND ("role" = ? OR "role" = ?)
+```
+
+SQL 文字列中の `WHERE` 等を検索して条件を追加する方式は採用しない。
+
+## 5. SQL Compiler
+
+### 5.1 役割
+
+```nim
+type CompiledQuery* = object
+  sql*: string
+  params*: seq[SqlValue]
+  kind*: QueryKind
+
+proc compile*(q: Query): Result[CompiledQuery, DbError]
+```
+
+Query Compiler 自体は DB 接続を必要としない。
+
+### 5.2 コンパイル例
+
+入力：
+
+```nim
+let q = database
+  .table("users")
+  .select("id", "name")
+  .where("age", ">=", 18'i64)
+  .where("isActive", "=", true)
+  .orderBy("id", Desc)
+  .limit(20)
+```
+
+出力：
+
+```sql
+SELECT "id", "name"
+FROM "users"
+WHERE "age" >= ?
+  AND "isActive" = ?
+ORDER BY "id" DESC
+LIMIT ?
+```
+
+パラメータ：`[Integer(18), Integer(1), Integer(20)]`。
+
+値を SQL 本文に埋め込まない。パラメータ配列はメソッド呼び出し順ではなく、**最終 SQL 内のプレースホルダーの出現順**に生成する。UPDATE の SET と WHERE の順序にも対応する。
+
+### 5.3 Identifier の扱い
+
+SQL の値は bind できるが、テーブル名・カラム名は bind できない。識別子の検証と引用を独立させる。
+
+```nim
+proc quoteIdentifier(name: string): Result[string, DbError]
+```
+
+初期版では `users`、`users.id`、`schema.table` のような形式のみを受け付ける。各構成要素は原則 ASCII 英字・数字・アンダースコアに限定し、先頭は英字またはアンダースコアとする。
+
+```text
+users      → "users"
+users.id   → "users"."id"
+```
+
+`selectAs()` や集約関数は専用 AST ノードで表現し、任意の SQL 断片をカラム名として扱わない。
+
+### 5.4 バリデーション
+
+| 条件 | 処理 |
+|---|---|
+| 空テーブル名、不正な Identifier | エラー |
+| 非対応の比較演算子 | エラー |
+| 負の LIMIT / OFFSET | エラー |
+| 不完全な JOIN 条件 | エラー |
+| INSERT / UPDATE の対象カラムが空 | エラー |
+| 必要な条件を持たない HAVING | エラー |
+| 非対応の SQL 構文 | 明示的なエラー |
+
+比較演算子は `=`、`!=`、`<`、`<=`、`>`、`>=`、`LIKE` などのホワイトリストを使用する。
+
+### 5.5 NULL と IN 句
+
+```nim
+.whereNull("deleted_at")
+.whereNotNull("email")
+.whereIn("id", @[1'i64, 2, 3])
+```
+
+```sql
+"deleted_at" IS NULL
+"email" IS NOT NULL
+"id" IN (?, ?, ?)
+```
+
+`WHERE column = NULL` は生成しない。空配列の場合、`whereIn()` は常に偽、`whereNotIn()` は常に真となる条件を明示的に生成する。BETWEEN と LIKE も全値をパラメータ化する。
+
+## 6. SQLite と Nim の型変換
+
+SQLite は値自体が型を持つ動的型付け DB であり、宣言型だけで格納値の型を確定できない。本設計では次の2段階で型安全性を実現する。
+
+1. Nim object の構造とフィールド型をコンパイル時に決定。
+2. 読み取り時に実際の SQLite storage class と NULL 状態を検証し、不一致なら `DbError` を返す。
+
+暗黙の型変換によるデータ欠損を防ぐため、基本型では厳密な変換をデフォルトとする。
+
+### 6.1 SqlValue
+
+```nim
+type
+  SqlValueKind* = enum
+    svNull, svInteger, svReal, svText, svBlob
+
+  SqlValue* = object
+    case kind*: SqlValueKind
+    of svInteger:
+      intValue*: int64
+    of svReal:
+      realValue*: float64
+    of svText:
+      textValue*: string
+    of svBlob:
+      blobValue*: seq[byte]
+    of svNull:
+      discard
+```
+
+### 6.2 標準型の対応
+
+| Nim 型 | SQLite storage class | 変換ルール |
+|---|---|---|
+| `int64` | INTEGER | 64 bit 整数として取得 |
+| `int` | INTEGER | 対象環境での範囲を検証 |
+| `int8`〜`int32` | INTEGER | オーバーフローを検証 |
+| `float64` | REAL / INTEGER | float64 として取得 |
+| `float32` | REAL / INTEGER | 表現範囲を確認 |
+| `string` | TEXT | 長さに基づきコピー |
+| `bool` | INTEGER | 0/1 のみ許可 |
+| `seq[byte]` | BLOB | バイト列をコピー |
+| `Option[T]` | NULL / T | NULL → `none(T)` |
+
+INTEGER を string に、TEXT `"123"` を整数に暗黙変換しない。`float64` では INTEGER からの変換を許可するが、厳密な精度要件は別 codec で扱う。SQLite の INTEGER に格納できない `uint64` 範囲は初期版ではエラーとし、必要なら TEXT/BLOB 専用 codec を利用する。Wasm32 の `int` 幅依存を避けるため、ID や大きな整数は `int64` を推奨する。
+
+### 6.3 NULL の扱い
+
+```nim
+type User = object
+  id: int64
+  name: string
+  email: Option[string]
+```
+
+`email = NULL` は `none(string)` に変換する。一方、`name = NULL` では `""` を補わず、`DbError` を返す。NULL と空文字列を区別する。
+
+### 6.4 型付き取得の実装
+
+`Row Mapper` は Nim の `fieldPairs` またはマクロによりモデルのフィールドを列挙する。以下は擬似コード。
+
+```nim
+proc decodeRow[T](
+  stmt: ptr Sqlite3Stmt,
+  mapping: ColumnMapping,
+  typ: typedesc[T]
+): Result[T, DbError] =
+  var row: T
+  for fieldName, field in fieldPairs(row):
+    let index = mapping.find(fieldName)
+    if index < 0:
+      return mappingError(fieldName)
+    let decoded = readColumn(stmt, index, type(field))
+    if not decoded.isOk:
+      return decodeError(decoded.error)
+    field = decoded.value
+  return ok(row)
+```
+
+初期版は `fieldPairs` と generics を用い、カラム名カスタマイズやコンパイル時検証が必要になった時点で `derive.nim` マクロを追加する。
+
+### 6.5 カラム対応付け
+
+順番ではなく結果セットのカラム名でマッピングする。Prepare 後に `sqlite3_column_count()`、`sqlite3_column_name()` から列名・インデックス対応表を作り、全行で再利用する。
+
+| 状態 | 動作 |
+|---|---|
+| 必須フィールドが存在しない | エラー |
+| 余分な結果カラムが存在する | 無視 |
+| 同名の結果カラムが複数存在する | エラー |
+| NULL → `Option[T]` | `none(T)` |
+| NULL → 通常型 | エラー |
+| 型・数値範囲不一致 | エラー |
+
+JOIN の同名カラムには alias を明示する。0件の場合も取得可能な結果カラム情報を検証する。
+
+### 6.6 TEXT と BLOB の読み出し
+
+SQLite が管理する一時ポインタを Nim object に保存しない。
+
+1. `sqlite3_column_type()` で実際の型を確認。
+2. `sqlite3_column_text()` または `sqlite3_column_blob()` を呼ぶ。
+3. `sqlite3_column_bytes()` で長さを取得。
+4. Nim の `string` / `seq[byte]` にコピー。
+5. 次の行へ進む。
+
+TEXT は `$cstring` による読み出しだけに依存せず、埋め込み NUL を保持する。
+
+### 6.7 カスタム型
+
+初期版の標準対応は基本型と `Option[T]` に限定する。拡張ポイント：
+
+```nim
+toSqlValue[T](value: T): SqlValue
+fromSqlValue[T](value: SqlValue; typ: typedesc[T]): Result[T, DbError]
+```
+
+`DateTime` は Unix timestamp（INTEGER）または ISO 8601（TEXT）など格納形式を codec で明示する。JSON、UUID、enum も同様に拡張する。
+
+## 7. Prepared Statement / Executor
+
+### 7.1 FFI 追加
+
+既存の `sqlite_api.nim` に以下を追加する。
+
+```nim
+sqlite3_column_name
+sqlite3_bind_parameter_count
+sqlite3_stmt_readonly
+sqlite3_errcode
+sqlite3_extended_errcode
+```
+
+```nim
+const
+  SqliteInteger* = 1.cint
+  SqliteFloat*   = 2.cint
+  SqliteText*    = 3.cint
+  SqliteBlob*    = 4.cint
+  SqliteNull*    = 5.cint
+```
+
+`sqlite3_bind_parameter_count()` を利用し、SQL のパラメータ数と生成引数数を照合する。
+
+### 7.2 Statement ライフサイクル
+
+```text
+SQL / Parameters
+       │
+       ▼
+  Validation
+       │
+       ▼
+sqlite3_prepare_v2
+       │
+       ▼
+Parameter binding
+       │
+       ▼
+ sqlite3_step
+       ├── SQLITE_ROW → decodeRow[T] → 次の行
+       ├── SQLITE_DONE
+       └── SQLITE_ERROR → DbError
+       │
+       ▼
+sqlite3_finalize
+       │
+       ▼
+Result[T, DbError]
+```
+
+すべてのエラー経路で `sqlite3_finalize()` を実行する。エラー内容は finalize 前に確保し、finalize 自体の失敗も結果へ反映する。生成 SQL は一文に限定する。
+
+### 7.3 読み取り処理の分離
+
+| Executor | 用途 |
+|---|---|
+| `readRows[T]()` | SELECT と結果デコード |
+| `executeWrite()` | INSERT / UPDATE / DELETE |
+
+読み取りでは overlay を開始せず、更新では既存の `beginStableOperation()` / `finishStableOperation()` を通す。AST の種別に加え `sqlite3_stmt_readonly()` でも読み取り専用性を確認する。ただしこの API は外部関数の副作用までは保証しないため、通常 Query Builder はサポート対象 SELECT 構文のみ生成する。
+
+### 7.4 既存 API の共通化
+
+現在の `execTextRaw()`、`queryOneText()` に重複する prepare / bind / step / finalize を `statement.nim` へ整理する。ただし公開シグネチャと既存の TEXT bind 動作は維持する。
+
+## 8. ICP 固有の制約とトランザクション
+
+### 8.1 Overlay を維持
+
+```text
+beginStableOperation()
+        │
+        ▼
+    beginOverlay()
+        │
+        ▼
+    SQL 実行
+      ├── 失敗 → Overlay 破棄
+      └── 成功 → publish dirty pages → superblock 更新
+```
+
+Query Builder 独自の commit 処理や stable memory 書き込み処理は作らない。
+
+### 8.2 `withUpdate()` 統合
+
+| 呼び出し元 | SELECT | INSERT / UPDATE / DELETE |
+|---|---|---|
+| `Db` | Overlay を開始しない | 1操作につき1回の Overlay |
+| `UpdateConnection` | 現在のトランザクション内で実行 | 既存トランザクション内で実行 |
+
+`UpdateConnection` 由来の Query は実行コンテキストを保持し、トランザクション外への持ち出しを拒否する。同一トランザクション内の SELECT は未確定更新結果を参照できるようにする。
+
+### 8.3 例外時の後始末
+
+- body の `Result` がエラーなら `ROLLBACK`。
+- 捕捉可能な Nim 例外でもトランザクションと overlay を破棄。
+- stable publish 開始後の不可逆な失敗は既存の trap 方針を維持。
+- ネストした Overlay を開始しない。
+- 更新途中の `await` を禁止する。
+
+ICP の inter-canister call を挟む操作を同一の原子的実行として扱わない。Query Builder に Future ベースの非同期 API は導入しない。
+
+### 8.4 Canister query メソッド
+
+読み取り専用 Query Builder は将来的に Canister の query メソッドから利用可能とする。ただし DB 初期化や永続状態更新を query メソッドに依存させない。適切な lifecycle で DB を初期化し、読み取り Executor 自体も永続書き込みを必要としない設計を維持する。
+
+## 9. エラー処理とリソース制限
+
+### 9.1 DbError の拡張
+
+既存の `code`、`message` を維持する。
+
+```nim
+type
+  DbErrorKind* = enum
+    dekSqlite, dekInvalidQuery, dekBind,
+    dekColumnMissing, dekTypeMismatch, dekNullViolation,
+    dekOverflow, dekResourceLimit, dekInvalidState
+
+  DbError* = object
+    code*: cint
+    message*: string
+    kind*: DbErrorKind
+    column*: string
+    expectedType*: string
+    actualType*: string
+    rowIndex*: int
+```
+
+旧形式の `DbError(code: ..., message: ...)` 構築を引き続き有効とする。型変換失敗と SQL 実行失敗を区別する。
+
+### 9.2 メモリと結果件数
+
+現在の `DbConfig` に存在する `maxDirtyPages`、`maxDirtyBytes`、`maxSqlBytes`、`maxBlobBytes` に加え、次の設定を提案する。
+
+| 設定 | 初期値案 | 目的 |
+|---|---:|---|
+| `maxResultRows` | 1,000 | 取得行数の上限 |
+| `maxResultBytes` | 8 MiB | 取得データ量の上限 |
+| `maxQueryParams` | SQLite の実効上限に従う | bind 数制限 |
+
+設定値は調整可能とし、旧形式の config との互換性を維持する。超過時には切り詰めず `dekResourceLimit` を返す。
+
+### 9.3 SQL Injection 対策
+
+- 値は必ず bind parameter に変換する。
+- テーブル名とカラム名は Identifier として検証する。
+- 比較演算子はホワイトリストで検証する。
+- 任意 SQL 断片を Query AST と無制限に混在させない。
+- Prepared Statement に複数 SQL 文を渡さない。
+
+既存の `exec(sql)` は維持するが、外部入力をそのまま SQL として公開する Canister API は推奨しない。
+
+## 10. 実装フェーズ
+
+| Phase | 内容 | 完了条件 |
+|---|---|---|
+| 1 — SQLite Typed Executor | FFI 追加、`SqlValue`、bind、複数行取得、基本型変換、NULL、finalize | 生 SQL から `Result[seq[T], DbError]` を取得 |
+| 2 — 基本 Query Builder | AST、`table/select/where/orderBy/limit/offset/get/first` | メソッドチェーンの型付き SELECT |
+| 3 — 条件式と JOIN | `orWhere/whereGroup/whereIn/whereBetween/whereNull/join/leftJoin`、alias、DISTINCT、GROUP BY、HAVING | 複数テーブル検索 |
+| 4 — 型付き更新 | `insert/insertId/update/delete`、object → bind | 型付き CRUD |
+| 5 — トランザクション統合 | `UpdateConnection` と `withUpdate` の連携 | 同一トランザクション内の複数 CRUD と rollback |
+| 6 — 型拡張・最適化 | codec、マクロ、Statement Cache、集約関数、ページネーション | 実運用向けリソース制御と機能 |
+
+最初のマイルストーンは Phase 1～2 とする。Typed Executor が安定してから更新系を追加する。
+
+## 11. テスト設計
+
+```text
+tests/
+├── test_query_compiler.nim
+├── test_query_builder.nim
+├── test_typed_row.nim
+├── test_typed_write.nim
+├── test_query_transaction.nim
+└── test_query_stable.nim
+```
+
+native の in-memory SQLite と `VecStableBackend` の双方でテストする。最終段階では wasm32 のビルドと Canister 統合テストも実施する。
+
+### 11.1 必須テスト
+
+| 分類 | テスト | 期待結果 |
+|---|---|---|
+| SELECT | 複数行取得 / 0件 | `seq[T]` / 空 seq |
+| FIRST | 0件 | `none(T)` |
+| 型 | INTEGER → int64、REAL → float64 | 正常 |
+| 型 | INTEGER → bool | 0/1 のみ許可 |
+| 型 | TEXT → int64 / 範囲外整数 | 型不一致 / Overflow |
+| NULL | NULL → Option[T] / 通常型 | `none(T)` / エラー |
+| BLOB | バイナリ取得 | 完全一致 |
+| TEXT | 埋め込み NUL | 長さを保持 |
+| Model | カラム不足 / 同名カラム | Mapping エラー |
+| JOIN | alias | 正常 |
+| WHERE | 複数 AND/OR | SQL と bind 順序が正しい |
+| WHERE IN | 空配列 | 定義済みの真偽 |
+| Security | SQL Injection 入力 | SQL 構造を変更しない |
+| Transaction | 更新途中の失敗 | 全件 rollback |
+| Stable | 再初期化 | データ保持 |
+| Compatibility | 既存 API | 従来テストが成功 |
+
+SQL Compiler では生成 SQL とパラメータ配列をセットで比較する。
+
+### 11.2 静的型のテスト
+
+```nim
+type UserSummary = object
+  id: int64
+  name: string
+
+let result = database
+  .table("users")
+  .select("id", "name")
+  .get(UserSummary)
+
+doAssert result.isOk
+let user = result.value[0]
+let id: int64 = user.id
+let name: string = user.name
+```
+
+未対応モデルや不正な型操作のコンパイルエラーテストも用意する。ただし、実行時 DB スキーマに存在しないカラムは初期版では実行時に検証する。
+
+### 11.3 性能比較
+
+| 比較対象 | 計測内容 |
+|---|---|
+| `queryOneText()` | 単一値取得の基準 |
+| `get(T)` | 型付き複数行取得 |
+| JSON 経由変換 | 直接デコードとの比較 |
+| Statement 再利用 | prepare 回数・実行時間 |
+| Native / Wasm32 | 実行時間・メモリ・命令数 |
+
+JSON 中間生成の削減を評価し、具体的な性能基準は初期ベンチマーク後に設定する。
+
+## 12. 初期リリースの API スコープ
+
+| 機能 | 初期リリース | 将来拡張 |
+|---|---|---|
+| SELECT / WHERE | 対応 | — |
+| AND / OR / IN / BETWEEN | 対応 | — |
+| ORDER BY / LIMIT / OFFSET | 対応 | — |
+| JOIN / LEFT JOIN | 対応 | その他の JOIN |
+| INSERT / UPDATE / DELETE | 対応 | UPSERT / RETURNING |
+| `get(T)` / `first(T)` | 対応 | — |
+| object / Option[T] | 対応 | ref object / tuple の拡張 |
+| int / float / bool / string / BLOB | 対応 | 独自 codec |
+| `withUpdate()` | 対応 | — |
+| GROUP BY / HAVING / 集約関数 | 基本機能 | 高度な集約 |
+| Statement Cache | 非対応 | 対応 |
+| Schema Builder | 非対応 | 別設計 |
+| 完全な Active Record ORM | 非対応 | 必要に応じて検討 |
+
+## 13. 最終方針
+
+まず `db.nim` に不足している汎用の型付き行取得機構を作り、その上にメソッドチェーンを接続する。
+
+```text
+Query Builder
+     │
+     ▼
+Query Compiler
+     │
+     ▼
+Typed Executor
+     ├── Parameter Binder
+     └── Typed Row Mapper
+               │
+               ▼
+        Existing DB Facade
+               │
+               ▼
+          SQLite / VFS
+```
+
+この構成なら、将来 Query Builder を使わず生 SQL から型付きオブジェクトを取得する API も提供できる。
+
+**Nim の型安全性はコンパイル時に保証し、SQLite の実データとモデルの整合性は実行時に厳密に検証する。** モデル定義やスキーマ生成を強制することなく、既存テーブルにも導入できる。将来的にスキーマ定義から Nim object とカラム指定を自動生成すれば、より多くの検証をコンパイル時に移せる。
+
+---
+
+## 参考ソース
+
+- [nim-ic-sqlite / db.nim](https://github.com/dumblepy/nim-ic-sqlite/blob/0c0af872d2f6bb69d295909205be863a10c71bbb/ic-sqlite/src/ic_sqlite/db.nim)
+- [nim-ic-sqlite / sqlite_api.nim](https://github.com/dumblepy/nim-ic-sqlite/blob/0c0af872d2f6bb69d295909205be863a10c71bbb/ic-sqlite/src/ic_sqlite/ffi/sqlite_api.nim)
+- [nim-allographer / sqlite_query.nim](https://github.com/dumblepy/nim-allographer/blob/a4ef1b47f56401acc422432681dcfeee4b94c91b/src/allographer/query_builder/models/sqlite/sqlite_query.nim)
+- [nim-allographer / sqlite_generator.nim](https://github.com/dumblepy/nim-allographer/blob/a4ef1b47f56401acc422432681dcfeee4b94c91b/src/allographer/query_builder/models/sqlite/query/sqlite_generator.nim)
+- [nim-allographer / orm.nim](https://github.com/dumblepy/nim-allographer/blob/a4ef1b47f56401acc422432681dcfeee4b94c91b/src/allographer/query_builder/models/orm.nim)
+- [SQLite: Datatypes In SQLite](https://www.sqlite.org/datatype3.html)
+- [SQLite: Result Values From A Query](https://www.sqlite.org/c3ref/column_blob.html)
+
+> 本書は実装方針を定義した設計書である。Nim 2.2.12 および wasm32 でのコンパイル・動作検証は実装フェーズで実施する。
