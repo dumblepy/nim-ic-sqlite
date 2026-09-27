@@ -16,9 +16,17 @@ proc trapPublishFailure(message: string) {.noreturn.} =
   raise newException(CatchableError, "sqlite stable publish failed: " & message)
 
 type
+  DbErrorKind* = enum
+    dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
+    dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
   DbError* = object
     code*: cint
     message*: string
+    kind*: DbErrorKind
+    column*: string
+    expectedType*: string
+    actualType*: string
+    rowIndex*: int
   DbConfig* = object
     maxDirtyPages*: uint64
     maxDirtyBytes*: uint64
@@ -237,6 +245,37 @@ proc execText*(db: var Db; sql: string; values: openArray[string]): Result[int, 
   if not finished.isOk: return Result[int, DbError](isOk: false, error: finished.error)
   executed
 
+proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError]
+proc finalize*(statement: var Statement)
+
+proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
+  ## Typed prepared execution using the same overlay/publish path as execText.
+  if db.raw.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized", kind: dekInvalidState))
+  let begun = db.beginStableOperation()
+  if not begun.isOk: return Result[int, DbError](isOk: false, error: begun.error)
+  var raw: ptr Sqlite3Stmt
+  var code = sqlite3_prepare_v2(db.raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code == sqlite_api.SqliteOk and int(sqlite3_bind_parameter_count(raw)) != values.len:
+    code = -1
+  if code == sqlite_api.SqliteOk:
+    var statement = Statement(raw: raw, db: addr db, errorSource: db.raw)
+    for index, value in values:
+      let bound = statement.bind(index + 1, value)
+      if not bound.isOk:
+        statement.finalize()
+        discard db.finishStableOperation(begun.value, false)
+        return Result[int, DbError](isOk: false, error: bound.error)
+    code = sqlite3_step(raw)
+    statement.finalize()
+  elif not raw.isNil:
+    discard sqlite3_finalize(raw)
+  if code != SqliteDone:
+    discard db.finishStableOperation(begun.value, false)
+    return Result[int, DbError](isOk: false, error: db.dbError(code))
+  let finished = db.finishStableOperation(begun.value, true)
+  if not finished.isOk: return Result[int, DbError](isOk: false, error: finished.error)
+  Result[int, DbError](isOk: true, value: int(sqlite3_changes(db.raw)))
+
 proc exec*(conn: var UpdateConnection; sql: string): Result[int, DbError] =
   if conn.db.isNil:
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
@@ -298,6 +337,12 @@ proc finalize*(statement: var Statement) =
     discard sqlite3_finalize(statement.raw)
     statement.raw = nil
 
+proc parameterCount*(statement: Statement): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_bind_parameter_count(statement.raw))
+
+proc isReadonly*(statement: Statement): bool =
+  not statement.raw.isNil and sqlite3_stmt_readonly(statement.raw) != 0
+
 proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError] =
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
@@ -332,7 +377,18 @@ proc step*(statement: var Statement): Result[StepResult, DbError] =
   Result[StepResult, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
 
 proc columnIsNull*(statement: Statement; index: int): bool =
-  not statement.raw.isNil and sqlite3_column_type(statement.raw, index.cint) == 5
+  not statement.raw.isNil and sqlite3_column_type(statement.raw, index.cint) == SqliteNull
+
+proc columnType*(statement: Statement; index: int): cint =
+  if statement.raw.isNil: SqliteNull else: sqlite3_column_type(statement.raw, index.cint)
+
+proc columnCount*(statement: Statement): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_column_count(statement.raw))
+
+proc columnName*(statement: Statement; index: int): string =
+  if statement.raw.isNil: return ""
+  let name = sqlite3_column_name(statement.raw, index.cint)
+  if name.isNil: "" else: $name
 
 proc columnInt64*(statement: Statement; index: int): int64 =
   sqlite3_column_int64(statement.raw, index.cint)
@@ -342,7 +398,10 @@ proc columnFloat64*(statement: Statement; index: int): float64 =
 
 proc columnText*(statement: Statement; index: int): string =
   let text = sqlite3_column_text(statement.raw, index.cint)
-  if text.isNil: "" else: $text
+  let length = sqlite3_column_bytes(statement.raw, index.cint)
+  if text.isNil or length <= 0: return ""
+  result = newString(int(length))
+  copyMem(addr result[0], text, int(length))
 
 proc columnBlob*(statement: Statement; index: int): seq[byte] =
   let length = sqlite3_column_bytes(statement.raw, index.cint)

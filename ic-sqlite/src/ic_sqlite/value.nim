@@ -1,5 +1,6 @@
 ## Values accepted by the typed statement API.  Callers never need SQLite's
 ## C-level bind constants or ownership rules.
+import std/options
 
 type
   SqlValueKind* = enum
@@ -23,3 +24,21 @@ proc sqlFloat*(value: float64): SqlValue = SqlValue(kind: svFloat, floatValue: v
 proc sqlText*(value: string): SqlValue = SqlValue(kind: svText, textValue: value)
 proc sqlBlob*(value: openArray[byte]): SqlValue =
   SqlValue(kind: svBlob, blobValue: @value)
+
+proc toSqlValue*[T](value: T): SqlValue =
+  when T is SqlValue:
+    value
+  elif T is Option:
+    if value.isSome: toSqlValue(value.get) else: sqlNull()
+  elif T is bool:
+    sqlInt(if value: 1 else: 0)
+  elif T is SomeSignedInt:
+    sqlInt(int64(value))
+  elif T is SomeFloat:
+    sqlFloat(float64(value))
+  elif T is string:
+    sqlText(value)
+  elif T is seq[byte]:
+    sqlBlob(value)
+  else:
+    {.error: "unsupported SQLite bind type; use a standard scalar, seq[byte], Option, or SqlValue".}

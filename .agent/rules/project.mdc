@@ -9,7 +9,7 @@ alwaysApply: true
 
 設計書は `/application/design/nim_ic_sqlite_vfs_design.md` を参照すること。
 
-実装先は `/application/ic-sqlite/` とする。`/application/` 直下には設計書 (`design/`)・Dockerfile・compose.yaml・PROGRESS.md・エージェントルールのみを配置し、コードはすべて `/application/ic-sqlite/` 以下に配置する。
+実装先は `/application/ic-sqlite/` とする。`/application/` 直下には設計書 (`design/`)・Dockerfile・compose.yaml・エージェントルールのみを配置し、コードはすべて `/application/ic-sqlite/` 以下に配置する。進捗記録は `/application/.agent/PROGRESS.md` に配置する。
 
 ## 0. 規範表現
 
@@ -30,7 +30,7 @@ alwaysApply: true
 
 [NISQL-ARCH-002][MUST] 設計書 `/application/design/nim_ic_sqlite_vfs_design.md` の全セクションを実装する。ただしフェーズ順（設計書 54節）に従い、Phase 0 → Phase 1 → ... と段階的に進めてよい。
 
-[NISQL-ARCH-003][MUST] `PROGRESS.md` に定義された完了条件をすべて満たすまで完成扱いしない。
+[NISQL-ARCH-003][MUST] `.agent/PROGRESS.md` に定義された完了条件をすべて満たすまで完成扱いしない。
 
 [NISQL-ARCH-004][MUST] Nim 利用者は通常のアプリケーションコードから Rust の型、Rust の所有権、raw C pointer、static archive のパス、SQLite C API の詳細を意識せず SQLite を利用できるようにする。
 
@@ -173,8 +173,7 @@ ICP Stable memory
 
 [NISQL-PHASE-001][MUST] Phase 0 (build PoC) → Phase 1 (C VFS shim) → Phase 2 (stable main DB) → Phase 3 (transaction overlay) → Phase 4 (DB facade) の順で実装する。
 
-[NISQL-PHASE-002][MUST] 各 Phase の完了条件を `PROGRESS.md` で検証可能な形で定義し、満たしてから次の Phase に進む。
+[NISQL-PHASE-002][MUST] 各 Phase の完了条件を `.agent/PROGRESS.md` で検証可能な形で定義し、満たしてから次の Phase に進む。
 
 [NISQL-PHASE-003][MUST] Phase 3 (overlay) 完了前の実装は production で write を許可しない。
-
 

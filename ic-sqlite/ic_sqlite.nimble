@@ -23,3 +23,7 @@ task test, "Run native unit tests":
   exec "nim c -r --path:src --nimcache:build/nimcache/test_vfs_exports tests/test_vfs_exports.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_sqlite_api tests/test_sqlite_api.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_db_api tests/test_db_api.nim"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_typed_row tests/test_typed_row.nim"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_query_compiler tests/test_query_compiler.nim"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_query_builder tests/test_query_builder.nim"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_typed_write tests/test_typed_write.nim"
