@@ -24,3 +24,18 @@ suite "query builder":
     check found.isOk
     check found.value.get.name == "Ada"
     db.close()
+
+  test "keeps typed query results identical with statement cache enabled":
+    var config = defaultDbConfig()
+    config.statementCacheEnabled = true
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    check db.exec("CREATE TABLE cached_users (id INTEGER, name TEXT, active INTEGER)").isOk
+    check db.exec("INSERT INTO cached_users VALUES (1, 'Ada', 1), (2, 'Grace', 0)").isOk
+    let first = db.table("cached_users").where("active", "=", true).get(User)
+    let second = db.table("cached_users").where("active", "=", true).get(User)
+    check first.isOk
+    check second.isOk
+    check first.value == second.value
+    check db.statementCacheStats().hits == 1
+    db.close()

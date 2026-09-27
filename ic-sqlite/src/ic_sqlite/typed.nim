@@ -19,6 +19,29 @@ proc storageName(kind: cint): string =
   of SqliteNull: "NULL"
   else: "unknown"
 
+type SqlCodec*[T] = object
+  encode*: proc(value: T): SqlValue {.closure.}
+  decode*: proc(value: SqlValue): Result[T, DbError] {.closure.}
+
+proc readSqlValue*(statement: Statement; index: int): SqlValue =
+  case statement.columnType(index)
+  of SqliteNull: sqlNull()
+  of SqliteInteger: sqlInt(statement.columnInt64(index))
+  of SqliteFloat: sqlFloat(statement.columnFloat64(index))
+  of SqliteText: sqlText(statement.columnText(index))
+  of SqliteBlob: sqlBlob(statement.columnBlob(index))
+  else: sqlNull()
+
+proc toSqlValue*[T](value: T; codec: SqlCodec[T]): SqlValue = codec.encode(value)
+
+proc readColumn*[T](statement: Statement; index: int;
+                    codec: SqlCodec[T]): Result[T, DbError] =
+  let decoded = codec.decode(statement.readSqlValue(index))
+  if decoded.isOk: return decoded
+  var error = decoded.error
+  if error.kind == dekSqlite: error.kind = dekTypeMismatch
+  Result[T, DbError](isOk: false, error: error)
+
 proc readColumn*[T](statement: Statement; index: int; typ: typedesc[T]): Result[T, DbError] =
   let actual = statement.columnType(index)
   if actual == SqliteNull:
@@ -147,7 +170,10 @@ proc readRows*[T](db: var Db; sql: string; params: openArray[SqlValue] = []): Re
   )
 
 proc readFirst*[T](db: var Db; sql: string; params: openArray[SqlValue] = []): Result[Option[T], DbError] =
-  let rows = readRows[T](db, sql, params)
+  let copied = @params
+  let rows = db.withQuery(proc(conn: var Connection): Result[seq[T], DbError] =
+    scanRowsOnConnection[T](conn, sql, copied, firstOnly = true)
+  )
   if not rows.isOk: return Result[Option[T], DbError](isOk: false, error: rows.error)
   Result[Option[T], DbError](isOk: true,
     value: if rows.value.len == 0: none(T) else: some(rows.value[0]))

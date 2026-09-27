@@ -29,6 +29,7 @@ proc sqlite3_prepare_v2*(db: ptr Sqlite3; sql: cstring; nByte: cint; stmt: ptr p
 proc sqlite3_finalize*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_step*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_reset*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
+proc sqlite3_clear_bindings*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_bind_null*(stmt: ptr Sqlite3Stmt; index: cint): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_bind_int64*(stmt: ptr Sqlite3Stmt; index: cint; value: int64): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_bind_double*(stmt: ptr Sqlite3Stmt; index: cint; value: cdouble): cint {.importc, cdecl, header: "sqlite3.h".}

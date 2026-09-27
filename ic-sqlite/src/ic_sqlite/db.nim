@@ -1,5 +1,5 @@
 ## High-level database entry point. SQLite C pointers remain private here.
-import std/options
+import std/[options, tables]
 import ./ffi/sqlite_api
 import ./ffi/vfs_exports
 import ./stable/[backend, superblock]
@@ -19,6 +19,9 @@ type
   TransactionLease* = ref object
     active: bool
     db: ptr Db
+  StatementCacheStats* = object
+    hits*: uint64
+    misses*: uint64
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
     dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
@@ -38,6 +41,8 @@ type
     maxResultRows*: uint64
     maxResultBytes*: uint64
     maxQueryParams*: uint64
+    statementCacheEnabled*: bool
+    maxCachedStatements*: uint64
   Db* = object
     raw: ptr Sqlite3
     backend: StableBackend
@@ -45,6 +50,8 @@ type
     lastTxId: uint64
     config: DbConfig
     currentUpdate: TransactionLease
+    statementCache: Table[string, ptr Sqlite3Stmt]
+    statementCacheStats: StatementCacheStats
   UpdateConnection* = object
     db: ptr Db
     lease: TransactionLease
@@ -55,6 +62,8 @@ type
     raw: ptr Sqlite3Stmt
     db: ptr Db
     errorSource: ptr Sqlite3
+    cached: bool
+    cacheKey: string
   StepResult* = enum
     srRow, srDone
   Migration* = object
@@ -68,16 +77,27 @@ proc defaultDbConfig*(): DbConfig =
   DbConfig(maxDirtyPages: 4096, maxDirtyBytes: 64'u64 * 1024 * 1024,
     maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
     maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
-    maxQueryParams: 999)
+    maxQueryParams: 999, statementCacheEnabled: false,
+    maxCachedStatements: 32)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
     config.maxSqlBytes > 0 and config.maxBlobBytes > 0 and
     config.maxResultRows > 0 and config.maxResultBytes > 0 and
-    config.maxQueryParams > 0
+    config.maxQueryParams > 0 and
+    (not config.statementCacheEnabled or config.maxCachedStatements > 0)
 
 proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
   (db.config.maxResultRows, db.config.maxResultBytes, db.config.maxQueryParams)
+
+proc statementCacheStats*(db: Db): StatementCacheStats = db.statementCacheStats
+
+proc clearStatementCache(db: var Db) =
+  for _, statement in db.statementCache:
+    if not statement.isNil:
+      discard sqlite3_finalize(statement)
+  db.statementCache.clear()
+  db.statementCacheStats = StatementCacheStats()
 
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
   ## wasi2ic reserves stable memory under the MGR+version header. Preserve that
@@ -178,6 +198,7 @@ when not defined(wasm32):
     Result[bool, DbError](isOk: true, value: true)
 
 proc close*(db: var Db) =
+  db.clearStatementCache()
   if not db.raw.isNil:
     discard sqlite3_close(db.raw)
     db.raw = nil
@@ -406,16 +427,35 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "SQL exceeds configured limit"))
+  let cacheable = conn.db[].config.statementCacheEnabled and conn.raw == conn.db[].raw
+  if cacheable and conn.db[].statementCache.hasKey(sql):
+    let raw = conn.db[].statementCache[sql]
+    discard sqlite3_reset(raw)
+    discard sqlite3_clear_bindings(raw)
+    inc conn.db[].statementCacheStats.hits
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+        cached: true, cacheKey: sql))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.raw, code))
+  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
+    conn.db[].statementCache[sql] = raw
+    inc conn.db[].statementCacheStats.misses
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+        cached: true, cacheKey: sql))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
 proc finalize*(statement: var Statement) =
   if not statement.raw.isNil:
-    discard sqlite3_finalize(statement.raw)
+    if statement.cached:
+      discard sqlite3_reset(statement.raw)
+      discard sqlite3_clear_bindings(statement.raw)
+    else:
+      discard sqlite3_finalize(statement.raw)
     statement.raw = nil
 
 proc parameterCount*(statement: Statement): int =

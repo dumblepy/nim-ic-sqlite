@@ -70,13 +70,13 @@
 - [x] Phase 3: 条件式と JOIN
 - [x] Phase 4: 型付き更新
 - [x] Phase 5: トランザクション統合
-- [ ] Phase 6: 型拡張・最適化（カスタム codec / Statement Cache は未実装）
-- [ ] NISQL-GOAL-001: 全完了条件を再実行して成功
+- [x] Phase 6: 型拡張・最適化
+- [x] NISQL-GOAL-001: 全完了条件を再実行して成功
 
 ## 作業記録
 
-- 現在の問題: Phase 6の custom codec / Statement Cache が未実装。
-- 試したこと: 指定設計書に従い TransactionLease・writer connection scanner・updateScope dispatch を追加し、更新内 `first` を試験した。
-- 結果: scannerの暗黙result蓄積を明示seqへ修正後、未確定INSERTを同一 `withUpdate()` 内の型付き `first` で取得してcommitできた。詳細はブランチルール14.5節に記録した。
-- 否定された仮説: native `:memory:` の `withQuery` / query-only 経路が同一トランザクション内の未確定行を読めるという仮説。native system SQLite が icstable VFS を自動登録するという仮説。
-- 次に試すこと: 同一トランザクション内 SELECT の read path を分離する。
+- 現在の問題: なし。Phase 1–6 と NISQL-GOAL-001 の完了条件を満たした。
+- 試したこと: `Db.raw` と寿命が一致する接続（native `:memory:` と `withUpdate()` の writer）だけに SQL 文字列キーの cache を追加し、返却時に `sqlite3_reset` と `sqlite3_clear_bindings` を行うようにした。短命な stable 読み取り接続は cache しない。
+- 結果: cache の hit/miss を公開し、parameterized SELECT、Query Builder、更新トランザクション writer の各経路で、異なる bind 値・同一結果・cache hit を検証した。`nimble test` は終了コード 0、必須個別テスト、`nimble build`、`scripts/build_sqlite.sh`、`git diff --check` は成功した。
+- 否定された仮説: stable 読み取り接続を Db 全体で再利用して cache する方法。read-only connection の寿命と VFS の安全な分離を崩すため採用しない。
+- 次に試すこと: なし。

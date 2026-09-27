@@ -266,9 +266,15 @@ proc get*[T](q: Query; typ: typedesc[T]): Result[seq[T], DbError] =
   readRows[T](q.owner[], compiled.value.sql, compiled.value.params)
 
 proc first*[T](q: Query; typ: typedesc[T]): Result[Option[T], DbError] =
-  let rows = q.get(T)
-  if not rows.isOk: return Result[Option[T], DbError](isOk: false, error: rows.error)
-  Result[Option[T], DbError](isOk: true, value: if rows.value.len == 0: none(T) else: some(rows.value[0]))
+  if q.owner.isNil: return Result[Option[T], DbError](isOk: false, error: DbError(code: -1, message: "query has no database", kind: dekInvalidState))
+  let compiled = q.compile()
+  if not compiled.isOk: return Result[Option[T], DbError](isOk: false, error: compiled.error)
+  if not q.updateScope.isNil:
+    let rows = withUpdateQueryRead(q.updateScope, proc(conn: var Connection): Result[seq[T], DbError] =
+      scanRowsOnConnection[T](conn, compiled.value.sql, compiled.value.params, firstOnly = true))
+    if not rows.isOk: return Result[Option[T], DbError](isOk: false, error: rows.error)
+    return Result[Option[T], DbError](isOk: true, value: if rows.value.len == 0: none(T) else: some(rows.value[0]))
+  readFirst[T](q.owner[], compiled.value.sql, compiled.value.params)
 
 proc find*[T](q: Query; id: int64; typ: typedesc[T]; key = "id"): Result[Option[T], DbError] =
   q.where(key, "=", id).first(T)

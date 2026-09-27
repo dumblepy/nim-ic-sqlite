@@ -850,7 +850,7 @@ JSON 中間生成の削減を評価し、具体的な性能基準は初期ベン
 | int / float / bool / string / BLOB | 対応 | 独自 codec |
 | `withUpdate()` | 対応 | — |
 | GROUP BY / HAVING / 集約関数 | 基本機能 | 高度な集約 |
-| Statement Cache | 非対応 | 対応 |
+| Statement Cache | `Db.raw` と寿命が一致する接続で対応 | stable 読取り接続をまたぐ cache、LRU eviction |
 | Schema Builder | 非対応 | 別設計 |
 | 完全な Active Record ORM | 非対応 | 必要に応じて検討 |
 

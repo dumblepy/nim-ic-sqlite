@@ -13,6 +13,7 @@ type
     name: string
   RequiredId = object
     id: int64
+  UserCode = distinct string
 
 suite "typed row reader":
   test "decodes multiple rows, NULL options, blobs, and embedded NUL text":
@@ -87,4 +88,47 @@ suite "typed row reader":
     let tooLarge = readRows[RequiredName](db, "SELECT 'four' AS name")
     check not tooLarge.isOk
     check tooLarge.error.kind == dekResourceLimit
+    db.close()
+
+  test "supports explicit custom codecs":
+    let codec = SqlCodec[UserCode](
+      encode: proc(value: UserCode): SqlValue = sqlText(string(value)),
+      decode: proc(value: SqlValue): Result[UserCode, DbError] =
+        if value.kind != svText or value.textValue.len != 3:
+          return Result[UserCode, DbError](isOk: false,
+            error: DbError(code: -1, message: "invalid user code", kind: dekTypeMismatch))
+        Result[UserCode, DbError](isOk: true, value: UserCode(value.textValue))
+    )
+    var db: Db
+    check db.initMemoryForTest().isOk
+    let decoded = db.withQuery(proc(conn: var Connection): Result[UserCode, DbError] =
+      let prepared = conn.prepare("SELECT 'ABC'")
+      if not prepared.isOk: return Result[UserCode, DbError](isOk: false, error: prepared.error)
+      var statement = prepared.value
+      defer: statement.finalize()
+      let stepped = statement.step()
+      if not stepped.isOk or stepped.value != srRow:
+        return Result[UserCode, DbError](isOk: false, error: DbError(code: -1, message: "missing row"))
+      readColumn(statement, 0, codec)
+    )
+    check decoded.isOk
+    check string(decoded.value) == "ABC"
+    check toSqlValue(UserCode("XYZ"), codec).textValue == "XYZ"
+    db.close()
+
+  test "reuses statements when the cache is enabled":
+    var config = defaultDbConfig()
+    config.statementCacheEnabled = true
+    config.maxCachedStatements = 2
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    let first = readRows[RequiredId](db, "SELECT ? AS id", [sqlInt(7)])
+    let second = readRows[RequiredId](db, "SELECT ? AS id", [sqlInt(9)])
+    check first.isOk
+    check second.isOk
+    check first.value[0].id == 7
+    check second.value[0].id == 9
+    let stats = db.statementCacheStats()
+    check stats.misses == 1
+    check stats.hits == 1
     db.close()
