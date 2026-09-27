@@ -3,6 +3,26 @@ import ic_sqlite/stable/backend
 import ic_sqlite/stable/superblock
 import ic_sqlite/vfs/overlay
 
+type FailingWriteBackend = ref object of StableBackend
+  delegate: StableBackend
+  failOnWrite: int
+  writeCount: int
+
+method sizePages(backend: FailingWriteBackend): uint64 =
+  backend.delegate.sizePages()
+
+method grow(backend: FailingWriteBackend; pages: uint64): bool =
+  backend.delegate.grow(pages)
+
+method read(backend: FailingWriteBackend; offset: uint64; dst: pointer; size: uint64) =
+  backend.delegate.read(offset, dst, size)
+
+method write(backend: FailingWriteBackend; offset: uint64; src: pointer; size: uint64) =
+  inc backend.writeCount
+  if backend.writeCount == backend.failOnWrite:
+    raise newException(IOError, "injected stable write failure")
+  backend.delegate.write(offset, src, size)
+
 suite "Overlay":
   test "keeps writes off stable memory until publish":
     let storage: StableBackend = newVecStableBackend()
@@ -40,3 +60,13 @@ suite "Overlay":
     check overlay.readAt(storage, 16, 16) == newSeq[byte](16)
     overlay.writeAt(storage, 16, [byte 7])
     check overlay.zeroExtents.len == 0
+
+  test "marks failures after the first stable page write as irreversible":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(2)
+    let storage: StableBackend = FailingWriteBackend(delegate: raw, failOnWrite: 2)
+    var overlay = initOverlay(0, pageSize = 16, dbBaseOffset = 64)
+    overlay.writeAt(storage, 0, [byte 1])
+    overlay.writeAt(storage, 16, [byte 2])
+    expect PublishStartedError:
+      overlay.publishDirtyPages(storage)

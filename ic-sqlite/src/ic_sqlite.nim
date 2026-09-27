@@ -4,8 +4,12 @@
 ## Applications should import only this module.
 
 import ic_sqlite/db
+import ic_sqlite/lifecycle
+import ic_sqlite/value
 from ic_sqlite/stable/superblock import Result
 export db
+export lifecycle
+export value
 export Result
 
 const IcSqliteVersion* = "0.1.0"

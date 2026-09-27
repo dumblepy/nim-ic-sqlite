@@ -1,0 +1,4 @@
+.icp/
+main.wasm
+backend/main.wasm
+backend/wasi.wasm

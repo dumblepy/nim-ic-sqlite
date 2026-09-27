@@ -26,9 +26,13 @@ suite "VecStableBackend":
     expect CatchableError:
       discard backend.sizePages()
 
-  test "offset backend preserves a runtime-owned stable prefix":
+  test "bounded region preserves foreign stable data and rejects overflow":
     let raw: StableBackend = newVecStableBackend()
-    let region: StableBackend = newOffsetStableBackend(raw, StablePageSize)
+    check raw.grow(1)
+    var foreignData = [byte 4, 5, 6]
+    raw.write(12, addr foreignData[0], uint64(foreignData.len))
+    let region: StableBackend = newRegionStableBackend(raw,
+      StableRegion(baseOffset: StablePageSize, maxBytes: StablePageSize))
     check region.sizePages == 0
     check region.grow(1)
     check raw.sizePages == 2
@@ -37,3 +41,9 @@ suite "VecStableBackend":
     var readBack = newSeq[byte](written.len)
     region.read(0, addr readBack[0], uint64(readBack.len))
     check readBack == @written
+    var preserved = newSeq[byte](foreignData.len)
+    raw.read(12, addr preserved[0], uint64(preserved.len))
+    check preserved == @foreignData
+    check not region.grow(1)
+    expect ValueError:
+      region.write(StablePageSize, addr written[0], uint64(written.len))

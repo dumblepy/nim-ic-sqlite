@@ -1,0 +1,6 @@
+name: backend
+build:
+  steps:
+    - type: script
+      commands:
+        - bash -c 'if [ "${DFX_NETWORK:-local}" = "local" ]; then nicp developmentBuild; else nicp productionBuild; fi'

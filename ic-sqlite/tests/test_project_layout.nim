@@ -4,6 +4,7 @@ import ic_sqlite
 suite "ic_sqlite project scaffold":
   test "public module is importable":
     check IcSqliteVersion == "0.1.0"
+    check declared(initDatabase)
 
   test "required Phase 0 directories exist":
     for path in [
