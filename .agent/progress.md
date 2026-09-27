@@ -18,6 +18,13 @@
 
 ## タスク別完了条件
 
+### GitHub Actions CI
+
+完了条件:
+- `actionlint .github/workflows/ci.yml` が終了コード 0 で完了する。
+- workflow が recursive submodule checkout 後に、コンテナ内で `nimble test` と `./scripts/build_sqlite.sh` を実行する。
+
+
 ### Phase 1 — SQLite Typed Executor
 
 完了条件:
@@ -75,8 +82,8 @@
 
 ## 作業記録
 
-- 現在の問題: なし。Phase 1–6 と NISQL-GOAL-001 の完了条件を満たした。
-- 試したこと: `Db.raw` と寿命が一致する接続（native `:memory:` と `withUpdate()` の writer）だけに SQL 文字列キーの cache を追加し、返却時に `sqlite3_reset` と `sqlite3_clear_bindings` を行うようにした。短命な stable 読み取り接続は cache しない。
-- 結果: cache の hit/miss を公開し、parameterized SELECT、Query Builder、更新トランザクション writer の各経路で、異なる bind 値・同一結果・cache hit を検証した。`nimble test` は終了コード 0、必須個別テスト、`nimble build`、`scripts/build_sqlite.sh`、`git diff --check` は成功した。
-- 否定された仮説: stable 読み取り接続を Db 全体で再利用して cache する方法。read-only connection の寿命と VFS の安全な分離を崩すため採用しない。
-- 次に試すこと: なし。
+- 現在の問題: なし。GitHub Actions CI の workflow を追加済み。
+- 試したこと: `nicp_cdk` の CI を調査し、Docker Buildx・GitHub Actions cache・recursive submodule checkout を採用した。CI container 内では local `nicp_cdk` submodule を `nimble develop` 登録する。
+- 結果: `.github/workflows/ci.yml` は native test と wasm32-wasi SQLite archive build を push、pull request、手動実行で行う。`actionlint .github/workflows/ci.yml` と `git diff --check` は成功した。
+- 否定された仮説: CI runner のグローバル Nimble package に `nicp_cdk` が既に存在するという仮説。submodule を明示的に開発依存として登録するため前提にしない。
+- 次に試すこと: push または pull request 作成後、GitHub-hosted runner 上の CI 実行結果を確認する。

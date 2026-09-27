@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Native tests and WASI SQLite build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/bake-action@v5
+        with:
+          files: compose.yaml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Run native tests and build the WASI SQLite archive
+        run: |
+          set -euo pipefail
+          docker compose run --rm --no-TTY app bash -lc '
+            set -euo pipefail
+            cd /application/nicp_cdk
+            nimble develop -y
+            cd /application/ic-sqlite
+            nimble test
+            ./scripts/build_sqlite.sh
+          '
