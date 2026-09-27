@@ -4,6 +4,8 @@ import ic_sqlite/stable/superblock
 
 type NewItem = object
   name: string
+type StoredItem = object
+  name: string
 
 suite "query builder transactions":
   test "commits typed writes in one withUpdate transaction":
@@ -15,6 +17,9 @@ suite "query builder transactions":
       if not first.isOk: return Result[bool, DbError](isOk: false, error: first.error)
       let second = conn.table("items").insert(NewItem(name: "two"))
       if not second.isOk: return Result[bool, DbError](isOk: false, error: second.error)
+      let visible = conn.table("items").where("name", "=", "two").first(StoredItem)
+      if not visible.isOk or visible.value.isNone or visible.value.get.name != "two":
+        return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "uncommitted row not visible"))
       Result[bool, DbError](isOk: true, value: true)
     )
     check committed.isOk

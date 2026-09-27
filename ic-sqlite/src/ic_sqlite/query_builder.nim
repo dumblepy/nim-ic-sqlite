@@ -30,7 +30,7 @@ type
     direction*: SortOrder
   Query* = object
     owner: ptr Db
-    updateOwner: ptr UpdateConnection
+    updateScope: TransactionLease
     tableName*: string
     tableAlias*: string
     columns*: seq[string]
@@ -64,7 +64,7 @@ proc table*(db: var Db; name: string; alias = ""): Query =
   Query(owner: addr db, tableName: name, tableAlias: alias)
 
 proc table*(conn: var UpdateConnection; name: string; alias = ""): Query =
-  Query(owner: conn.ownerDb(), updateOwner: addr conn, tableName: name, tableAlias: alias)
+  Query(owner: conn.ownerDb(), updateScope: conn.transactionLease(), tableName: name, tableAlias: alias)
 
 proc select*(q: Query; columns: varargs[string]): Query =
   result = q
@@ -259,6 +259,10 @@ proc get*[T](q: Query; typ: typedesc[T]): Result[seq[T], DbError] =
   if q.owner.isNil: return Result[seq[T], DbError](isOk: false, error: DbError(code: -1, message: "query has no database", kind: dekInvalidState))
   let compiled = q.compile()
   if not compiled.isOk: return Result[seq[T], DbError](isOk: false, error: compiled.error)
+  if not q.updateScope.isNil:
+    return withUpdateQueryRead(q.updateScope,
+      proc(conn: var Connection): Result[seq[T], DbError] =
+        scanRowsOnConnection[T](conn, compiled.value.sql, compiled.value.params))
   readRows[T](q.owner[], compiled.value.sql, compiled.value.params)
 
 proc first*[T](q: Query; typ: typedesc[T]): Result[Option[T], DbError] =
@@ -271,7 +275,8 @@ proc find*[T](q: Query; id: int64; typ: typedesc[T]; key = "id"): Result[Option[
 
 proc executeWrite(q: Query; sql: string; params: openArray[SqlValue]): Result[int, DbError] =
   if q.owner.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "query has no database", kind: dekInvalidState))
-  if not q.updateOwner.isNil: return q.updateOwner[].execValues(sql, params)
+  if not q.updateScope.isNil:
+    return execValuesInTransaction(q.updateScope, sql, params)
   q.owner[].execValues(sql, params)
 
 proc insert*[T](q: Query; value: T): Result[int, DbError] =
@@ -291,7 +296,8 @@ proc insert*[T](q: Query; value: T): Result[int, DbError] =
 proc insertId*[T](q: Query; value: T): Result[int64, DbError] =
   let inserted = q.insert(value)
   if not inserted.isOk: return Result[int64, DbError](isOk: false, error: inserted.error)
-  if not q.updateOwner.isNil: return q.updateOwner[].lastInsertId()
+  if not q.updateScope.isNil:
+    return lastInsertIdInTransaction(q.updateScope)
   q.owner[].lastInsertId()
 
 proc delete*(q: Query): Result[int, DbError] =

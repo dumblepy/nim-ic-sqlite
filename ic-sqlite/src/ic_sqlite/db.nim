@@ -16,6 +16,9 @@ proc trapPublishFailure(message: string) {.noreturn.} =
   raise newException(CatchableError, "sqlite stable publish failed: " & message)
 
 type
+  TransactionLease* = ref object
+    active: bool
+    db: ptr Db
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
     dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
@@ -41,8 +44,10 @@ type
     sqlitePageSize: uint32
     lastTxId: uint64
     config: DbConfig
+    currentUpdate: TransactionLease
   UpdateConnection* = object
     db: ptr Db
+    lease: TransactionLease
   Connection* = object
     db: ptr Db
     raw: ptr Sqlite3
@@ -334,6 +339,29 @@ proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
 
 proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
 
+proc transactionLease*(conn: UpdateConnection): TransactionLease = conn.lease
+
+proc withUpdateQueryRead*[T](lease: TransactionLease;
+    body: proc(conn: var Connection): Result[T, DbError] {.closure.}
+  ): Result[T, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease or lease.db[].raw.isNil:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  var borrowed = Connection(db: lease.db, raw: lease.db[].raw)
+  body(borrowed)
+
+proc execValuesInTransaction*(lease: TransactionLease; sql: string;
+                               values: openArray[SqlValue]): Result[int, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease:
+    return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  var connection = UpdateConnection(db: lease.db, lease: lease)
+  connection.execValues(sql, values)
+
+proc lastInsertIdInTransaction*(lease: TransactionLease): Result[int64, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease:
+    return Result[int64, DbError](isOk: false, error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  lease.db[].lastInsertId()
+
 
 
 proc withQuery*[T](db: var Db;
@@ -345,6 +373,9 @@ proc withQuery*[T](db: var Db;
   if db.raw.isNil:
     return Result[T, DbError](isOk: false,
       error: DbError(code: -1, message: "database is not initialized"))
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "ordinary query is forbidden during withUpdate", kind: dekInvalidState))
   if db.backend.isNil:
     let queryOnlyCode = sqlite3_exec(db.raw, "PRAGMA query_only=ON".cstring, nil, nil, nil)
     if queryOnlyCode != sqlite_api.SqliteOk:
@@ -479,7 +510,13 @@ proc withUpdate*[T](db: var Db;
   if not beginResult.isOk:
     discard db.finishStableOperation(begun.value, false)
     return Result[T, DbError](isOk: false, error: beginResult.error)
-  var connection = UpdateConnection(db: addr db)
+  let lease = TransactionLease(active: true, db: addr db)
+  db.currentUpdate = lease
+  defer:
+    lease.active = false
+    lease.db = nil
+    if db.currentUpdate == lease: db.currentUpdate = nil
+  var connection = UpdateConnection(db: addr db, lease: lease)
   var bodyResult: Result[T, DbError]
   try:
     bodyResult = body(connection)

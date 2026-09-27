@@ -933,6 +933,14 @@ UpdateConnection.table(...)   -> UpdateTransactionContext
 
 この変更を実装するまで、公開仕様は **`withUpdate()` 内の Query Builder 書込みは対応、同一 body 内の Query Builder 型付き SELECT は未対応** とする。
 
+### 14.5 2026-09-27 実装試行の結果
+
+設計書 `nim_ic_sqlite_withupdate_typed_select_design.md` の最小構成として、共有 `TransactionLease`、`withUpdateQueryRead()`、`scanRowsOnConnection()`、`Query.updateScope` を実装した。更新用 Query は通常 `Db.withQuery()` を通らず、lease が借用した writer の `sqlite3*` へ dispatch される。
+
+初回試行で0件となった直接原因は、`scanRowsOnConnection()` への抽出後も closure由来の暗黙 `result.value` に行を追加していたことである。scanner自身の返却 `Result` には行が蓄積されず、正常な `SQLITE_ROW` が空 seq に変換されていた。明示的な `var output: seq[T]` に追加して返すよう修正後、同一 writer connection 上の `INSERT → first(StoredItem)` は `some` を返し、transaction はcommitした。
+
+したがって、今回の0件は SQLite の可視性やVFS overlayではなく Typed Reader の結果集約回帰だった。`TransactionLease` と `withUpdateQueryRead()` により通常 `Db.withQuery()` を経由せず同じ writer `sqlite3*` を借用する経路を維持する。今後はD0–D5の低水準診断を常時ログ化せず、回帰時の診断テストとして追加する。
+
 ---
 
 ## 参考ソース
