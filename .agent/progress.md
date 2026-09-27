@@ -95,6 +95,12 @@
 
 ## 作業記録
 
+- 現在の問題: example canister の `wasi2ic` が `wasi_snapshot_preview1` import を解消できず、`icp deploy` が失敗した。
+- 試したこと: `wasi2ic` の実装と canister config を確認し、WASI 置換関数を提供する `ic_wasi_polyfill` のリンク状態を調査した。
+- 結果: `nicpDisableWasiPolyfill` が polyfill の初期化参照を除去し、linker が置換関数を破棄していた。example と minimal_kv の config からこの define を削除した。`nim c -r --path:src tests/test_example_canister.nim` は Wasm build、deploy、CRUD、upgrade を含め終了コード 0 で成功した。
+- 否定された仮説: SQLite が stable memory を直接使うため、WASI polyfill を無効にする必要があるという仮説。既存の `sqliteStableBackend()` は wasi2ic の予約領域を検出して SQLite の開始位置をオフセットするため、共存できる。
+- 次に試すこと: なし。
+
 - 現在の問題: Nim パッケージの導入が Dockerfile 内にあり、CI のテスト入口が `nimble test` 内の個別 `nim c -r` コマンド列だった。
 - 試したこと: `scripts/install.sh` に `nicp_cdk` の導入とヘッダー準備を移し、`scripts/test.sh` から導入・SQLite build・Testament 実行を順に呼ぶ構成に変更した。
 - 結果: `testament --simulate --megatest:off p 'tests/test_*.nim'` は native と canister integration を含む16件を検出した。`./scripts/test.sh` は全16件を Testament で実行し、すべて成功した。`nimble build`、スクリプト構文検査、Dockerfile の Nimble 導入コマンド不在も確認した。

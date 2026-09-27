@@ -947,6 +947,8 @@ UpdateConnection.table(...)   -> UpdateTransactionContext
 
 `ic-sqlite/scripts/test.sh` は install、wasm32-wasi SQLite build、Testament の順に実行する。Testament は `tests/test_*.nim` に含まれる native test と canister integration test を個別に実行する。`nimble test` と GitHub Actions は同じスクリプトへ委譲する。
 
+WASI を用いる canister は `nicpDisableWasiPolyfill` を定義しない。`wasi2ic` はリンク済みの polyfill にある `__ic_custom_*` 関数で WASI import を置換する。SQLite の stable memory 領域は `sqliteStableBackend()` が wasi2ic の予約ヘッダーを検出してページ境界以降へ配置するため、polyfill と共存する。
+
 ---
 
 ## 参考ソース

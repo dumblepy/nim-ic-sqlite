@@ -2,7 +2,6 @@ import std/os
 
 let icSqliteRoot = "/application/ic-sqlite"
 let sqliteWasiArtifacts = icSqliteRoot / "vendor" / "sqlite" / "wasm32-wasi"
-switch("define", "nicpDisableWasiPolyfill")
 switch("path", icSqliteRoot / "src")
 switch("passC", "-I" & icSqliteRoot / "vendor/sqlite")
 switch("passC", "-I" & icSqliteRoot / "c")
