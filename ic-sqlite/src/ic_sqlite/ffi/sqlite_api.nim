@@ -51,3 +51,4 @@ proc sqlite3_changes*(db: ptr Sqlite3): cint {.importc, cdecl, header: "sqlite3.
 proc sqlite3_last_insert_rowid*(db: ptr Sqlite3): int64 {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_exec*(db: ptr Sqlite3; sql: cstring; callback: pointer; argument: pointer; errorMessage: ptr cstring): cint
   {.importc, cdecl, header: "sqlite3.h".}
+proc ic_sqlite_register_vfs*(): cint {.importc, cdecl, header: "ic_sqlite_vfs_shim.h".}

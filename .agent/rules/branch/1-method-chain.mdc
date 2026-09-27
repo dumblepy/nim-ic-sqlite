@@ -880,6 +880,59 @@ Typed Executor
 
 **Nim の型安全性はコンパイル時に保証し、SQLite の実データとモデルの整合性は実行時に厳密に検証する。** モデル定義やスキーマ生成を強制することなく、既存テーブルにも導入できる。将来的にスキーマ定義から Nim object とカラム指定を自動生成すれば、より多くの検証をコンパイル時に移せる。
 
+## 14. 実装中の問題: `withUpdate()` 内の型付き SELECT
+
+### 14.1 現在の状態
+
+`UpdateConnection.table(...).insert/update/delete` は、`withUpdate()` が開始した SQLite transaction と stable-memory overlay を正しく共有する。body が `Result` エラーまたは捕捉可能な Nim 例外で終了した場合も rollback される。
+
+一方で、`UpdateConnection.table(...).get(T)` / `first(T)` により、同じ transaction 内で未確定の書込みを型付き SELECT する経路は未実装である。現在の `Query.get()` は `Db.withQuery()` を経由するため、通常の読取り用 connection / `PRAGMA query_only` の経路を選ぶ。この経路は transaction の実行コンテキストを保持しない。
+
+### 14.2 再現した現象
+
+以下の body で、`insert` は成功するが、直後の `first(StoredItem)` は `none(StoredItem)` を返した。body はエラーとして終了し、期待どおり全 insert は rollback される。
+
+```nim
+database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+  discard conn.table("items").insert(NewItem(name: "two"))
+  let visible = conn.table("items").where("name", "=", "two").first(StoredItem)
+  # visible.value は none
+  ...
+)
+```
+
+`UpdateConnection` の raw SQLite handle を直接 Typed Reader へ渡す試作も行ったが、同じく 0 行となった。この試作は既存 Typed Reader の結果蓄積を回帰させたため撤回した。失敗経路を公開 API とテストスイートへ残してはいない。
+
+### 14.3 原因の整理
+
+- Query AST は `Db` への参照だけを保持しており、read 実行時に「通常 query」「update transaction 内 query」を区別する実行コンテキストを表現していない。
+- `Db.withQuery()` は通常読取りの安全性のために query-only connection を構築する。これは更新 transaction の可視性を表す正規経路ではない。
+- `UpdateConnection` は書込み用の `exec` / `execText` / `execValues` を持つが、Statement の prepare/bind/step/finalize と型付き行復号を一貫して実行する read executor をまだ持たない。
+- native `:memory:` と stable VFS では connection の扱いが異なるため、単に `Db.withQuery()` の分岐を変更すると read-only 保証または overlay の分離を壊すおそれがある。
+
+### 14.4 解決方針
+
+`Query` に raw pointer を長期間保存するのではなく、実行時だけ有効な内部 `QueryExecutionContext` を導入する。
+
+```text
+Db.table(...)                 -> ReadOnlyContext
+UpdateConnection.table(...)   -> UpdateTransactionContext
+                                      │
+                                      ▼
+                         typed read executor
+                         （同一 sqlite3* を使用）
+```
+
+`UpdateTransactionContext` は `withUpdate()` body のスコープ外へ持ち出せない内部値とし、次を満たす。
+
+- 同一の `sqlite3*` に対して prepare/bind/step/finalize を行い、未確定行を読める。
+- `sqlite3_stmt_readonly()` で SELECT 専用を検査し、更新文は拒否する。
+- `Db` の通常 query は現行の `withQuery()` / query-only 経路を維持する。
+- transaction 終了後の Query 実行は `dekInvalidState` を返す。
+- native `:memory:` と stable VFS の双方で、insert → get → commit と insert → get → rollback をテストする。
+
+この変更を実装するまで、公開仕様は **`withUpdate()` 内の Query Builder 書込みは対応、同一 body 内の Query Builder 型付き SELECT は未対応** とする。
+
 ---
 
 ## 参考ソース

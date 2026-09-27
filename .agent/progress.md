@@ -69,14 +69,14 @@
 - [x] Phase 2: 基本 Query Builder
 - [x] Phase 3: 条件式と JOIN
 - [x] Phase 4: 型付き更新
-- [ ] Phase 5: トランザクション統合
-- [ ] Phase 6: 型拡張・最適化
+- [ ] Phase 5: トランザクション統合（同一トランザクション内 SELECT が未達）
+- [ ] Phase 6: 型拡張・最適化（カスタム codec / Statement Cache は未実装）
 - [ ] NISQL-GOAL-001: 全完了条件を再実行して成功
 
 ## 作業記録
 
-- 現在の問題: トランザクション内 SELECT と native stable 再初期化が未実装。
-- 試したこと: `DbConfig` に `maxResultRows`、`maxResultBytes`、`maxQueryParams` を追加し、Typed Reader の実際の SQLite 列サイズと bind 数を検証した。
-- 結果: `test_typed_row` と `test_query_compiler` が成功し、上限超過で `dekResourceLimit` を返すことを確認した。
+- 現在の問題: `withUpdate()` 内の Query Builder 型付き SELECT が未実装。再現条件・原因・解決方針はブランチルール 14節に記録した。
+- 試したこと: 明示登録済み native VFS を使う `test_query_stable` を再導入し、`VecStableBackend` の close/reopen 後に型付き Query Builder 読取りを実行した。
+- 結果: `test_query_stable` が成功し、stable 再初期化読取りを確認した。
 - 否定された仮説: native `:memory:` の `withQuery` / query-only 経路が同一トランザクション内の未確定行を読めるという仮説。native system SQLite が icstable VFS を自動登録するという仮説。
-- 次に試すこと: 全テスト・ビルドを再実行し、残る未実装条件を分離する。
+- 次に試すこと: 同一トランザクション内 SELECT の read path を分離する。

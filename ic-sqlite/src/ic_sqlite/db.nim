@@ -118,6 +118,9 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
   if backend.isNil: return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "nil stable backend"))
   if not config.configIsValid:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "invalid database resource limits"))
+  when not defined(wasm32):
+    if ic_sqlite_register_vfs() != sqlite_api.SqliteOk:
+      return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "unable to register icstable VFS"))
   let sqliteBackend = sqliteStableBackend(backend)
   let existing = readExistingSuperblock(sqliteBackend)
   if not existing.isOk:
@@ -330,6 +333,7 @@ proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
   Result[int64, DbError](isOk: true, value: sqlite3_last_insert_rowid(conn.db[].raw))
 
 proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
+
 
 
 proc withQuery*[T](db: var Db;
