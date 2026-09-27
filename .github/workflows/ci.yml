@@ -42,8 +42,6 @@ jobs:
           set -euo pipefail
           docker compose run --rm --no-TTY app bash -lc '
             set -euo pipefail
-            cd /application/nicp_cdk
-            nimble develop -y
             cd /application/ic-sqlite
             nimble test
           '
