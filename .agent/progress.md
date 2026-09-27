@@ -88,8 +88,8 @@
 
 ## 作業記録
 
-- 現在の問題: GitHub Actions の fresh Docker image に `nicp_cdk` Nimble package がなく、`ic_sqlite.nimble` の依存解決が失敗する。
-- 試したこと: Dockerfile の Nim インストール直後に、build context 内の `nicp_cdk` git submodule を `/opt/nicp_cdk` へ `COPY` し、`nimble develop` と `nimble path nicp_cdk` を実行するよう変更した。workflow の workspace-local `nimble develop` は不要なため削除済み。
-- 結果: Docker image build 時に親リポジトリが固定した submodule commit を依存として登録するため、CI run 時の空の Nimble cache と外部リポジトリの最新状態に依存しない。Docker CLI はこの開発コンテナにないため image rebuild は GitHub Actions で行われる。
-- 否定された仮説: native `initMemoryForTest` だけで canister の実行経路を十分に検証できるという仮説。wasm build・lifecycle hook・Candid call を通らないため採用しない。
-- 次に試すこと: Docker image を rebuild し、`nimble path nicp_cdk` と CI test task を確認する。
+- 現在の問題: canister の `config.nims` が一時的な `build/` 配下の SQLite archive と C object を直接参照しており、fresh checkout と bind mount のいずれでも成果物の場所が明確でなかった。
+- 試したこと: `nim-rustcrypto` の vendor-first・target別配置を参考に、`build_sqlite.sh` の wasm32-wasi 成果物を `vendor/sqlite/wasm32-wasi/` へ統一した。両 example の `config.nims` は同ディレクトリを変数化して archive と C shim object を link するよう変更し、生成物は専用 `.gitignore` で非追跡にした。
+- 結果: SQLite の source は従来どおり `vendor/sqlite/` に保持し、target依存の `.o` / `.a` は固定の vendor subdirectory にのみ置かれる。`./scripts/build_sqlite.sh` は archive と両 object を生成し、変更後の path を使う `test_example_canister.nim`（wasm build・deploy・migration・CRUD・upgrade）は終了コード 0 で完了した。ライブラリ直下の wasm `config.nims` も同じ参照先へ統一した。
+- 否定された仮説: `build/` を共有の linker input 置き場として使い続ければ CI とローカルの双方で十分に再現可能、という仮説。ビルドディレクトリは transient であり、config の依存先として不適切なため採用しない。
+- 次に試すこと: なし。この変更に関する build script・deployed-canister integration・shell syntax・差分チェックは成功した。`actionlint` は実行環境に未導入のため、この環境では再実行できない（workflow の変更自体は本作業では行っていない）。

@@ -28,6 +28,16 @@ example additionally requires:
 
 The repository Dockerfile contains the complete toolchain used by CI.
 
+Before compiling a canister, build the target-specific SQLite link inputs:
+
+```sh
+WASI_SDK_PATH=/root/.wasi-sdk ./scripts/build_sqlite.sh
+```
+
+This creates the SQLite archive and C shim objects under
+`vendor/sqlite/wasm32-wasi/`. The example canister configurations link from
+that directory, so they do not depend on transient files in `build/`.
+
 ## Install for local development
 
 Clone this repository and register the package with Nimble:

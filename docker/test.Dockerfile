@@ -101,10 +101,11 @@ RUN tar zxf nimlangserver.tar.gz
 RUN rm -f nimlangserver.tar.gz
 RUN mv nimlangserver /root/.nimble/bin/
 
-# `ic_sqlite.nimble` requires nicp_cdk by package name. Install it while the
-# image is built so fresh CI containers can resolve the dependency without a
-# pre-populated Nimble cache or a workspace-local `nimble develop` step.
-RUN nimble install -y https://github.com/dumblepy/nicp_cdk && \
+# Use the exact nicp_cdk commit pinned by the parent repository's submodule.
+# `/opt` is not hidden when Compose bind-mounts the workspace at /application.
+COPY nicp_cdk /opt/nicp_cdk
+RUN cd /opt/nicp_cdk && \
+    nimble develop -y && \
     nimble path nicp_cdk
 RUN nicp cHeaders
 
@@ -121,4 +122,7 @@ RUN wasm-opt --version
 
 
 RUN git config --global --add safe.directory /application
+COPY docker/test-entrypoint.sh /usr/local/bin/ic-sqlite-test-entrypoint
+RUN chmod +x /usr/local/bin/ic-sqlite-test-entrypoint
 WORKDIR /application
+ENTRYPOINT ["/usr/local/bin/ic-sqlite-test-entrypoint"]

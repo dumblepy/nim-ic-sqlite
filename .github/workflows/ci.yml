@@ -29,7 +29,7 @@ jobs:
       - name: Build test image
         uses: docker/bake-action@v5
         with:
-          files: compose.yaml
+          files: compose.test.yaml
           load: true
           set: |
             *.cache-from=type=gha
@@ -38,7 +38,7 @@ jobs:
       - name: Run native tests and build the WASI SQLite archive
         run: |
           set -euo pipefail
-          docker compose run --rm --no-TTY app bash -lc '
+          docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
             set -euo pipefail
             cd /application/ic-sqlite
             nimble test

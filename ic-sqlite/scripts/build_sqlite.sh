@@ -5,7 +5,10 @@ set -euo pipefail
 readonly SQLITE_VERSION="3.53.4"
 readonly SQLITE_SOURCE="vendor/sqlite/sqlite3.c"
 readonly SQLITE_HEADER="vendor/sqlite/sqlite3.h"
-readonly BUILD_DIR="build"
+# Keep target-specific link inputs beside the vendored amalgamation.  This
+# mirrors the vendor-first layout used by nim-rustcrypto and gives canister
+# config.nims one stable directory to reference.
+readonly ARTIFACT_DIR="vendor/sqlite/wasm32-wasi"
 
 : "${WASI_SDK_PATH:?WASI_SDK_PATH must point to a WASI SDK installation}"
 readonly CC="${WASI_SDK_PATH}/bin/clang"
@@ -22,13 +25,13 @@ grep -Fq "#define SQLITE_VERSION        \"${SQLITE_VERSION}\"" "$SQLITE_HEADER" 
   exit 1
 }
 
-mkdir -p "$BUILD_DIR"
+mkdir -p "$ARTIFACT_DIR"
 "$CC" \
   --target=wasm32-wasi \
   -Os \
   -std=c99 \
   -c "$SQLITE_SOURCE" \
-  -o "$BUILD_DIR/sqlite3.o" \
+  -o "$ARTIFACT_DIR/sqlite3.o" \
   -DSQLITE_CORE \
   -DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
   -DSQLITE_ENABLE_API_ARMOR \
@@ -44,5 +47,27 @@ mkdir -p "$BUILD_DIR"
   -DSQLITE_OMIT_SHARED_CACHE \
   -DSQLITE_DEFAULT_MEMSTATUS=0
 
-"$AR" rcs "$BUILD_DIR/libsqlite3_ic.a" "$BUILD_DIR/sqlite3.o"
-echo "built $BUILD_DIR/libsqlite3_ic.a (SQLite ${SQLITE_VERSION}, wasm32-wasi)"
+"$AR" rcs "$ARTIFACT_DIR/libsqlite3_ic.a" "$ARTIFACT_DIR/sqlite3.o"
+
+# Canister config.nims links these objects from ARTIFACT_DIR next to the SQLite
+# archive. They must use the same wasm32-wasi target; host-compiled objects
+# cannot be linked into a canister wasm module.
+"$CC" \
+  --target=wasm32-wasi \
+  -Os \
+  -std=c99 \
+  -Ivendor/sqlite \
+  -Ic \
+  -c c/ic_sqlite_vfs_shim.c \
+  -o "$ARTIFACT_DIR/ic_sqlite_vfs_shim.o"
+
+"$CC" \
+  --target=wasm32-wasi \
+  -Os \
+  -std=c99 \
+  -Ivendor/sqlite \
+  -Ic \
+  -c c/sqlite_helpers.c \
+  -o "$ARTIFACT_DIR/sqlite_helpers.o"
+
+echo "built $ARTIFACT_DIR/libsqlite3_ic.a and C shims (SQLite ${SQLITE_VERSION}, wasm32-wasi)"
