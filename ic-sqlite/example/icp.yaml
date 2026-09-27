@@ -8,7 +8,9 @@ networks:
     mode: managed
     gateway:
       bind: "0.0.0.0"
-      port: 8000
+      # 0 lets the OS pick an unused port, so integration tests can run
+      # alongside other ICP projects and worktrees.
+      port: 0
     ii: true # http://id.ai.localhost:8000/#authorize
 
 environments:

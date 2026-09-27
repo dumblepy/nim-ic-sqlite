@@ -27,8 +27,16 @@ icp deploy
 You can call the backend directly:
 
 ```bash
-icp canister call backend greet '("Internet Computer")'
+icp canister call backend migrationCount '()' --query
+icp canister call backend put '("hello", "world")'
+icp canister call backend get '("hello")' --query
+icp canister call backend update '("hello", "updated")'
+icp canister call backend deleteValue '("hello")'
 ```
+
+`backend` は起動時と upgrade 時に migration を実行します。`kv` テーブルは
+migration 1、`kv_value_idx` は migration 2 で作成され、`migrationCount` は適用済み
+migration 数を返します。
 
 ## Local Backend Iteration
 

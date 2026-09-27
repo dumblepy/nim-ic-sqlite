@@ -29,3 +29,7 @@ task test, "Run native unit tests":
   exec "nim c -r --path:src --nimcache:build/nimcache/test_typed_write tests/test_typed_write.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_query_transaction tests/test_query_transaction.nim"
   exec "nim c -r --path:src --nimcache:build/nimcache/test_query_stable tests/test_query_stable.nim"
+  # The deployed canister links the wasm32-wasi SQLite archive, which is not
+  # committed. Build it here so `nimble test` works from a fresh checkout.
+  exec "./scripts/build_sqlite.sh"
+  exec "nim c -r --path:src --nimcache:build/nimcache/test_example_canister tests/test_example_canister.nim"

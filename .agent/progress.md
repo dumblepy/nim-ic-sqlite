@@ -22,7 +22,13 @@
 
 完了条件:
 - `actionlint .github/workflows/ci.yml` が終了コード 0 で完了する。
-- workflow が recursive submodule checkout 後に、コンテナ内で `nimble test` と `./scripts/build_sqlite.sh` を実行する。
+- workflow が recursive submodule checkout 後に、コンテナ内で `nimble test` を実行し、その task 内で `./scripts/build_sqlite.sh` と canister integration test を実行する。
+
+### Example canister integration
+
+完了条件:
+- `cd /application/ic-sqlite && nim c -r --path:src tests/test_example_canister.nim` が終了コード 0 で完了する。
+- Nim テストが `icp network start`、`icp deploy`、`icp canister call` を実行し、migration、INSERT/SELECT/UPDATE/DELETE、upgrade 後の stable memory 永続化を検証する。
 
 
 ### Phase 1 — SQLite Typed Executor
@@ -82,8 +88,8 @@
 
 ## 作業記録
 
-- 現在の問題: なし。GitHub Actions CI の workflow を追加済み。
-- 試したこと: `nicp_cdk` の CI を調査し、Docker Buildx・GitHub Actions cache・recursive submodule checkout を採用した。CI container 内では local `nicp_cdk` submodule を `nimble develop` 登録する。
-- 結果: `.github/workflows/ci.yml` は native test と wasm32-wasi SQLite archive build を push、pull request、手動実行で行う。`actionlint .github/workflows/ci.yml` と `git diff --check` は成功した。
-- 否定された仮説: CI runner のグローバル Nimble package に `nicp_cdk` が既に存在するという仮説。submodule を明示的に開発依存として登録するため前提にしない。
-- 次に試すこと: push または pull request 作成後、GitHub-hosted runner 上の CI 実行結果を確認する。
+- 現在の問題: なし。example canister の実行経路を含む統合テストを追加・検証済み。
+- 試したこと: existing `example` canister に migration-aware 初期化、migration 数を返す query、query annotation を追加し、Nim の `osproc` から `icp` を実行する統合テストを追加した。
+- 結果: test は deploy、migration、CRUD、upgrade 後の stable-memory 永続化を一連で検証する構成になった。初回コンパイルでは Nim の予約語 `method` を引数名に使ったため失敗し、`methodName` へ修正した。初回実行では残存 local network により起動できなかったため、開始前・終了時に対象 project の network を停止するよう修正した。さらに daemonized network start の stdout を `execCmdEx` が待ち続けることを確認し、起動だけは出力非捕捉の `execShellCmd` に切り替えた。`nimble test`（終了コード 0）、`nimble build`、`actionlint .github/workflows/ci.yml`、`git diff --check` は成功した。
+- 否定された仮説: native `initMemoryForTest` だけで canister の実行経路を十分に検証できるという仮説。wasm build・lifecycle hook・Candid call を通らないため採用しない。
+- 次に試すこと: なし。

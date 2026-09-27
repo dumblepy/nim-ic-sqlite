@@ -46,5 +46,4 @@ jobs:
             nimble develop -y
             cd /application/ic-sqlite
             nimble test
-            ./scripts/build_sqlite.sh
           '
