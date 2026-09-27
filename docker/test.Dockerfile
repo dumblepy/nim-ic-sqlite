@@ -101,19 +101,9 @@ RUN tar zxf nimlangserver.tar.gz
 RUN rm -f nimlangserver.tar.gz
 RUN mv nimlangserver /root/.nimble/bin/
 
-# Use the exact nicp_cdk commit pinned by the parent repository's submodule.
-# `/opt` is not hidden when Compose bind-mounts the workspace at /application.
-COPY nicp_cdk /opt/nicp_cdk
-RUN cd /opt/nicp_cdk && \
-    nimble --sync -y install && \
-    nimble path nicp_cdk
-RUN nicp cHeaders
-
-
 # check command installed successfully
 RUN nim -v
 RUN nimble -v
-RUN nimble path nicp_cdk
 RUN cargo -V
 RUN icp --version
 RUN ic-wasm --version
@@ -122,7 +112,4 @@ RUN wasm-opt --version
 
 
 RUN git config --global --add safe.directory /application
-COPY docker/test-entrypoint.sh /usr/local/bin/ic-sqlite-test-entrypoint
-RUN chmod +x /usr/local/bin/ic-sqlite-test-entrypoint
 WORKDIR /application
-ENTRYPOINT ["/usr/local/bin/ic-sqlite-test-entrypoint"]

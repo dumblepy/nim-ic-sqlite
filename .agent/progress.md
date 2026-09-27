@@ -22,13 +22,14 @@
 
 完了条件:
 - `actionlint .github/workflows/ci.yml` が終了コード 0 で完了する。
-- workflow が recursive submodule checkout 後に、コンテナ内で `nimble test` を実行し、その task 内で `./scripts/build_sqlite.sh` と canister integration test を実行する。
+- workflow が recursive submodule checkout 後に、コンテナ内で `./scripts/test.sh` を実行する。
+- `cd /application/ic-sqlite && ./scripts/test.sh` が終了コード 0 で完了し、Testament が native test と canister integration test の両方を実行する。
 
 ### GitHub Actions の nicp_cdk インストール
 
 完了条件:
-- `docker/test.Dockerfile` が submodule の `nicp_cdk` を `nimble --sync -y install` で導入し、その直後の `nimble path nicp_cdk` でパッケージを解決する。
-- 空の Nimble ディレクトリで `cd nicp_cdk && nimble --sync -y install` が終了コード 0 で完了し、`nimble path nicp_cdk` と `nicp` CLI が利用できる。
+- `docker/test.Dockerfile` と `docker/develop.Dockerfile` に Nim パッケージの install/develop/path コマンドが存在しない。
+- `cd /application/ic-sqlite && ./scripts/install.sh` が終了コード 0 で完了し、`nimble path nicp_cdk` と `nicp` CLI が利用できる。
 
 ### Example canister integration
 
@@ -94,9 +95,15 @@
 
 ## 作業記録
 
+- 現在の問題: Nim パッケージの導入が Dockerfile 内にあり、CI のテスト入口が `nimble test` 内の個別 `nim c -r` コマンド列だった。
+- 試したこと: `scripts/install.sh` に `nicp_cdk` の導入とヘッダー準備を移し、`scripts/test.sh` から導入・SQLite build・Testament 実行を順に呼ぶ構成に変更した。
+- 結果: `testament --simulate --megatest:off p 'tests/test_*.nim'` は native と canister integration を含む16件を検出した。`./scripts/test.sh` は全16件を Testament で実行し、すべて成功した。`nimble build`、スクリプト構文検査、Dockerfile の Nimble 導入コマンド不在も確認した。
+- 否定された仮説: `testament r tests/test_query_compiler.nim` でこのディレクトリ配置のテストを実行できるという仮説。`r` は Testament の標準的なカテゴリ形式を要求したため、`p` を使用する。
+- 次に試すこと: GitHub Actions で Docker image build と workflow を再実行して確認する。この環境には Docker CLI/daemon がないため Docker build 自体は未実行。
+
 - 現在の問題: GitHub Actions の Docker image build で `nicp_cdk` の `nimble develop -y` が依存解決に失敗し、`base32`、`illwill`、`cligen`、`nim-rustcrypto` が欠落した。
 - 試したこと: 隔離した空の Nimble ディレクトリで逐次解決 `--sync` を使って依存を取得し、`develop` と `install` の登録結果を比較した。
-- 結果: `--sync` では依存取得が成功。`develop` では `nimble path nicp_cdk` が失敗したが、`install` は CLI をビルドし `nimble path nicp_cdk` と `nicp --help` が成功した。Dockerfile を `nimble --sync -y install` に変更した。`cd ic-sqlite && nimble test` は native test、WASI SQLite build、canister deploy・CRUD を含め終了コード 0 で完了した。`nimble build` と `git diff --check` も成功した。
+- 結果: `--sync` では依存取得が成功。`develop` では `nimble path nicp_cdk` が失敗したが、`install` は CLI をビルドし `nimble path nicp_cdk` と `nicp --help` が成功した。さらに Git 管理情報を含まないソースコピーと空の Nimble ディレクトリで `nimble --sync -y install`、`nimble path nicp_cdk`、`nicp --help`、`nicp cHeaders` がすべて終了コード 0 で完了した。Dockerfile を `nimble --sync -y install` に変更した。`cd ic-sqlite && nimble test` は native test、WASI SQLite build、canister deploy・CRUD を含め終了コード 0 で完了した。`nimble build` と `git diff --check` も成功した。
 - 否定された仮説: `develop` だけで Dockerfile 後続の `nimble path nicp_cdk` と `nicp cHeaders` のための CLI 配置まで保証できるという仮説。
 - 次に試すこと: GitHub Actions で image build を再実行して確認する。この環境には Docker CLI/daemon がないため Docker build 自体は未実行。
 

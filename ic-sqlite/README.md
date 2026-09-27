@@ -242,13 +242,14 @@ projects without a fixed gateway-port conflict.
 
 ## Testing
 
-Run the full suite from `ic-sqlite/`:
+Run the full suite from `ic-sqlite/` (after checking out the `nicp_cdk` submodule):
 
 ```sh
-nimble test
+./scripts/test.sh
 ```
 
-This runs native unit tests, builds the wasm32-wasi SQLite archive, and starts
+The script installs the Nim package dependencies, runs native tests with
+Testament, builds the wasm32-wasi SQLite archive, and starts
 the local IC network for the example-canister integration test. The integration
 test verifies migrations, CRUD calls, and data persistence through a canister
 upgrade.

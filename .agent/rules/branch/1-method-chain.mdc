@@ -941,6 +941,12 @@ UpdateConnection.table(...)   -> UpdateTransactionContext
 
 したがって、今回の0件は SQLite の可視性やVFS overlayではなく Typed Reader の結果集約回帰だった。`TransactionLease` と `withUpdateQueryRead()` により通常 `Db.withQuery()` を経由せず同じ writer `sqlite3*` を借用する経路を維持する。今後はD0–D5の低水準診断を常時ログ化せず、回帰時の診断テストとして追加する。
 
+## 15. CI の導入・テスト入口
+
+`nicp_cdk` は親リポジトリで固定した submodule を実行時にインストールする。`ic-sqlite/scripts/install.sh` が Nimble の逐次依存解決、CLI 導入、C ヘッダー準備を担当し、Dockerfile は Nim toolchain までを用意する。
+
+`ic-sqlite/scripts/test.sh` は install、wasm32-wasi SQLite build、Testament の順に実行する。Testament は `tests/test_*.nim` に含まれる native test と canister integration test を個別に実行する。`nimble test` と GitHub Actions は同じスクリプトへ委譲する。
+
 ---
 
 ## 参考ソース

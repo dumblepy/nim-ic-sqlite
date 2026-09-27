@@ -104,7 +104,6 @@ RUN mv nimlangserver /root/.nimble/bin/
 # check command installed successfully
 RUN nim -v
 RUN nimble -v
-RUN nimble path nicp_cdk
 RUN cargo -V
 RUN icp --version
 RUN ic-wasm --version

@@ -35,11 +35,11 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
 
-      - name: Run native tests and build the WASI SQLite archive
+      - name: Run Testament and canister integration tests
         run: |
           set -euo pipefail
           docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
             set -euo pipefail
             cd /application/ic-sqlite
-            nimble test
+            ./scripts/test.sh
           '

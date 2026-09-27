@@ -1,3 +1,4 @@
 /ic_sqlite
 /tests/test_project_layout
 /tests/test_stable_backend
+/testresults/
