@@ -3,7 +3,7 @@
   "run_kind": "template",
   "nim_implementation": {
     "repository": "dumblepy/nim-ic-sqlite",
-    "commit": "cd426eb2e7d0f35807f032a7dee61fe14d04c286",
+    "commit": "96faaf95a03632c269038ae9b1e61a795cd66968",
     "sqlite_version": "3.53.4",
     "sqlite_page_size": 16384,
     "build_flags_source": "scripts/build_sqlite.sh"

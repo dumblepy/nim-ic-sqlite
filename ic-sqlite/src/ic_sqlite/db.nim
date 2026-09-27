@@ -141,7 +141,8 @@ proc persistMetadata(db: Db): Result[bool, DbError] =
       formatVersion: SuperblockFormatVersion,
       sqlitePageSize: db.sqlitePageSize,
       dbSize: databaseSize,
-      lastTxId: db.lastTxId)
+      lastTxId: db.lastTxId,
+      zeroExtents: currentZeroExtents())
     let encoded = encodeSuperblock(metadata)
     db.backend.write(0, unsafeAddr encoded[0], uint64(encoded.len))
     Result[bool, DbError](isOk: true, value: true)
@@ -165,12 +166,14 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
   let restoredSize = if existing.value.isSome: existing.value.get.dbSize else: 0'u64
   let restoredTxId = if existing.value.isSome: existing.value.get.lastTxId else: 0'u64
   let restoredPageSize = if existing.value.isSome: existing.value.get.sqlitePageSize else: 16384'u32
+  let restoredZeroExtents = if existing.value.isSome: existing.value.get.zeroExtents else: @[]
   if restoredPageSize != 16384'u32:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "unsupported SQLite page size in stable superblock"))
   db.config = config
   initVfs(sqliteBackend, if dbSize != 0: dbSize else: restoredSize,
-    maxDirtyPages = config.maxDirtyPages, maxDirtyBytes = config.maxDirtyBytes)
+    maxDirtyPages = config.maxDirtyPages, maxDirtyBytes = config.maxDirtyBytes,
+    zeroExtents = restoredZeroExtents, pageSize = restoredPageSize)
   beginOverlay()
   let flags = SqliteOpenReadWrite or SqliteOpenCreate or SqliteOpenNoMutex
   let code = sqlite3_open_v2("/main.db", addr db.raw, flags, "icstable")

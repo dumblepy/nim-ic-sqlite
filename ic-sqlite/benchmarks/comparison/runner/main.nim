@@ -16,7 +16,7 @@ const
   RustWasm = RustRepo / "benchmarks/kv-canister/target/wasm32-unknown-unknown/release/ic_sqlite_vfs_kv_bench.wasm"
   RustDid = RustRepo / "benchmarks/kv-canister/kv_bench.did"
   ExpectedRustSha = "1386239acff1dd7ede5ac78a2f0a22ef495195de"
-  ExpectedNimSha = "cd426eb2e7d0f35807f032a7dee61fe14d04c286"
+  ExpectedNimSha = "96faaf95a03632c269038ae9b1e61a795cd66968"
 
 proc shellOutput(command: string): string =
   let (output, status) = execCmdEx(command)
@@ -77,7 +77,8 @@ proc main() =
   let nimSha = shellOutput("git -C /application/ic-sqlite rev-parse HEAD")
   if rustSha != ExpectedRustSha or nimSha != ExpectedNimSha:
     raise newException(ValueError, "source SHA differs from pinned comparison manifest")
-  discard shellOutput("cd " & quoteShell(NimBackendDir) & " && nicp developmentBuild")
+  ## Rust uses Cargo's release profile; use the matching optimized Nim Wasm.
+  discard shellOutput("cd " & quoteShell(NimBackendDir) & " && nicp productionBuild")
   let nimWasmSha = sha256(NimWasm)
   let rustWasmSha = sha256(RustWasm)
   let rustPatchSha = sha256(ComparisonDir / "rust_host_stats.patch")

@@ -127,5 +127,7 @@
 - P1の基礎Canisterを追加し、`nicp developmentBuild` と `wasm-objdump` で基礎4 endpointのWasm exportを確認した。比較実行に必要なprepared read、churn、PocketIC runnerは未実装。
 - P1の基礎APIにprepared read、append、churn、実測SQLite統計とraw stable memory観測を追加し、`icp` の実CanisterでCRUDを確認した。`nicp_cdk` のobject→Candid変換に欠けていた `uint64` 対応を修正し、同CDKのNative試験で確認した。
 - P2のNim CLI transportは `icp --json` のCandidバイト列を復号する。固定Rust commitにread-only raw memory endpointパッチを適用し、fresh Canister 5組の比較を `ic-sqlite/benchmarks/comparison/results/20260927T153154Z/` に保存した。
-- P3の5,000件×100周回churnを両実装で完走し、各201ステップを `ic-sqlite/benchmarks/comparison/results/churn-20260927T153429Z/` に保存した。両実装のupgrade後churn継続、Native rollback、bounded region隔離も確認した。ZeroExtentの再open不具合は診断テストで再現しており未修正。
-- P4の公式Cycle Costs料金スナップショットと30日シナリオ推計を同churn runの `cost_estimate.json` に保存した。Heapと管理APIのCycles分類は未取得で、推計はstable memoryとUpdateのみ。
+- 最適化済みNim WasmとRust release Wasmによるfresh Canister 5組の比較を `ic-sqlite/benchmarks/comparison/results/20260927T234133Z/` に保存した。100-row Updateの中央値はNim 1,903,252、Rust 1,484,474 Wasm instructions（Nim/Rust 1.282）だった。
+- production Wasmで5,000件×100周回churnを両実装で完走し、各201ステップを `ic-sqlite/benchmarks/comparison/results/churn-20260927T234335Z/` に保存した。最終行数は両側5,000、raw stable pagesはNim 1,031、Rust 129で周回中に増えなかった。
+- ZeroExtentのtruncate→再拡張→reopen不具合を、VFS確定extentのsuperblock保存・復元とoverlay非活性readのゼロ化で修正し、Native回帰試験で確認した。両実装のupgrade後churn継続、Native rollback、bounded region隔離も確認した。
+- P4の公式Cycle Costs料金スナップショットと30日シナリオ推計をproduction churn runの `cost_estimate.json` に保存した。Heapと管理APIのCycles分類は未取得で、推計はstable memoryとUpdateのみ。

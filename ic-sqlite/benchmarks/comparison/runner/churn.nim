@@ -43,8 +43,10 @@ proc observe(transport: CliTransport; runId, implementation, repoSha, wasmSha,
     rawGrowthPages: some(rawGrowthPages(baseline, raw)), rowCount: count)
 
 proc main() =
-  if not fileExists(NimWasm) or not fileExists(RustWasm):
-    raise newException(OSError, "build both benchmark Wasm files first")
+  if not fileExists(RustWasm):
+    raise newException(OSError, "run benchmarks/comparison/prepare_rust.sh first")
+  ## Keep the Nim artifact comparable with Rust's Cargo release artifact.
+  discard commandOutput("cd " & quoteShell(CanisterDir / "backend") & " && nicp productionBuild")
   let runId = "churn-" & now().utc.format("yyyyMMdd'T'HHmmss") & "Z"
   let resultDir = ComparisonDir / "results" / runId
   createDir(resultDir)

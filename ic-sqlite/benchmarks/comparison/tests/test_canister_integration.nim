@@ -34,7 +34,13 @@ proc decodedReply(methodName, args: string; query = false): CandidRecord =
   candidValueToCandidRecord(variant.value)
 
 proc stopNetwork() =
-  discard run("icp network stop")
+  ## Stopping an already stopped local network is harmless in test setup.
+  let previous = getCurrentDir()
+  try:
+    setCurrentDir(CanisterDir)
+    discard execCmdEx("icp network stop")
+  finally:
+    setCurrentDir(previous)
 
 proc startNetwork() =
   let previous = getCurrentDir()
