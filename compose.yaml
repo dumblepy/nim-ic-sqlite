@@ -2,15 +2,7 @@ services:
   app:
     build: 
       context: .
-      dockerfile: Dockerfile
+      dockerfile: develop.Dockerfile
     tty: true
     volumes:
       - .:/application
-
-networks:
-  default:
-    ipam:
-      config:
-        # Docker's automatic address pools are exhausted on this host.
-        # Keep this project's bridge network in a dedicated, non-overlapping range.
-        - subnet: 10.254.0.0/24
