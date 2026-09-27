@@ -1,5 +1,5 @@
 ## High-level database entry point. SQLite C pointers remain private here.
-import std/options
+import std/[options, tables]
 import ./ffi/sqlite_api
 import ./ffi/vfs_exports
 import ./stable/[backend, superblock]
@@ -16,22 +16,45 @@ proc trapPublishFailure(message: string) {.noreturn.} =
   raise newException(CatchableError, "sqlite stable publish failed: " & message)
 
 type
+  TransactionLease* = ref object
+    active: bool
+    db: ptr Db
+  StatementCacheStats* = object
+    hits*: uint64
+    misses*: uint64
+  DbErrorKind* = enum
+    dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
+    dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
   DbError* = object
     code*: cint
     message*: string
+    kind*: DbErrorKind
+    column*: string
+    expectedType*: string
+    actualType*: string
+    rowIndex*: int
   DbConfig* = object
     maxDirtyPages*: uint64
     maxDirtyBytes*: uint64
     maxSqlBytes*: uint64
     maxBlobBytes*: uint64
+    maxResultRows*: uint64
+    maxResultBytes*: uint64
+    maxQueryParams*: uint64
+    statementCacheEnabled*: bool
+    maxCachedStatements*: uint64
   Db* = object
     raw: ptr Sqlite3
     backend: StableBackend
     sqlitePageSize: uint32
     lastTxId: uint64
     config: DbConfig
+    currentUpdate: TransactionLease
+    statementCache: Table[string, ptr Sqlite3Stmt]
+    statementCacheStats: StatementCacheStats
   UpdateConnection* = object
     db: ptr Db
+    lease: TransactionLease
   Connection* = object
     db: ptr Db
     raw: ptr Sqlite3
@@ -39,6 +62,8 @@ type
     raw: ptr Sqlite3Stmt
     db: ptr Db
     errorSource: ptr Sqlite3
+    cached: bool
+    cacheKey: string
   StepResult* = enum
     srRow, srDone
   Migration* = object
@@ -50,11 +75,29 @@ const Wasi2icReservedStablePages = 1025'u64
 
 proc defaultDbConfig*(): DbConfig =
   DbConfig(maxDirtyPages: 4096, maxDirtyBytes: 64'u64 * 1024 * 1024,
-    maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024)
+    maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
+    maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
+    maxQueryParams: 999, statementCacheEnabled: false,
+    maxCachedStatements: 32)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
-    config.maxSqlBytes > 0 and config.maxBlobBytes > 0
+    config.maxSqlBytes > 0 and config.maxBlobBytes > 0 and
+    config.maxResultRows > 0 and config.maxResultBytes > 0 and
+    config.maxQueryParams > 0 and
+    (not config.statementCacheEnabled or config.maxCachedStatements > 0)
+
+proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
+  (db.config.maxResultRows, db.config.maxResultBytes, db.config.maxQueryParams)
+
+proc statementCacheStats*(db: Db): StatementCacheStats = db.statementCacheStats
+
+proc clearStatementCache(db: var Db) =
+  for _, statement in db.statementCache:
+    if not statement.isNil:
+      discard sqlite3_finalize(statement)
+  db.statementCache.clear()
+  db.statementCacheStats = StatementCacheStats()
 
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
   ## wasi2ic reserves stable memory under the MGR+version header. Preserve that
@@ -100,6 +143,9 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
   if backend.isNil: return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "nil stable backend"))
   if not config.configIsValid:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "invalid database resource limits"))
+  when not defined(wasm32):
+    if ic_sqlite_register_vfs() != sqlite_api.SqliteOk:
+      return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "unable to register icstable VFS"))
   let sqliteBackend = sqliteStableBackend(backend)
   let existing = readExistingSuperblock(sqliteBackend)
   if not existing.isOk:
@@ -152,6 +198,7 @@ when not defined(wasm32):
     Result[bool, DbError](isOk: true, value: true)
 
 proc close*(db: var Db) =
+  db.clearStatementCache()
   if not db.raw.isNil:
     discard sqlite3_close(db.raw)
     db.raw = nil
@@ -237,6 +284,43 @@ proc execText*(db: var Db; sql: string; values: openArray[string]): Result[int, 
   if not finished.isOk: return Result[int, DbError](isOk: false, error: finished.error)
   executed
 
+proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError]
+proc finalize*(statement: var Statement)
+
+proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
+  ## Typed prepared execution using the same overlay/publish path as execText.
+  if db.raw.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized", kind: dekInvalidState))
+  let begun = db.beginStableOperation()
+  if not begun.isOk: return Result[int, DbError](isOk: false, error: begun.error)
+  var raw: ptr Sqlite3Stmt
+  var code = sqlite3_prepare_v2(db.raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code == sqlite_api.SqliteOk and int(sqlite3_bind_parameter_count(raw)) != values.len:
+    code = -1
+  if code == sqlite_api.SqliteOk:
+    var statement = Statement(raw: raw, db: addr db, errorSource: db.raw)
+    for index, value in values:
+      let bound = statement.bind(index + 1, value)
+      if not bound.isOk:
+        statement.finalize()
+        discard db.finishStableOperation(begun.value, false)
+        return Result[int, DbError](isOk: false, error: bound.error)
+    code = sqlite3_step(raw)
+    statement.finalize()
+  elif not raw.isNil:
+    discard sqlite3_finalize(raw)
+  if code != SqliteDone:
+    discard db.finishStableOperation(begun.value, false)
+    return Result[int, DbError](isOk: false, error: db.dbError(code))
+  let finished = db.finishStableOperation(begun.value, true)
+  if not finished.isOk: return Result[int, DbError](isOk: false, error: finished.error)
+  Result[int, DbError](isOk: true, value: int(sqlite3_changes(db.raw)))
+
+proc lastInsertId*(db: Db): Result[int64, DbError] =
+  if db.raw.isNil:
+    return Result[int64, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not initialized", kind: dekInvalidState))
+  Result[int64, DbError](isOk: true, value: sqlite3_last_insert_rowid(db.raw))
+
 proc exec*(conn: var UpdateConnection; sql: string): Result[int, DbError] =
   if conn.db.isNil:
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
@@ -247,6 +331,60 @@ proc execText*(conn: var UpdateConnection; sql: string; values: openArray[string
     return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection"))
   conn.db[].execTextRaw(sql, values)
 
+proc execValues*(conn: var UpdateConnection; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
+  ## Executes inside the active withUpdate transaction; it never starts an overlay.
+  if conn.db.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "nil update connection", kind: dekInvalidState))
+  var raw: ptr Sqlite3Stmt
+  var code = sqlite3_prepare_v2(conn.db[].raw, sql.cstring, sql.len.cint, addr raw, nil)
+  if code == sqlite_api.SqliteOk and int(sqlite3_bind_parameter_count(raw)) != values.len: code = -1
+  if code == sqlite_api.SqliteOk:
+    var statement = Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw)
+    for index, value in values:
+      let bound = statement.bind(index + 1, value)
+      if not bound.isOk:
+        statement.finalize()
+        return Result[int, DbError](isOk: false, error: bound.error)
+    code = sqlite3_step(raw)
+    statement.finalize()
+  elif not raw.isNil:
+    discard sqlite3_finalize(raw)
+  if code != sqlite_api.SqliteDone:
+    return Result[int, DbError](isOk: false, error: conn.db[].dbError(code))
+  Result[int, DbError](isOk: true, value: int(sqlite3_changes(conn.db[].raw)))
+
+proc lastInsertId*(conn: UpdateConnection): Result[int64, DbError] =
+  if conn.db.isNil:
+    return Result[int64, DbError](isOk: false,
+      error: DbError(code: -1, message: "nil update connection", kind: dekInvalidState))
+  Result[int64, DbError](isOk: true, value: sqlite3_last_insert_rowid(conn.db[].raw))
+
+proc ownerDb*(conn: var UpdateConnection): ptr Db = conn.db
+
+proc transactionLease*(conn: UpdateConnection): TransactionLease = conn.lease
+
+proc withUpdateQueryRead*[T](lease: TransactionLease;
+    body: proc(conn: var Connection): Result[T, DbError] {.closure.}
+  ): Result[T, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease or lease.db[].raw.isNil:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  var borrowed = Connection(db: lease.db, raw: lease.db[].raw)
+  body(borrowed)
+
+proc execValuesInTransaction*(lease: TransactionLease; sql: string;
+                               values: openArray[SqlValue]): Result[int, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease:
+    return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  var connection = UpdateConnection(db: lease.db, lease: lease)
+  connection.execValues(sql, values)
+
+proc lastInsertIdInTransaction*(lease: TransactionLease): Result[int64, DbError] =
+  if lease.isNil or not lease.active or lease.db.isNil or lease.db[].currentUpdate != lease:
+    return Result[int64, DbError](isOk: false, error: DbError(code: -1, message: "update query context is no longer active", kind: dekInvalidState))
+  lease.db[].lastInsertId()
+
+
+
 proc withQuery*[T](db: var Db;
                    body: proc(conn: var Connection): Result[T, DbError] {.closure.}
                   ): Result[T, DbError] =
@@ -256,6 +394,9 @@ proc withQuery*[T](db: var Db;
   if db.raw.isNil:
     return Result[T, DbError](isOk: false,
       error: DbError(code: -1, message: "database is not initialized"))
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "ordinary query is forbidden during withUpdate", kind: dekInvalidState))
   if db.backend.isNil:
     let queryOnlyCode = sqlite3_exec(db.raw, "PRAGMA query_only=ON".cstring, nil, nil, nil)
     if queryOnlyCode != sqlite_api.SqliteOk:
@@ -286,17 +427,45 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "SQL exceeds configured limit"))
+  let cacheable = conn.db[].config.statementCacheEnabled and conn.raw == conn.db[].raw
+  if cacheable and conn.db[].statementCache.hasKey(sql):
+    let raw = conn.db[].statementCache[sql]
+    discard sqlite3_reset(raw)
+    discard sqlite3_clear_bindings(raw)
+    inc conn.db[].statementCacheStats.hits
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+        cached: true, cacheKey: sql))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.raw, code))
+  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
+    conn.db[].statementCache[sql] = raw
+    inc conn.db[].statementCacheStats.misses
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+        cached: true, cacheKey: sql))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
 proc finalize*(statement: var Statement) =
   if not statement.raw.isNil:
-    discard sqlite3_finalize(statement.raw)
+    if statement.cached:
+      discard sqlite3_reset(statement.raw)
+      discard sqlite3_clear_bindings(statement.raw)
+    else:
+      discard sqlite3_finalize(statement.raw)
     statement.raw = nil
+
+proc parameterCount*(statement: Statement): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_bind_parameter_count(statement.raw))
+
+proc queryLimits*(statement: Statement): tuple[maxRows, maxBytes, maxParams: uint64] =
+  if statement.db.isNil: (0'u64, 0'u64, 0'u64) else: statement.db[].queryLimits()
+
+proc isReadonly*(statement: Statement): bool =
+  not statement.raw.isNil and sqlite3_stmt_readonly(statement.raw) != 0
 
 proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError] =
   if statement.raw.isNil or statement.db.isNil:
@@ -332,7 +501,21 @@ proc step*(statement: var Statement): Result[StepResult, DbError] =
   Result[StepResult, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
 
 proc columnIsNull*(statement: Statement; index: int): bool =
-  not statement.raw.isNil and sqlite3_column_type(statement.raw, index.cint) == 5
+  not statement.raw.isNil and sqlite3_column_type(statement.raw, index.cint) == SqliteNull
+
+proc columnType*(statement: Statement; index: int): cint =
+  if statement.raw.isNil: SqliteNull else: sqlite3_column_type(statement.raw, index.cint)
+
+proc columnCount*(statement: Statement): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_column_count(statement.raw))
+
+proc columnName*(statement: Statement; index: int): string =
+  if statement.raw.isNil: return ""
+  let name = sqlite3_column_name(statement.raw, index.cint)
+  if name.isNil: "" else: $name
+
+proc columnBytes*(statement: Statement; index: int): int =
+  if statement.raw.isNil: 0 else: int(sqlite3_column_bytes(statement.raw, index.cint))
 
 proc columnInt64*(statement: Statement; index: int): int64 =
   sqlite3_column_int64(statement.raw, index.cint)
@@ -342,7 +525,10 @@ proc columnFloat64*(statement: Statement; index: int): float64 =
 
 proc columnText*(statement: Statement; index: int): string =
   let text = sqlite3_column_text(statement.raw, index.cint)
-  if text.isNil: "" else: $text
+  let length = sqlite3_column_bytes(statement.raw, index.cint)
+  if text.isNil or length <= 0: return ""
+  result = newString(int(length))
+  copyMem(addr result[0], text, int(length))
 
 proc columnBlob*(statement: Statement; index: int): seq[byte] =
   let length = sqlite3_column_bytes(statement.raw, index.cint)
@@ -364,8 +550,21 @@ proc withUpdate*[T](db: var Db;
   if not beginResult.isOk:
     discard db.finishStableOperation(begun.value, false)
     return Result[T, DbError](isOk: false, error: beginResult.error)
-  var connection = UpdateConnection(db: addr db)
-  let bodyResult = body(connection)
+  let lease = TransactionLease(active: true, db: addr db)
+  db.currentUpdate = lease
+  defer:
+    lease.active = false
+    lease.db = nil
+    if db.currentUpdate == lease: db.currentUpdate = nil
+  var connection = UpdateConnection(db: addr db, lease: lease)
+  var bodyResult: Result[T, DbError]
+  try:
+    bodyResult = body(connection)
+  except CatchableError as error:
+    discard db.execRaw("ROLLBACK")
+    discard db.finishStableOperation(begun.value, false)
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: error.msg, kind: dekInvalidState))
   if not bodyResult.isOk:
     discard db.execRaw("ROLLBACK")
     discard db.finishStableOperation(begun.value, false)

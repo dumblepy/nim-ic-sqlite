@@ -1,13 +1,13 @@
 import std/os
 
 let icSqliteRoot = "/application/ic-sqlite"
-switch("define", "nicpDisableWasiPolyfill")
+let sqliteWasiArtifacts = icSqliteRoot / "vendor" / "sqlite" / "wasm32-wasi"
 switch("path", icSqliteRoot / "src")
 switch("passC", "-I" & icSqliteRoot / "vendor/sqlite")
 switch("passC", "-I" & icSqliteRoot / "c")
-switch("passL", icSqliteRoot / "build/libsqlite3_ic.a")
-switch("passL", icSqliteRoot / "build/ic_sqlite_vfs_shim.o")
-switch("passL", icSqliteRoot / "build/sqlite_helpers.o")
+switch("passL", sqliteWasiArtifacts / "libsqlite3_ic.a")
+switch("passL", sqliteWasiArtifacts / "ic_sqlite_vfs_shim.o")
+switch("passL", sqliteWasiArtifacts / "sqlite_helpers.o")
 
 --mm: "orc"
 --threads: "off"

@@ -11,15 +11,5 @@ requires "nim >= 2.2.12"
 # Consumers building canisters provide nicp_cdk through their Nimble environment.
 requires "nicp_cdk >= 0.1.0"
 
-task test, "Run native unit tests":
-  # Nim cache entries include a program's reachable module graph.  Keep one
-  # cache per test executable so partial graphs cannot be reused by another.
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_project_layout tests/test_project_layout.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_stable_backend tests/test_stable_backend.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_superblock tests/test_superblock.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_overlay tests/test_overlay.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_temp_file tests/test_temp_file.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_vfs tests/test_vfs.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_vfs_exports tests/test_vfs_exports.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_sqlite_api tests/test_sqlite_api.nim"
-  exec "nim c -r --path:src --nimcache:build/nimcache/test_db_api tests/test_db_api.nim"
+task test, "Run the full test suite with Testament":
+  exec "./scripts/test.sh"

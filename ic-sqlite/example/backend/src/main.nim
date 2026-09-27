@@ -7,6 +7,13 @@ import ic_sqlite/stable/ic_backend
 var database: Db
 var databaseReady = false
 
+const migrations = [
+  Migration(version: 1,
+    sql: "CREATE TABLE kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"),
+  Migration(version: 2,
+    sql: "CREATE INDEX kv_value_idx ON kv(value)")
+]
+
 proc greet() {.query.} =
   let request = Request.new()
   reply("Hello, " & request.getStr(0) & "!")
@@ -16,7 +23,7 @@ proc initializeDatabase() =
   ## image. A failure must reject install/upgrade rather than leave a canister
   ## that might later overwrite a foreign stable-memory image.
   database.close()
-  let initialized = database.initDatabase(newIcStableBackend())
+  let initialized = database.initDatabase(newIcStableBackend(), migrations)
   if not initialized.isOk:
     let message = "ic-sqlite initialization failed: " & initialized.error.message
     ic0_trap(cast[int](message.cstring), message.len)
@@ -71,7 +78,7 @@ proc put() {.update.} =
     return
   reply("ok")
 
-proc get() {.update.} =
+proc get() {.query.} =
   let request = Request.new()
   let setupError = ensureDatabase()
   if setupError.len > 0:
@@ -84,6 +91,16 @@ proc get() {.update.} =
     reply(found.value.get)
   else:
     reply("not_found")
+
+proc migrationCount() {.query.} =
+  let found = database.queryOneText(
+    "SELECT CAST(count(*) AS TEXT) FROM __nim_ic_sqlite_migrations", [])
+  if not found.isOk:
+    reply("error: " & found.error.message)
+  elif found.value.isSome:
+    reply(found.value.get)
+  else:
+    reply("0")
 
 proc update() {.update.} =
   let request = Request.new()

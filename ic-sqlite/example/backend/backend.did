@@ -3,7 +3,8 @@ service : {
   selectOne : () -> (text);
   createTable : () -> (text);
   put : (text, text) -> (text);
-  get : (text) -> (text);
+  get : (text) -> (text) query;
+  migrationCount : () -> (text) query;
   update : (text, text) -> (text);
   deleteValue : (text) -> (text);
 };

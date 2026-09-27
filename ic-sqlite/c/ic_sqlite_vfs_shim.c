@@ -4,18 +4,19 @@
 #include <string.h>
 
 /* Every function below is exported by Nim with {.exportc, cdecl.}. */
-extern int nim_icvfs_open(const char *, int, uint32_t *, int *);
-extern int nim_icvfs_close(uint32_t);
-extern int nim_icvfs_read(uint32_t, void *, int, sqlite3_int64);
-extern int nim_icvfs_write(uint32_t, const void *, int, sqlite3_int64);
-extern int nim_icvfs_truncate(uint32_t, sqlite3_int64);
-extern int nim_icvfs_file_size(uint32_t, sqlite3_int64 *);
-extern int nim_icvfs_lock(uint32_t, int);
-extern int nim_icvfs_unlock(uint32_t, int);
-extern int nim_icvfs_check_reserved_lock(uint32_t, int *);
-extern int nim_icvfs_randomness(void *, int);
-extern int nim_icvfs_current_time(double *);
-extern int nim_icvfs_last_error(char *, int);
+#define IC_WEAK __attribute__((weak))
+extern int nim_icvfs_open(const char *, int, uint32_t *, int *) IC_WEAK;
+extern int nim_icvfs_close(uint32_t) IC_WEAK;
+extern int nim_icvfs_read(uint32_t, void *, int, sqlite3_int64) IC_WEAK;
+extern int nim_icvfs_write(uint32_t, const void *, int, sqlite3_int64) IC_WEAK;
+extern int nim_icvfs_truncate(uint32_t, sqlite3_int64) IC_WEAK;
+extern int nim_icvfs_file_size(uint32_t, sqlite3_int64 *) IC_WEAK;
+extern int nim_icvfs_lock(uint32_t, int) IC_WEAK;
+extern int nim_icvfs_unlock(uint32_t, int) IC_WEAK;
+extern int nim_icvfs_check_reserved_lock(uint32_t, int *) IC_WEAK;
+extern int nim_icvfs_randomness(void *, int) IC_WEAK;
+extern int nim_icvfs_current_time(double *) IC_WEAK;
+extern int nim_icvfs_last_error(char *, int) IC_WEAK;
 
 static int ic_xClose(sqlite3_file *file) {
   IcFile *f = (IcFile *)file;
@@ -132,5 +133,6 @@ sqlite3_vfs IC_VFS = {
   NULL, NULL, NULL, NULL
 };
 
-int sqlite3_os_init(void) { return sqlite3_vfs_register(&IC_VFS, 1); }
+int ic_sqlite_register_vfs(void) { return sqlite3_vfs_register(&IC_VFS, 1); }
+int sqlite3_os_init(void) { return ic_sqlite_register_vfs(); }
 int sqlite3_os_end(void) { return SQLITE_OK; }
