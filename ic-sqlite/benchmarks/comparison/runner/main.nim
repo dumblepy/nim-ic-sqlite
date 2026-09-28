@@ -17,7 +17,7 @@ const
   RustWasm = RustRepo / "benchmarks/kv-canister/target/wasm32-unknown-unknown/release/ic_sqlite_vfs_kv_bench.wasm"
   RustDid = RustRepo / "benchmarks/kv-canister/kv_bench.did"
   ExpectedRustSha = "1386239acff1dd7ede5ac78a2f0a22ef495195de"
-  ExpectedNimSha = "4735f04908ae9a7ac30bac6d05aa7aaa1e0da260"
+  DefaultNimSha = "4735f04908ae9a7ac30bac6d05aa7aaa1e0da260"
 
 proc shellOutput(command: string): string =
   let (output, status) = execCmdEx(command)
@@ -81,8 +81,13 @@ proc main() =
     raise newException(OSError, "run benchmarks/comparison/prepare_rust.sh first")
   let rustSha = shellOutput("git -C " & quoteShell(RustRepo) & " rev-parse HEAD")
   let nimSha = shellOutput("git -C /application/ic-sqlite rev-parse HEAD")
-  if rustSha != ExpectedRustSha or nimSha != ExpectedNimSha:
-    raise newException(ValueError, "source SHA differs from pinned comparison manifest")
+  if rustSha != ExpectedRustSha:
+    raise newException(ValueError, "Rust source SHA differs from the pinned comparison manifest")
+  # In CI the working tree is the PR commit; the runner then measures
+  # HEAD itself instead of the pinned Nim commit.
+  let expectedNimSha = getEnv("NISQL_COMPARE_NIM_SHA", DefaultNimSha)
+  if expectedNimSha != "HEAD" and nimSha != expectedNimSha:
+    raise newException(ValueError, "Nim source SHA differs from the pinned comparison manifest")
   ## Rust uses Cargo's release profile; use the matching optimized Nim Wasm.
   discard shellOutput("cd " & quoteShell(NimBackendDir) & " && nicp productionBuild")
   let nimWasmSha = sha256(NimWasm)

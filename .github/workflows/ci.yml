@@ -43,3 +43,42 @@ jobs:
             cd /application/ic-sqlite
             ./scripts/test.sh
           '
+
+  comparison-regression:
+    name: Comparison build and paired core-KV regression
+    runs-on: ubuntu-latest
+    ## Cold cargo build of the pinned Rust benchmark canister included.
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/bake-action@v5
+        with:
+          files: compose.test.yaml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      # CI regression is deliberately short (single trial, 100 rows). The
+      # accepted condition is a successful paired build + install, complete
+      # non-missing instructions / stable-memory / heap observations, and a
+      # mechanically valid result set. Full 5-trial and 100-churn runs are
+      # manual benchmarks recorded under results/<run-id>/.
+      - name: Build both benchmark Wasm files and run paired regression
+        run: |
+          set -euo pipefail
+          docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
+            set -euo pipefail
+            cd /application/ic-sqlite
+            ./benchmarks/comparison/run_comparison_ci.sh
+          '

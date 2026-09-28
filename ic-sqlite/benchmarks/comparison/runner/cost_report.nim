@@ -2,6 +2,7 @@
 ## Usage: nim c -r runner/cost_report.nim <results/churn-run-id>
 import std/[algorithm, json, os]
 import ../shared/cost_model
+import ./validate
 
 const PricingPath = "/application/ic-sqlite/benchmarks/comparison/pricing_2026-09-27.json"
 
@@ -25,6 +26,8 @@ proc median(values: var seq[uint64]): uint64 =
 proc main() =
   if paramCount() != 1: raise newException(ValueError, "pass one completed churn results directory")
   let resultDir = paramStr(1)
+  ## Refuse to cost a run that has missing, failed, or unpaired steps.
+  validateChurnResults(resultDir / "measurements.jsonl")
   let pricing = parseFile(PricingPath)
   let rates = CycleRates(subnetNodes: pricing["subnet_nodes"].getBiggestInt().uint64,
     updateBaseCyclesPerMessage: pricing["update_base_cycles_per_message"].getBiggestInt().uint64,
