@@ -118,9 +118,11 @@ proc main() =
   manifest["trials"] = %trialCount
   manifest["rows_per_trial"] = %100'u32
   manifest["trial_baselines"] = newJArray()
+  manifest["cycle_balance_observations"] = newJArray()
   manifest["notes"] = %["Both implementations use fresh canisters on the same local subnet per trial.",
     "Rust source is pinned plus rust_host_stats.patch; both physical page counts use ic0 stable64_size.",
     "heap_bytes is derived from canister status memory_size minus raw stable bytes; it is a local status observation.",
+    "cycle_balance_observations are management-status balance deltas; they include local replica accounting and are not instruction-only execution costs.",
     "Nim and nicp_cdk working trees are dirty; source file hashes identify the measured build.",
     "Query instructions are measured separately and are not cycles estimates."]
   writeFile(resultDir / "manifest.json", manifest.pretty())
@@ -153,13 +155,25 @@ proc main() =
     writeFile(resultDir / "manifest.json", manifest.pretty())
     for phase in ["reset", "read", "update"]:
       for implementation in ["nim", "rust"]:
+        let canister = if implementation == "nim": nimCanister else: rustCanister
+        let beforeStatus = transport.canisterStatus(canister)
         let measurement = measure(transport, runId, implementation,
           if implementation == "nim": nimSha else: rustSha,
           if implementation == "nim": nimWasmSha else: rustWasmSha,
-          if implementation == "nim": nimCanister else: rustCanister,
+          canister,
           if implementation == "nim": NimDid else: RustDid,
           phase, uint32(trial), 100'u32,
           if implementation == "nim": nimBaseline else: rustBaseline)
+        let afterStatus = transport.canisterStatus(canister)
+        let beforeCycles = beforeStatus.canisterCycles()
+        let afterCycles = afterStatus.canisterCycles()
+        manifest["cycle_balance_observations"].add(%*{
+          "trial": trial, "implementation": implementation, "phase": phase,
+          "cycles_before": beforeCycles, "cycles_after": afterCycles,
+          "reserved_cycles_before": beforeStatus.canisterReservedCycles(),
+          "reserved_cycles_after": afterStatus.canisterReservedCycles()
+        })
+        writeFile(resultDir / "manifest.json", manifest.pretty())
         csv.add(measurement.toCsvRow() & "\n")
         jsonl.add($measurement.toJson() & "\n")
         if phase == "update":

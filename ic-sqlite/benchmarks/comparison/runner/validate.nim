@@ -6,6 +6,7 @@ import std/[json, os, sets, strformat]
 const
   CorePhases* = ["reset", "read", "update"]
   ChurnPhases = ["reset", "delete", "insert"]
+  ProfileNames = ["read", "write", "get_many_in", "growth"]
 
 proc requiredNumber(row: JsonNode; field, label: string) =
   if not row.hasKey(field) or row[field].kind == JNull:
@@ -93,12 +94,32 @@ proc validateChurnResults*(measurementsPath: string) =
           let key = implementation & ":" & phase & ":" & $cycle
           if key notin seen: raise newException(ValueError, "missing churn measurement: " & key)
 
+proc validateProfileResults*(measurementsPath: string) =
+  var seen = initHashSet[string]()
+  for line in lines(measurementsPath):
+    if line.len == 0: continue
+    let row = parseJson(line)
+    let implementation = row["implementation"].getStr()
+    let profile = row["profile"].getStr()
+    if implementation notin ["nim", "rust"] or profile notin ProfileNames:
+      raise newException(ValueError, "unknown profile measurement")
+    let key = implementation & ":" & profile
+    if key in seen: raise newException(ValueError, "duplicate profile measurement: " & key)
+    seen.incl(key)
+    for field in ["rows", "instructions", "checksum", "db_size", "stable_pages", "stable_bytes", "raw_stable_pages", "raw_stable_bytes"]:
+      requiredNumber(row, field, key)
+  for implementation in ["nim", "rust"]:
+    for profile in ProfileNames:
+      let key = implementation & ":" & profile
+      if key notin seen: raise newException(ValueError, "missing profile measurement: " & key)
+
 proc runKind*(measurementsPath: string): string =
   ## `churn_capacity` for churn runs, `local_comparison` for core KV runs.
   ## Rows without a scenario field are core-KV rows (legacy fixtures).
   for line in lines(measurementsPath):
     if line.len == 0: continue
     let row = parseJson(line)
+    if row.hasKey("profile"): return "profile"
     let scenario = if row.hasKey("scenario"): row["scenario"].getStr() else: ""
     return if scenario == "churn_5000x100": "churn_capacity" else: "local_comparison"
   raise newException(ValueError, "no measurements to validate")
@@ -111,6 +132,7 @@ proc main() =
     raise newException(OSError, "missing measurements.jsonl")
   case runKind(measurementsPath)
   of "churn_capacity": validateChurnResults(measurementsPath)
+  of "profile": validateProfileResults(measurementsPath)
   else: validateCoreResults(measurementsPath)
   echo fmt"validated {measurementsPath}"
 

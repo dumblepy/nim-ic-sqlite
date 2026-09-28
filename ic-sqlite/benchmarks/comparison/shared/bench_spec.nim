@@ -35,6 +35,8 @@ proc benchKey*(index: uint32): string = prefixedKey('k', index)
 proc churnKey*(index: uint32): string = prefixedKey('c', index)
 proc benchValue*(index: uint32): string = "value-" & fixedIndex(index) & "-stable-vfs"
 proc updatedValue*(index: uint32): string = "updated-" & fixedIndex(index) & "-stable-vfs"
+proc growthValue*(index: uint32): string = "growth-" & fixedIndex(index) & "-stable-vfs"
+proc writeValue*(index: uint32): string = "write-" & fixedIndex(index)
 
 proc churnDeleteRange*(cycle: uint32): tuple[start, count: uint32] =
   if cycle >= 100'u32:

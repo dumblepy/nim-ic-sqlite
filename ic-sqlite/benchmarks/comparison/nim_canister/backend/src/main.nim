@@ -19,9 +19,62 @@ type
     phase: string
   HostStatsReport = object
     raw_stable_pages, raw_stable_bytes: uint64
+  NimCapacityGrowthReport = object
+    rows, writes, instructions, checksum: uint64
+    db_size_before, db_size_after: uint64
+    sqlite_virtual_pages_before, sqlite_virtual_pages_after: uint64
+    raw_stable_pages_before, raw_stable_pages_after: uint64
+    raw_stable_bytes_before, raw_stable_bytes_after: uint64
+  NimGrowthProfileReport = object
+    rows, writes, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
+    update_open, key_value_format, execute_total: uint64
+    stable_read_calls, stable_read_bytes, stable_write_calls, stable_write_bytes: uint64
+    stable_grow_calls, stable_grow_pages: uint64
+  NimReadProfileReport = object
+    rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
+    prepare, reset_bind, step, column_read: uint64
+    stable_read_calls, stable_read_bytes: uint64
+  NimWriteProfileReport = object
+    rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
+    update_open, prepare, key_value_format, execute_total: uint64
+    stable_read_calls, stable_read_bytes, stable_write_calls, stable_write_bytes: uint64
+    stable_grow_calls, stable_grow_pages: uint64
+  NimGetManyProfileReport = object
+    rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
+    sql_build, key_build, prepare, bind_total, row_scan: uint64
+    stable_read_calls, stable_read_bytes: uint64
+  StableIoMetrics = object
+    readCalls, readBytes, writeCalls, writeBytes, growCalls, growPages: uint64
+  MetricsBackend = ref object of stable_backend.StableBackend
+    inner: stable_backend.StableBackend
+
+var stableIoMetrics: StableIoMetrics
+var stableIoMetricsEnabled = false
+
+proc resetStableIoMetrics() = stableIoMetrics = StableIoMetrics()
+
+proc newMetricsBackend(): MetricsBackend = MetricsBackend(inner: newIcStableBackend())
+
+method sizePages(backend: MetricsBackend): uint64 = backend.inner.sizePages()
+method grow(backend: MetricsBackend; pages: uint64): bool =
+  if stableIoMetricsEnabled:
+    inc stableIoMetrics.growCalls
+    stableIoMetrics.growPages += pages
+  backend.inner.grow(pages)
+method read(backend: MetricsBackend; offset: uint64; dst: pointer; size: uint64) =
+  if stableIoMetricsEnabled:
+    inc stableIoMetrics.readCalls
+    stableIoMetrics.readBytes += size
+  backend.inner.read(offset, dst, size)
+method write(backend: MetricsBackend; offset: uint64; src: pointer; size: uint64) =
+  if stableIoMetricsEnabled:
+    inc stableIoMetrics.writeCalls
+    stableIoMetrics.writeBytes += size
+  backend.inner.write(offset, src, size)
 
 var database: Db
 var databaseReady = false
+var useMetricsBackend = false
 
 when defined(benchmarkFailpoint):
   type FaultInjectingBackend = ref object of stable_backend.StableBackend
@@ -60,7 +113,7 @@ proc ensureDatabase(): string =
   when defined(benchmarkFailpoint):
     let opened = database.init(newFaultInjectingBackend())
   else:
-    let opened = database.init(newIcStableBackend())
+    let opened = database.init(if useMetricsBackend: newMetricsBackend() else: newIcStableBackend())
   if not opened.isOk: return opened.error.message
   let schema = database.exec("CREATE TABLE IF NOT EXISTS bench (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID")
   if not schema.isOk: return schema.error.message
@@ -411,7 +464,8 @@ proc bench_growth() {.update.} =
     let schema = conn.exec("DROP TABLE IF EXISTS growth_bench; CREATE TABLE growth_bench (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
     if not schema.isOk: return Result[bool, DbError](isOk: false, error: schema.error)
     for index in 0'u32 ..< rows:
-      let inserted = conn.execValues("INSERT INTO growth_bench(key, value) VALUES (?, ?)", [sqlText(prefixedKey('g', index)), sqlText("seed-" & $index)])
+      let inserted = conn.execValues("INSERT INTO growth_bench(key, value) VALUES (?, ?)",
+        [sqlText(prefixedKey('g', index)), sqlText(growthValue(index))])
       if not inserted.isOk: return Result[bool, DbError](isOk: false, error: inserted.error)
     Result[bool, DbError](isOk: true, value: true)
   )
@@ -420,13 +474,297 @@ proc bench_growth() {.update.} =
   for index in 0'u32 ..< writes:
     let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
       let result = conn.execValues("UPDATE growth_bench SET value = ? WHERE key = ?",
-        [sqlText("write-" & $index), sqlText(prefixedKey('g', index mod rows))])
+        [sqlText(writeValue(index)), sqlText(prefixedKey('g', index mod rows))])
       if not result.isOk: return Result[bool, DbError](isOk: false, error: result.error)
       if conn.changes() != 1: return Result[bool, DbError](isOk: false, error: DbError(message: "growth row missing"))
       Result[bool, DbError](isOk: true, value: true)
     )
     if not updated.isOk: replyErr(updated.error.message); return
   replyOk(report(rows, start, uint64(writes)))
+
+proc bench_capacity_growth_guard() {.update.} =
+  ## Nim has a fixed superblock offset and no Rust-style page table. Report the
+  ## directly observable capacity invariants under distinct field names.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  let writes = request.getNat32(1)
+  if rows == 0 or not validateFixedBenchKeyRows(rows) or not validateFixedBenchKeyRows(writes):
+    replyErr("invalid capacity guard range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS growth_bench; CREATE TABLE growth_bench (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+    if not schema.isOk: return Result[bool, DbError](isOk: false, error: schema.error)
+    for index in 0'u32 ..< rows:
+      let inserted = conn.execValues("INSERT INTO growth_bench(key, value) VALUES (?, ?)",
+        [sqlText(prefixedKey('g', index)), sqlText(growthValue(index))])
+      if not inserted.isOk: return Result[bool, DbError](isOk: false, error: inserted.error)
+    Result[bool, DbError](isOk: true, value: true)
+  )
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  let before = database.storageStats()
+  let rawBeforePages = ic0_stable64_size()
+  let start = ic0_performance_counter(0'u32)
+  for index in 0'u32 ..< writes:
+    let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+      let result = conn.execValues("UPDATE growth_bench SET value = ? WHERE key = ?",
+        [sqlText(writeValue(index)), sqlText(prefixedKey('g', index mod rows))])
+      if not result.isOk: return Result[bool, DbError](isOk: false, error: result.error)
+      if conn.changes() != 1: return Result[bool, DbError](isOk: false, error: DbError(message: "growth row missing"))
+      Result[bool, DbError](isOk: true, value: true)
+    )
+    if not updated.isOk: replyErr(updated.error.message); return
+  let instructions = ic0_performance_counter(0'u32) - start
+  let after = database.storageStats()
+  let rawAfterPages = ic0_stable64_size()
+  if after.dbSize != before.dbSize or after.sqliteVirtualPages != before.sqliteVirtualPages or
+      rawAfterPages != rawBeforePages:
+    replyErr("existing-capacity update changed a storage high-water mark"); return
+  replyOk(NimCapacityGrowthReport(rows: uint64(rows), writes: uint64(writes),
+    instructions: instructions, checksum: uint64(writes),
+    db_size_before: before.dbSize, db_size_after: after.dbSize,
+    sqlite_virtual_pages_before: before.sqliteVirtualPages,
+    sqlite_virtual_pages_after: after.sqliteVirtualPages,
+    raw_stable_pages_before: rawBeforePages, raw_stable_pages_after: rawAfterPages,
+    raw_stable_bytes_before: rawBeforePages * bench_spec.StablePageSize,
+    raw_stable_bytes_after: rawAfterPages * bench_spec.StablePageSize))
+
+proc bench_growth_profile() {.update.} =
+  ## Nim-specific profile: timing and stable backend I/O are measured directly.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  let writes = request.getNat32(1)
+  if rows == 0 or not validateFixedBenchKeyRows(rows) or not validateFixedBenchKeyRows(writes):
+    replyErr("invalid growth profile range"); return
+  ## Reopen only this profiling request with its counting backend. Regular
+  ## benchmark endpoints keep the direct stable backend in their hot path.
+  database.close()
+  databaseReady = false
+  useMetricsBackend = true
+  defer:
+    stableIoMetricsEnabled = false
+    useMetricsBackend = false
+    database.close()
+    databaseReady = false
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS growth_bench; CREATE TABLE growth_bench (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+    if not schema.isOk: return Result[bool, DbError](isOk: false, error: schema.error)
+    for index in 0'u32 ..< rows:
+      let inserted = conn.execValues("INSERT INTO growth_bench(key, value) VALUES (?, ?)",
+        [sqlText(prefixedKey('g', index)), sqlText(growthValue(index))])
+      if not inserted.isOk: return Result[bool, DbError](isOk: false, error: inserted.error)
+    Result[bool, DbError](isOk: true, value: true)
+  )
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  resetStableIoMetrics()
+  stableIoMetricsEnabled = true
+  let start = ic0_performance_counter(0'u32)
+  var openInstructions = 0'u64
+  var formatInstructions = 0'u64
+  var executeInstructions = 0'u64
+  for index in 0'u32 ..< writes:
+    let updateStart = ic0_performance_counter(0'u32)
+    let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+      openInstructions += ic0_performance_counter(0'u32) - updateStart
+      let formatStart = ic0_performance_counter(0'u32)
+      let value = writeValue(index)
+      let key = prefixedKey('g', index mod rows)
+      formatInstructions += ic0_performance_counter(0'u32) - formatStart
+      let executeStart = ic0_performance_counter(0'u32)
+      let result = conn.execValues("UPDATE growth_bench SET value = ? WHERE key = ?",
+        [sqlText(value), sqlText(key)])
+      executeInstructions += ic0_performance_counter(0'u32) - executeStart
+      if not result.isOk: return Result[bool, DbError](isOk: false, error: result.error)
+      if conn.changes() != 1: return Result[bool, DbError](isOk: false, error: DbError(message: "growth row missing"))
+      Result[bool, DbError](isOk: true, value: true)
+    )
+    if not updated.isOk: replyErr(updated.error.message); return
+  let stats = database.storageStats()
+  replyOk(NimGrowthProfileReport(rows: uint64(rows), writes: uint64(writes),
+    instructions: ic0_performance_counter(0'u32) - start, checksum: uint64(writes),
+    db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize,
+    update_open: openInstructions, key_value_format: formatInstructions,
+    execute_total: executeInstructions, stable_read_calls: stableIoMetrics.readCalls,
+    stable_read_bytes: stableIoMetrics.readBytes, stable_write_calls: stableIoMetrics.writeCalls,
+    stable_write_bytes: stableIoMetrics.writeBytes, stable_grow_calls: stableIoMetrics.growCalls,
+    stable_grow_pages: stableIoMetrics.growPages))
+
+proc bench_read_profile() {.query.} =
+  ## Profile a cached prepared point-read without instrumenting normal queries.
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  database.close()
+  databaseReady = false
+  useMetricsBackend = true
+  defer:
+    stableIoMetricsEnabled = false
+    useMetricsBackend = false
+    database.close()
+    databaseReady = false
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  resetStableIoMetrics()
+  stableIoMetricsEnabled = true
+  let start = ic0_performance_counter(0'u32)
+  var prepareInstructions = 0'u64
+  var bindInstructions = 0'u64
+  var stepInstructions = 0'u64
+  var columnInstructions = 0'u64
+  let read = database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    let prepareStart = ic0_performance_counter(0'u32)
+    let prepared = conn.prepare("SELECT value FROM bench WHERE key = ?")
+    prepareInstructions = ic0_performance_counter(0'u32) - prepareStart
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    var checksum = 0'u64
+    for index in 0'u32 ..< rows:
+      let bindStart = ic0_performance_counter(0'u32)
+      let bound = statement.bind(1, sqlText(benchKey(index)))
+      bindInstructions += ic0_performance_counter(0'u32) - bindStart
+      if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+      let stepStart = ic0_performance_counter(0'u32)
+      let stepped = statement.step()
+      stepInstructions += ic0_performance_counter(0'u32) - stepStart
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srRow:
+        let columnStart = ic0_performance_counter(0'u32)
+        checksum += uint64(statement.columnBytes(0))
+        columnInstructions += ic0_performance_counter(0'u32) - columnStart
+      let resetStart = ic0_performance_counter(0'u32)
+      let reset = statement.reset()
+      bindInstructions += ic0_performance_counter(0'u32) - resetStart
+      if not reset.isOk: return Result[uint64, DbError](isOk: false, error: reset.error)
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not read.isOk: replyErr(read.error.message); return
+  let stats = database.storageStats()
+  replyOk(NimReadProfileReport(rows: uint64(rows),
+    instructions: ic0_performance_counter(0'u32) - start, checksum: read.value,
+    db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize,
+    prepare: prepareInstructions, reset_bind: bindInstructions, step: stepInstructions,
+    column_read: columnInstructions, stable_read_calls: stableIoMetrics.readCalls,
+    stable_read_bytes: stableIoMetrics.readBytes))
+
+proc bench_write_profile() {.update.} =
+  ## Mirrors Rust's write profile: one transaction of deterministic upserts.
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  database.close()
+  databaseReady = false
+  useMetricsBackend = true
+  defer:
+    stableIoMetricsEnabled = false
+    useMetricsBackend = false
+    database.close()
+    databaseReady = false
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  resetStableIoMetrics()
+  stableIoMetricsEnabled = true
+  let start = ic0_performance_counter(0'u32)
+  var openInstructions = 0'u64
+  var prepareInstructions = 0'u64
+  var formatInstructions = 0'u64
+  var executeInstructions = 0'u64
+  let written = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    openInstructions = ic0_performance_counter(0'u32) - start
+    let prepareStart = ic0_performance_counter(0'u32)
+    let prepared = conn.prepare("INSERT INTO bench(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    prepareInstructions = ic0_performance_counter(0'u32) - prepareStart
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let formatStart = ic0_performance_counter(0'u32)
+      let key = prefixedKey('w', index)
+      let value = updatedValue(index)
+      formatInstructions += ic0_performance_counter(0'u32) - formatStart
+      let executeStart = ic0_performance_counter(0'u32)
+      let boundKey = statement.bind(1, sqlText(key))
+      if not boundKey.isOk: return Result[uint64, DbError](isOk: false, error: boundKey.error)
+      let boundValue = statement.bind(2, sqlText(value))
+      if not boundValue.isOk: return Result[uint64, DbError](isOk: false, error: boundValue.error)
+      let stepped = statement.step()
+      executeInstructions += ic0_performance_counter(0'u32) - executeStart
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      let reset = statement.reset()
+      if not reset.isOk: return Result[uint64, DbError](isOk: false, error: reset.error)
+    Result[uint64, DbError](isOk: true, value: uint64(rows))
+  )
+  if not written.isOk: replyErr(written.error.message); return
+  let stats = database.storageStats()
+  replyOk(NimWriteProfileReport(rows: uint64(rows),
+    instructions: ic0_performance_counter(0'u32) - start, checksum: written.value,
+    db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize,
+    update_open: openInstructions, prepare: prepareInstructions,
+    key_value_format: formatInstructions, execute_total: executeInstructions,
+    stable_read_calls: stableIoMetrics.readCalls, stable_read_bytes: stableIoMetrics.readBytes,
+    stable_write_calls: stableIoMetrics.writeCalls, stable_write_bytes: stableIoMetrics.writeBytes,
+    stable_grow_calls: stableIoMetrics.growCalls, stable_grow_pages: stableIoMetrics.growPages))
+
+proc bench_get_many_in_profile() {.query.} =
+  let rows = Request.new().getNat32(0)
+  if rows == 0 or rows > 999 or not validateFixedBenchKeyRows(rows):
+    replyErr("multi-get rows must be between 1 and 999"); return
+  database.close(); databaseReady = false; useMetricsBackend = true
+  defer:
+    stableIoMetricsEnabled = false; useMetricsBackend = false
+    database.close(); databaseReady = false
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  resetStableIoMetrics(); stableIoMetricsEnabled = true
+  let start = ic0_performance_counter(0'u32)
+  let sqlStart = ic0_performance_counter(0'u32)
+  var sql = "SELECT value FROM bench WHERE key IN ("
+  for index in 0'u32 ..< rows:
+    if index > 0: sql.add(",")
+    sql.add("?")
+  sql.add(") ORDER BY key")
+  let sqlBuild = ic0_performance_counter(0'u32) - sqlStart
+  var keyBuild = 0'u64
+  var prepareInstructions = 0'u64
+  var bindInstructions = 0'u64
+  var rowScan = 0'u64
+  let read = database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    let prepareStart = ic0_performance_counter(0'u32)
+    let prepared = conn.prepare(sql)
+    prepareInstructions = ic0_performance_counter(0'u32) - prepareStart
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let keyStart = ic0_performance_counter(0'u32)
+      let key = benchKey(index)
+      keyBuild += ic0_performance_counter(0'u32) - keyStart
+      let bindStart = ic0_performance_counter(0'u32)
+      let bound = statement.bind(int(index) + 1, sqlText(key))
+      bindInstructions += ic0_performance_counter(0'u32) - bindStart
+      if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+    var checksum = 0'u64
+    while true:
+      let rowStart = ic0_performance_counter(0'u32)
+      let stepped = statement.step()
+      rowScan += ic0_performance_counter(0'u32) - rowStart
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srDone: break
+      checksum += uint64(statement.columnBytes(0))
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not read.isOk: replyErr(read.error.message); return
+  let stats = database.storageStats()
+  replyOk(NimGetManyProfileReport(rows: uint64(rows),
+    instructions: ic0_performance_counter(0'u32) - start, checksum: read.value,
+    db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize,
+    sql_build: sqlBuild, key_build: keyBuild, prepare: prepareInstructions,
+    bind_total: bindInstructions, row_scan: rowScan,
+    stable_read_calls: stableIoMetrics.readCalls, stable_read_bytes: stableIoMetrics.readBytes))
 
 proc db_stats() {.query.} =
   let failure = ensureDatabase()

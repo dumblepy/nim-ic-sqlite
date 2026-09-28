@@ -1,0 +1,117 @@
+# 進捗管理
+
+このファイルはタスク実装時の自律ループの完了条件と作業記録を管理する。
+
+対象ブランチ: `7-cost-performance-test`
+
+設計・固定 Rust SHA・Candid 契約は `.agent/rules/branch/7-cost-performance-test.mdc` を正とする。
+
+## プロジェクト全体の完成条件（GOAL-001）
+
+完了条件:
+- `cd /application/ic-sqlite && ./scripts/test.sh` が終了コード 0 で完了する。
+- 手動 paired 測定で両 Wasm の build、fresh core-KV trial、結果検証を完了できる。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T020140Z` が終了コード 0 で完了する。
+- profile/capacity の共通比較指標を含む artifact を Nim/Rust の両方から生成し、欠測を機械検証できる。
+- 管理 status 残高と料金推計の照合条件を、ローカル replica の会計値と区別して artifact に記録する。
+
+## タスク別完了条件
+
+各タスクの完了条件はこのセクションに集約する。以下の形式で機械的に検証可能な条件を列挙すること。
+
+### P1: profile と容量再利用の比較指標
+
+完了条件:
+- `cd /application/ic-sqlite/benchmarks/comparison/nim_canister/backend && nicp developmentBuild` が終了コード 0 で完了する。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_canister_integration.nim` が終了コード 0 で完了し、read/write/get-many/growth profile と capacity guard の checksum、stable I/O 観測、profile 後の通常 query、upgrade を検証する。
+- profile endpoint は通常の比較 endpoint と別の counting backend を使い、通常 workload の命令数へ計測分岐を混入させないことを統合試験で確認する。
+- [x] Nim/Rust の profile artifact に、少なくとも `rows`、`instructions`、`checksum`、`db_size`、`stable_pages`、`stable_bytes`、raw stable memory を同じ単位で保存する。
+
+### P4: 観測・費用照合
+
+完了条件:
+- `NISQL_COMPARE_NIM_SHA=HEAD nim c -r benchmarks/comparison/runner/main.nim 1` が終了コード 0 で完了し、生成 manifest に各 phase 前後の `cycles` / `reserved_cycles` と heap 観測が含まれる。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_transport.nim` が終了コード 0 で完了し、management status の数値復号を検証する。
+- 費用 report は local status の残高差を命令実行費用として扱わないことを artifact の notes と summary で検証する。
+
+### P5: 結果検証
+
+完了条件:
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_result_validation.nim` が終了コード 0 で完了する。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T020140Z` が終了コード 0 で完了する。
+- `.github/workflows/ci.yml` に comparison regression job が存在せず、通常 CI は native/canister test のみを実行する。
+
+条件は「コードを見て正しそう」ではなく、**テスト・lint・typecheck・curl・Playwright 等の実行可能な検証**で機械的に判定できるものとする。
+
+## 実装ループ
+
+以下のループを、完了条件をすべて満たすまで自律的に繰り返すこと。
+
+1. 現在のコードとエラーを調査する
+2. 原因を仮説化する
+3. 最小限の変更を実装する
+4. テスト・lint・typecheck・必要な実行確認を行う
+5. 失敗した場合はログを分析する
+6. 仮説を修正して再実装する
+7. 全完了条件を再検証する
+
+テストが失敗した状態で作業を終了しないこと。
+一部だけ成功しても終了しないこと。
+同じ方法に固執せず、失敗した仮説は捨てて別の方法を試すこと。
+
+## 自律判断基準
+
+ユーザーへの確認が不要な、可逆的なコード変更・調査・テスト・リファクタリングは自律的に進めてよい。
+
+以下の場合だけ停止して質問すること:
+- 秘密情報や認証情報が必要
+- 外部サービスへの不可逆な操作が必要
+- 仕様上、複数の選択肢がありコードから判断不能
+- 同一の根本原因について複数の異なるアプローチを試しても進展がない
+
+## 作業記録
+
+長時間作業になる場合はこのセクションを維持すること。
+
+各反復ごとに:
+- 現在の問題
+- 試したこと
+- 結果
+- 否定された仮説
+- 次に試すこと
+
+を短く更新する。
+
+### 2026-09-28: profile endpoint の拡張
+
+- 現在の問題: Rust の詳細 profile と Nim の固定オフセット VFS を、存在しない page-table 指標で比較してはいけない。
+- 試したこと: Nim 固有 read/growth/write/get-many profile と capacity guard を追加し、直接観測できる命令区間と stable backend I/O のみを返した。
+- 結果: read/growth/write/get-many profile と capacity guard は実 Canister 統合試験で成功。
+- 否定された仮説: Rust の page-table 固有 record へ Nim 側の推測値を入れれば比較できるという仮説。
+- 次に試すこと: profile validator と summary を実行し、artifact を検証する。
+
+### 2026-09-28: profile artifact runner
+
+- 現在の問題: profile の共通 field を両実装で同じ artifact に残せていなかった。
+- 試したこと: fresh Canister へ read/write/get-many/growth profile を呼び出す `runner/profile.nim` を追加した。
+- 結果: `results/profile-20260928T115537Z/profile_measurements.jsonl` に Nim/Rust × 4 profile の8行を保存し、全行で共通 field の存在を確認した。
+- 否定された仮説: Rust の詳細 VFS/page-table カウンタを Nim の比較 field として扱えるという仮説。
+- 次に試すこと: profile artifact を検証する validator と summary を追加する。
+
+### 2026-09-28: P4/P5 基盤
+
+- 現在の問題: local status の cycles 残高差を DB 実行命令費用と混同しない必要がある。
+- 試したこと: runner が各 phase 前後の `cycles` / `reserved_cycles` と heap 観測を manifest に保存するようにした。結果検証を追加し、比較測定は手動実行へ移した。
+- 結果: fresh 1 trial `results/20260928T073944Z/` に全6 status 観測を保存。core/churn validator は実装済みで、比較手順は README に記録した。
+- 否定された仮説: local replica の残高差だけで mainnet の命令実行費用を照合できるという仮説。
+- 次に試すこと: profile artifact runner を追加後、P1/P4/P5 の完了条件を順に再実行する。
+
+コンテキストが圧縮された場合でも、`progress.mdc` と git diff とテスト結果を確認して作業を継続する。
+
+## 完了報告
+
+完了時には以下を報告すること:
+- 変更内容
+- 原因
+- 実行した検証
+- 各完了条件の結果

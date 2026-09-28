@@ -89,9 +89,27 @@ suite "Nim benchmark canister":
     check decodedReply("bench_many_rows", "(3)", query = true)["checksum"].getNat64() == 81
     check decodedReply("bench_read_public_helper", "(3)", query = true)["checksum"].getNat64() == 81
     check decodedReply("bench_read_prepare_each", "(3)", query = true)["checksum"].getNat64() == 81
+    let readProfile = decodedReply("bench_read_profile", "(3)", query = true)
+    check readProfile["checksum"].getNat64() == 81
+    check readProfile["stable_read_calls"].getNat64() > 0
     check decodedReply("bench_get_many_in", "(3)", query = true)["checksum"].getNat64() == 81
+    let getManyProfile = decodedReply("bench_get_many_in_profile", "(3)", query = true)
+    check getManyProfile["checksum"].getNat64() == 81
+    check getManyProfile["stable_read_calls"].getNat64() > 0
     check decodedReply("bench_unbounded_order_by", "(10)")["checksum"].getNat64() > 0
     check decodedReply("bench_growth", "(10, 20)")["checksum"].getNat64() == 20
+    let capacity = decodedReply("bench_capacity_growth_guard", "(10, 20)")
+    check capacity["checksum"].getNat64() == 20
+    check capacity["db_size_before"].getNat64() == capacity["db_size_after"].getNat64()
+    check capacity["sqlite_virtual_pages_before"].getNat64() == capacity["sqlite_virtual_pages_after"].getNat64()
+    check capacity["raw_stable_pages_before"].getNat64() == capacity["raw_stable_pages_after"].getNat64()
+    let growthProfile = decodedReply("bench_growth_profile", "(10, 20)")
+    check growthProfile["checksum"].getNat64() == 20
+    check growthProfile["instructions"].getNat64() > 0
+    check growthProfile["stable_write_calls"].getNat64() > 0
+    let writeProfile = decodedReply("bench_write_profile", "(3)")
+    check writeProfile["checksum"].getNat64() == 3
+    check writeProfile["stable_write_calls"].getNat64() > 0
 
     discard run("icp deploy backend -m upgrade -y")
     check decodedReply("bench_read", "(3)", query = true)["checksum"].getNat64() == 81

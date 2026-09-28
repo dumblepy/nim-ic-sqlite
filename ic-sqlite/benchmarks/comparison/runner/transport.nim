@@ -44,9 +44,22 @@ proc upgrade*(transport: CliTransport; canister, wasmPath: string) =
   discard transport.runCommand("icp canister install " & quoteShell(canister) &
     " --wasm " & quoteShell(wasmPath) & " -m upgrade -y")
 
+proc canisterStatus*(transport: CliTransport; canister: string): JsonNode =
+  parseJson(transport.runCommand("icp canister status " & quoteShell(canister) & " --json"))
+
 proc canisterMemoryBytes*(transport: CliTransport; canister: string): uint64 =
-  let status = parseJson(transport.runCommand("icp canister status " & quoteShell(canister) & " --json"))
+  let status = transport.canisterStatus(canister)
   status["memory_size"].parseCliNat()
+
+proc canisterCycles*(status: JsonNode): uint64 =
+  if not status.hasKey("cycles"):
+    raise newException(ValueError, "canister status does not expose cycles")
+  status["cycles"].parseCliNat()
+
+proc canisterReservedCycles*(status: JsonNode): uint64 =
+  if not status.hasKey("reserved_cycles"):
+    raise newException(ValueError, "canister status does not expose reserved_cycles")
+  status["reserved_cycles"].parseCliNat()
 
 proc call*(transport: CliTransport; canister, didPath, methodName, args: string;
            query = false): CandidRecord =

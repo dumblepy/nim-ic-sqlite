@@ -13,6 +13,8 @@ suite "comparison benchmark fixtures":
   test "value fixtures match the Rust benchmark":
     check benchValue(42) == "value-00000042-stable-vfs"
     check updatedValue(42) == "updated-00000042-stable-vfs"
+    check growthValue(42) == "growth-00000042-stable-vfs"
+    check writeValue(42) == "write-00000042"
 
   test "key limits prevent eight-digit truncation":
     check validateFixedBenchKeyRows(100_000_000)
