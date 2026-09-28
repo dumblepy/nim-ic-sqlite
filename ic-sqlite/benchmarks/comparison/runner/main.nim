@@ -16,7 +16,7 @@ const
   RustWasm = RustRepo / "benchmarks/kv-canister/target/wasm32-unknown-unknown/release/ic_sqlite_vfs_kv_bench.wasm"
   RustDid = RustRepo / "benchmarks/kv-canister/kv_bench.did"
   ExpectedRustSha = "1386239acff1dd7ede5ac78a2f0a22ef495195de"
-  ExpectedNimSha = "c101d26e99a0c0df70752c95bb005fb20b03de8e"
+  ExpectedNimSha = "4735f04908ae9a7ac30bac6d05aa7aaa1e0da260"
 
 proc shellOutput(command: string): string =
   let (output, status) = execCmdEx(command)

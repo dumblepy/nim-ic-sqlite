@@ -337,11 +337,11 @@ run_id,implementation,repo_sha,wasm_sha256,scenario,trial,cycle,phase,rows,succe
 
 ## 実装進捗
 
-- [x] P0: `bench_manifest.json` に Nim (`cd426eb2e7d0f35807f032a7dee61fe14d04c286`) と Rust (`1386239acff1dd7ede5ac78a2f0a22ef495195de`) の比較対象を固定し、SQLite/Nim/nicp_cdk の現行値を記録した。
+- [x] P0: `bench_manifest.json` に Nim (`4735f04908ae9a7ac30bac6d05aa7aaa1e0da260`) と Rust (`1386239acff1dd7ede5ac78a2f0a22ef495195de`) の比較対象を固定し、SQLite/Nim/nicp_cdk の現行値を記録した。
 - [x] P0: Rust固定commitの `kv_bench.did` と `key.rs` を照合し、固定長キー・値・churn範囲をNimで実装して境界値試験を追加した。
 - [x] P0: CSV/JSONLの共通measurement型を追加し、命令数未取得を `null` / 空欄で保持してゼロ扱いしないことを検証した。
-- [ ] P1: reset/insert/update/append/prepared read/churn/statsのNim endpointを実Canisterで確認済み。Rust契約のprofile、join、large blob等の全endpointは未実装。
-- [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。
+- [ ] P1: reset/insert/update/append/prepared read/churn/stats、large blob、JOIN、many rows、unbounded order-by、public helper、prepare-each、multi-get、growthのNim endpointを実Canisterで確認済み。Rust契約のprofile、growth profile/capacity guard等は未実装。
+- [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。最新run `20260928T020140Z` はheap bytesも記録する。
 - [x] P3: 両実装の5,000件×100周回churn（各201ステップ）とupgrade後の行数、Native rollback/region試験を確認。ZeroExtentのtruncate→再拡張→reopenはsuperblock経由で修正・検証済み。ic-stable-structures互換の有効なMGR metadataとの共存、stable publish途中のWasm failpoint trapとメッセージrollbackも確認した。
 - [ ] P4: 更新命令数、両実装のraw/virtual stable memoryを採取し、公式料金の日時付きスナップショットで30日推計を作成。runnerは`icp canister status --json`の`memory_size`からraw stable memoryを差し引いたWasm heap bytesも採取・保管費へ加算する。新しい比較runでの採取、管理APIのCycles分類、実行費用の照合が残る。
 - [ ] P5: 自動summaryと欠測検査を追加。CIでの両Wasm build・比較回帰試験は未追加。

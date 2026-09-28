@@ -135,3 +135,8 @@
 - P3のWasm failpoint統合試験を追加した。`NISQL_ENABLE_FAILPOINT=1` の専用Wasmのみ2回目のstable writeを失敗させる。1回目のdirty pageをpublishした後のtrap（IC0503）後も、1000件のchecksum 25,000とraw stable pages 1,028が不変であることをローカルreplicaで確認した。
 - P4のrunnerは`icp canister status --json`の`memory_size`を取得し、raw stable bytesとの差分を`heap_bytes`として記録するようにした。新規artifactの費用推計ではheap storageも加算する。既存artifactのheap nullは未測定のまま保持する。
 - 最新Nim commit `c101d26e99a0c0df70752c95bb005fb20b03de8e` と固定Rust commitでfresh Canister 1組を再実行し、`results/20260928T014842Z/` にheap bytesを含むCSV/JSONLを保存した。Nimは3,273,713 bytes、Rustは3,405,778 bytesで、いずれもraw stable memoryとの差分として記録した。これはrunnerの採取確認用1 trialであり、5 trial比較値ではない。
+- 最新Nim commit `4735f04908ae9a7ac30bac6d05aa7aaa1e0da260` と固定Rust commitでfresh Canister 5組を再実行し、`results/20260928T020140Z/` に保存した。100-row Update中央値はNim 1,903,378、Rust 1,484,474 Wasm instructions（Nim/Rust 1.28219）。全trialのheap bytesはNim 3,273,713、Rust 3,405,778で一定だった。
+- P1のRust契約との差分から`bench_large_blob`と`bench_join`をNim benchmark Canisterへ追加した。64KiB blobの長さ65,536と100行JOINのcount 100を、既存CRUD/churn/upgrade/failpoint統合試験と同じローカルreplicaで確認した。
+- P1へ`bench_many_rows`と`bench_unbounded_order_by`を追加した。更新済み3行の読取りchecksum 81と10行ORDER BYの非ゼロchecksumを、同じCanister統合試験で確認した。
+- P1へ`bench_read_public_helper`、`bench_read_prepare_each`、`bench_get_many_in`を追加した。public helperはprepared statementを再利用し、prepare-eachとは別経路にした。更新済み3行に対し各endpointのchecksum 81をCanister統合試験で確認した。multi-getはSQLiteのparameter上限に合わせ1〜999行へ制限する。
+- P1へ`bench_growth`を追加した。指定行をseedした後、指定回数の更新を個別SQLite transactionとして実行する。10行・20回更新でchecksum 20を実Canister統合試験で確認した。

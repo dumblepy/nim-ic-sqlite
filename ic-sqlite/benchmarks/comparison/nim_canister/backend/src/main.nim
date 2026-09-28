@@ -186,6 +186,59 @@ proc bench_append_insert() {.update.} =
   if not inserted.isOk: replyErr(inserted.error.message); return
   replyOk(report(appendRows, start, uint64(appendRows)))
 
+proc bench_large_blob() {.update.} =
+  let bytes = Request.new().getNat32(0)
+  if bytes > 16'u32 * 1024 * 1024: replyErr("blob exceeds configured limit"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  var payload = newSeq[byte](int(bytes))
+  for index in 0 ..< payload.len: payload[index] = 0x5a
+  let written = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS blob_bench; CREATE TABLE blob_bench (id INTEGER PRIMARY KEY, body BLOB NOT NULL)")
+    if not schema.isOk: return Result[uint64, DbError](isOk: false, error: schema.error)
+    let inserted = conn.execValues("INSERT INTO blob_bench(id, body) VALUES (?, ?)", [sqlInt(1), sqlBlob(payload)])
+    if not inserted.isOk: return Result[uint64, DbError](isOk: false, error: inserted.error)
+    let length = conn.prepare("SELECT length(body) FROM blob_bench WHERE id = 1")
+    if not length.isOk: return Result[uint64, DbError](isOk: false, error: length.error)
+    var statement = length.value
+    defer: statement.finalize()
+    let stepped = statement.step()
+    if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+    if stepped.value != srRow: return Result[uint64, DbError](isOk: false, error: DbError(message: "blob row missing"))
+    Result[uint64, DbError](isOk: true, value: uint64(statement.columnInt64(0)))
+  )
+  if not written.isOk: replyErr(written.error.message); return
+  replyOk(report(bytes, start, written.value))
+
+proc bench_join() {.update.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let joined = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS join_left; DROP TABLE IF EXISTS join_right; CREATE TABLE join_left (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, body TEXT NOT NULL); CREATE TABLE join_right (group_id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+    if not schema.isOk: return Result[uint64, DbError](isOk: false, error: schema.error)
+    for group in 0'i64 ..< 100'i64:
+      let inserted = conn.execValues("INSERT INTO join_right(group_id, label) VALUES (?, ?)", [sqlInt(group), sqlText("group-" & $group)])
+      if not inserted.isOk: return Result[uint64, DbError](isOk: false, error: inserted.error)
+    for index in 0'u32 ..< rows:
+      let inserted = conn.execValues("INSERT INTO join_left(id, group_id, body) VALUES (?, ?, ?)",
+        [sqlInt(int64(index)), sqlInt(int64(index mod 100)), sqlText("body-" & $index)])
+      if not inserted.isOk: return Result[uint64, DbError](isOk: false, error: inserted.error)
+    let count = conn.prepare("SELECT COUNT(*) FROM join_left JOIN join_right ON join_left.group_id = join_right.group_id")
+    if not count.isOk: return Result[uint64, DbError](isOk: false, error: count.error)
+    var statement = count.value
+    defer: statement.finalize()
+    let stepped = statement.step()
+    if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+    if stepped.value != srRow: return Result[uint64, DbError](isOk: false, error: DbError(message: "join count missing"))
+    Result[uint64, DbError](isOk: true, value: uint64(statement.columnInt64(0)))
+  )
+  if not joined.isOk: replyErr(joined.error.message); return
+  replyOk(report(rows, start, joined.value))
+
 proc bench_read() {.query.} =
   let rows = Request.new().getNat32(0)
   if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
@@ -210,6 +263,170 @@ proc bench_read() {.query.} =
   )
   if not read.isOk: replyErr(read.error.message); return
   replyOk(report(rows, start, read.value))
+
+proc bench_many_rows() {.query.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let read = database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    let prepared = conn.prepare("SELECT value FROM bench ORDER BY key LIMIT ?")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    let bound = statement.bind(1, sqlInt(int64(rows)))
+    if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+    var checksum = 0'u64
+    while true:
+      let stepped = statement.step()
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srDone: break
+      checksum += uint64(statement.columnBytes(0))
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not read.isOk: replyErr(read.error.message); return
+  replyOk(report(rows, start, read.value))
+
+proc pointRead(rows: uint32; prepareEach: bool): Result[uint64, DbError] =
+  database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    var checksum = 0'u64
+    var cached: Statement
+    if not prepareEach:
+      let prepared = conn.prepare("SELECT value FROM bench WHERE key = ?")
+      if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+      cached = prepared.value
+    defer:
+      if not prepareEach: cached.finalize()
+    for index in 0'u32 ..< rows:
+      var statement: Statement
+      if prepareEach:
+        let prepared = conn.prepare("SELECT value FROM bench WHERE key = ?")
+        if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+        statement = prepared.value
+      else:
+        statement = cached
+      let bound = statement.bind(1, sqlText(benchKey(index)))
+      if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+      let stepped = statement.step()
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srRow: checksum += uint64(statement.columnBytes(0))
+      if prepareEach:
+        statement.finalize()
+      else:
+        let reset = statement.reset()
+        if not reset.isOk: return Result[uint64, DbError](isOk: false, error: reset.error)
+        cached = statement
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+
+proc bench_read_public_helper() {.query.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let read = pointRead(rows, false)
+  if not read.isOk: replyErr(read.error.message); return
+  replyOk(report(rows, start, read.value))
+
+proc bench_read_prepare_each() {.query.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let read = pointRead(rows, true)
+  if not read.isOk: replyErr(read.error.message); return
+  replyOk(report(rows, start, read.value))
+
+proc bench_get_many_in() {.query.} =
+  let rows = Request.new().getNat32(0)
+  if rows == 0 or rows > 999 or not validateFixedBenchKeyRows(rows):
+    replyErr("multi-get rows must be between 1 and 999"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  var sql = "SELECT value FROM bench WHERE key IN ("
+  for index in 0'u32 ..< rows:
+    if index > 0: sql.add(",")
+    sql.add("?")
+  sql.add(") ORDER BY key")
+  let start = ic0_performance_counter(0'u32)
+  let read = database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    let prepared = conn.prepare(sql)
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let bound = statement.bind(int(index) + 1, sqlText(benchKey(index)))
+      if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+    var checksum = 0'u64
+    while true:
+      let stepped = statement.step()
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srDone: break
+      checksum += uint64(statement.columnBytes(0))
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not read.isOk: replyErr(read.error.message); return
+  replyOk(report(rows, start, read.value))
+
+proc bench_unbounded_order_by() {.update.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let sorted = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS order_bench; CREATE TABLE order_bench (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+    if not schema.isOk: return Result[uint64, DbError](isOk: false, error: schema.error)
+    for index in 0'u32 ..< rows:
+      let inserted = conn.execValues("INSERT INTO order_bench(id, value) VALUES (?, ?)",
+        [sqlInt(int64(index)), sqlText("order-" & $(rows - index))])
+      if not inserted.isOk: return Result[uint64, DbError](isOk: false, error: inserted.error)
+    let prepared = conn.prepare("SELECT value FROM order_bench ORDER BY value")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    var checksum = 0'u64
+    while true:
+      let stepped = statement.step()
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srDone: break
+      checksum += uint64(statement.columnBytes(0))
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not sorted.isOk: replyErr(sorted.error.message); return
+  replyOk(report(rows, start, sorted.value))
+
+proc bench_growth() {.update.} =
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  let writes = request.getNat32(1)
+  if rows == 0 or not validateFixedBenchKeyRows(rows) or not validateFixedBenchKeyRows(writes):
+    replyErr("invalid growth range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+    let schema = conn.exec("DROP TABLE IF EXISTS growth_bench; CREATE TABLE growth_bench (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+    if not schema.isOk: return Result[bool, DbError](isOk: false, error: schema.error)
+    for index in 0'u32 ..< rows:
+      let inserted = conn.execValues("INSERT INTO growth_bench(key, value) VALUES (?, ?)", [sqlText(prefixedKey('g', index)), sqlText("seed-" & $index)])
+      if not inserted.isOk: return Result[bool, DbError](isOk: false, error: inserted.error)
+    Result[bool, DbError](isOk: true, value: true)
+  )
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  let start = ic0_performance_counter(0'u32)
+  for index in 0'u32 ..< writes:
+    let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+      let result = conn.execValues("UPDATE growth_bench SET value = ? WHERE key = ?",
+        [sqlText("write-" & $index), sqlText(prefixedKey('g', index mod rows))])
+      if not result.isOk: return Result[bool, DbError](isOk: false, error: result.error)
+      if conn.changes() != 1: return Result[bool, DbError](isOk: false, error: DbError(message: "growth row missing"))
+      Result[bool, DbError](isOk: true, value: true)
+    )
+    if not updated.isOk: replyErr(updated.error.message); return
+  replyOk(report(rows, start, uint64(writes)))
 
 proc db_stats() {.query.} =
   let failure = ensureDatabase()

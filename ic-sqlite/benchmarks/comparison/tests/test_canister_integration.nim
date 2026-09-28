@@ -84,6 +84,14 @@ suite "Nim benchmark canister":
     check stats["sqlite_page_count"].getNat64() > 0
     let raw = decodedReply("bench_host_stats", "()", query = true)
     check raw["raw_stable_pages"].getNat64() >= stats["stable_pages"].getNat64()
+    check decodedReply("bench_large_blob", "(65536)")["checksum"].getNat64() == 65_536
+    check decodedReply("bench_join", "(100)")["checksum"].getNat64() == 100
+    check decodedReply("bench_many_rows", "(3)", query = true)["checksum"].getNat64() == 81
+    check decodedReply("bench_read_public_helper", "(3)", query = true)["checksum"].getNat64() == 81
+    check decodedReply("bench_read_prepare_each", "(3)", query = true)["checksum"].getNat64() == 81
+    check decodedReply("bench_get_many_in", "(3)", query = true)["checksum"].getNat64() == 81
+    check decodedReply("bench_unbounded_order_by", "(10)")["checksum"].getNat64() > 0
+    check decodedReply("bench_growth", "(10, 20)")["checksum"].getNat64() == 20
 
     discard run("icp deploy backend -m upgrade -y")
     check decodedReply("bench_read", "(3)", query = true)["checksum"].getNat64() == 81
