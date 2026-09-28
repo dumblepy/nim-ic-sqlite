@@ -13,4 +13,5 @@ service : {
   bench_churn_insert : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
   db_stats : () -> (variant { Ok : DbStatsReport; Err : text }) query;
   bench_host_stats : () -> (variant { Ok : HostStatsReport; Err : text }) query;
+  bench_failpoint_update : (nat32) -> (variant { Ok : BenchReport; Err : text });
 };

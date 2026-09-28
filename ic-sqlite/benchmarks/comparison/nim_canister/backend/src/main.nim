@@ -4,6 +4,7 @@ import nicp_cdk
 import nicp_cdk/ic0/ic0
 import std/tables
 import ic_sqlite
+import ic_sqlite/stable/backend as stable_backend
 import ic_sqlite/stable/ic_backend
 import ../../../shared/bench_spec
 
@@ -22,6 +23,25 @@ type
 var database: Db
 var databaseReady = false
 
+when defined(benchmarkFailpoint):
+  type FaultInjectingBackend = ref object of stable_backend.StableBackend
+    inner: stable_backend.StableBackend
+
+  var failAfterStableWrites = -1
+
+  proc newFaultInjectingBackend(): FaultInjectingBackend =
+    FaultInjectingBackend(inner: newIcStableBackend())
+
+  method sizePages(backend: FaultInjectingBackend): uint64 = backend.inner.sizePages()
+  method grow(backend: FaultInjectingBackend; pages: uint64): bool = backend.inner.grow(pages)
+  method read(backend: FaultInjectingBackend; offset: uint64; dst: pointer; size: uint64) =
+    backend.inner.read(offset, dst, size)
+  method write(backend: FaultInjectingBackend; offset: uint64; src: pointer; size: uint64) =
+    if failAfterStableWrites == 0:
+      raise newException(ValueError, "injected stable write failure")
+    if failAfterStableWrites > 0: dec failAfterStableWrites
+    backend.inner.write(offset, src, size)
+
 proc replyOk[T: object](value: T) =
   ## nicp_cdk versions before the Nat64 conversion fix need explicit fields.
   var record = CandidRecord(kind: ckRecord, fields: initOrderedTable[string, CandidValue]())
@@ -37,7 +57,10 @@ proc replyErr(message: string) =
 proc ensureDatabase(): string =
   if databaseReady: return ""
   database.close()
-  let opened = database.init(newIcStableBackend())
+  when defined(benchmarkFailpoint):
+    let opened = database.init(newFaultInjectingBackend())
+  else:
+    let opened = database.init(newIcStableBackend())
   if not opened.isOk: return opened.error.message
   let schema = database.exec("CREATE TABLE IF NOT EXISTS bench (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID")
   if not schema.isOk: return schema.error.message
@@ -58,7 +81,7 @@ proc report(rows: uint32; start, checksum: uint64): BenchReport =
   let stats = database.storageStats()
   BenchReport(rows: uint64(rows), instructions: instructions, checksum: checksum,
     db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
-    stable_bytes: stats.sqliteVirtualPages * StablePageSize)
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize)
 
 proc insertRows(tableName: string; start, count: uint32; operation: string;
                 resetTable = false): Result[uint64, DbError] =
@@ -199,12 +222,28 @@ proc db_stats() {.query.} =
   let freeCount = scalar("PRAGMA freelist_count")
   if not freeCount.isOk: replyErr(freeCount.error.message); return
   replyOk(DbStatsReport(db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
-    stable_bytes: stats.sqliteVirtualPages * StablePageSize, sqlite_page_size: pageSize.value,
+    stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize, sqlite_page_size: pageSize.value,
     sqlite_page_count: pageCount.value, sqlite_freelist_count: freeCount.value))
 
 proc bench_host_stats() {.query.} =
   let rawPages = newIcStableBackend().sizePages()
-  replyOk(HostStatsReport(raw_stable_pages: rawPages, raw_stable_bytes: rawPages * StablePageSize))
+  replyOk(HostStatsReport(raw_stable_pages: rawPages, raw_stable_bytes: rawPages * bench_spec.StablePageSize))
+
+when defined(benchmarkFailpoint):
+  proc bench_failpoint_update() {.update.} =
+    ## The first dirty page reaches stable memory, then the second write fails.
+    ## finishStableOperation traps after publication has started, so the IC
+    ## rolls back the entire update message, including that first page write.
+    let rows = Request.new().getNat32(0)
+    if rows < 2 or not validateFixedBenchKeyRows(rows):
+      replyErr("invalid failpoint row count"); return
+    let failure = ensureDatabase()
+    if failure.len > 0: replyErr(failure); return
+    failAfterStableWrites = 1
+    let updated = insertRows("bench", 0, rows, "update")
+    failAfterStableWrites = -1
+    if not updated.isOk: replyErr(updated.error.message); return
+    replyErr("failpoint did not reach a second stable write")
 
 proc churnReport(cycle: uint32; phase: string; rows: uint32; start: uint64): Result[BenchChurnStepReport, DbError] =
   let pageSize = scalar("PRAGMA page_size")
@@ -220,7 +259,7 @@ proc churnReport(cycle: uint32; phase: string; rows: uint32; start: uint64): Res
     cycle: uint64(cycle), phase: phase, rows: uint64(rows),
     instructions: ic0_performance_counter(0'u32) - start, row_count: count.value,
     db_size: storage.dbSize, stable_pages: storage.sqliteVirtualPages,
-    stable_bytes: storage.sqliteVirtualPages * StablePageSize,
+    stable_bytes: storage.sqliteVirtualPages * bench_spec.StablePageSize,
     sqlite_page_size: pageSize.value, sqlite_page_count: pageCount.value,
     sqlite_freelist_count: freeCount.value))
 

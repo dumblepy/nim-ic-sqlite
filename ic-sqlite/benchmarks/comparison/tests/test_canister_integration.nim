@@ -33,6 +33,15 @@ proc decodedReply(methodName, args: string; query = false): CandidRecord =
     raise newException(ValueError, "unexpected benchmark result variant")
   candidValueToCandidRecord(variant.value)
 
+proc rejectedUpdate(methodName, args: string) =
+  let previous = getCurrentDir()
+  try:
+    setCurrentDir(CanisterDir)
+    let (_, status) = execCmdEx(fmt"icp canister call backend {methodName} '{args}' --json")
+    if status == 0: raise newException(ValueError, "expected update to trap")
+  finally:
+    setCurrentDir(previous)
+
 proc stopNetwork() =
   ## Stopping an already stopped local network is harmless in test setup.
   let previous = getCurrentDir()
@@ -79,3 +88,22 @@ suite "Nim benchmark canister":
     discard run("icp deploy backend -m upgrade -y")
     check decodedReply("bench_read", "(3)", query = true)["checksum"].getNat64() == 81
     check decodedReply("db_stats", "()", query = true)["sqlite_page_count"].getNat64() > 0
+
+  test "stable publish failure traps and rolls back the whole update message":
+    stopNetwork()
+    startNetwork()
+    defer: stopNetwork()
+    let previousFailpoint = getEnv("NISQL_ENABLE_FAILPOINT")
+    putEnv("NISQL_ENABLE_FAILPOINT", "1")
+    defer:
+      if previousFailpoint.len == 0: delEnv("NISQL_ENABLE_FAILPOINT")
+      else: putEnv("NISQL_ENABLE_FAILPOINT", previousFailpoint)
+    discard run("icp deploy -y")
+
+    let seeded = decodedReply("bench_reset", "(1000)")
+    let beforeChecksum = decodedReply("bench_read", "(1000)", query = true)["checksum"].getNat64()
+    let beforePages = decodedReply("bench_host_stats", "()", query = true)["raw_stable_pages"].getNat64()
+    check seeded["rows"].getNat64() == 1000
+    rejectedUpdate("bench_failpoint_update", "(1000)")
+    check decodedReply("bench_read", "(1000)", query = true)["checksum"].getNat64() == beforeChecksum
+    check decodedReply("bench_host_stats", "()", query = true)["raw_stable_pages"].getNat64() == beforePages

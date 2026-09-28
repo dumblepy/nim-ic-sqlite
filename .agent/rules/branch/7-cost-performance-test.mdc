@@ -342,7 +342,7 @@ run_id,implementation,repo_sha,wasm_sha256,scenario,trial,cycle,phase,rows,succe
 - [x] P0: CSV/JSONLの共通measurement型を追加し、命令数未取得を `null` / 空欄で保持してゼロ扱いしないことを検証した。
 - [ ] P1: reset/insert/update/append/prepared read/churn/statsのNim endpointを実Canisterで確認済み。Rust契約のprofile、join、large blob等の全endpointは未実装。
 - [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。
-- [ ] P3: 両実装の5,000件×100周回churn（各201ステップ）とupgrade後の行数、Native rollback/region試験を確認。ZeroExtentのtruncate→再拡張→reopenはsuperblock経由で修正・検証済み。ic-stable-structures互換の有効なMGR metadataとの共存もNativeで確認した。Wasm failpoint試験が残る。
+- [x] P3: 両実装の5,000件×100周回churn（各201ステップ）とupgrade後の行数、Native rollback/region試験を確認。ZeroExtentのtruncate→再拡張→reopenはsuperblock経由で修正・検証済み。ic-stable-structures互換の有効なMGR metadataとの共存、stable publish途中のWasm failpoint trapとメッセージrollbackも確認した。
 - [ ] P4: 更新命令数、両実装のraw/virtual stable memoryを採取し、公式料金の日時付きスナップショットで30日推計を作成。Heap、管理APIのCycles分類、実行費用の照合が残る。
 - [ ] P5: 自動summaryと欠測検査を追加。CIでの両Wasm build・比較回帰試験は未追加。
 
@@ -356,4 +356,5 @@ run_id,implementation,repo_sha,wasm_sha256,scenario,trial,cycle,phase,rows,succe
 - Rust側のraw物理ページは固定commitへ `rust_host_stats.patch` を適用した計測用Wasmのread-only endpointで採取する。元のcommit SHAとパッチSHA、最終Wasm SHAをrun manifestで別々に記録する。
 - Nimの `sqliteStableBackend` によるMGR接頭部検出は固定1025ページ方式で、現在のNim Canisterでも大きなraw初期領域として観測された。RustのMemoryId仮想ページと混同せず、両側のrawページを同じ `ic0_stable64_size` で比較する。Native試験はic-stable-structures 0.7互換のversion 1 header、128-page bucket、全32768バイトの割当表、MemoryId 7のsentinelを用い、SQLite後にmetadataとsentinelが不変であることを確認する。
 - VFSのtruncate→再拡張→再openでzero extentを失う不具合は、VFSが確定extentを保持し、DBがsuperblockへ保存・次回`initVfs`へ復元するよう修正した。overlay非活性のquery readにもextentを適用する。16KiB以外のテストページサイズもVFS設定として保持する。
+- `NISQL_ENABLE_FAILPOINT=1` の場合だけbenchmark Canisterを計測用のstable backendでビルドする。このbackendは2回目のstable writeを失敗させる。最初のdirty page書込み後に`PublishStartedError`から`ic0_trap`となり、ローカルreplicaでupdate拒否後のchecksumとraw stable pagesが不変であることを確認した。通常ベンチマークWasmにはこのbackendもendpointも含めない。
 - 公式Cycle Costsの2026-09-27取得値（13-node: Update基本5,000,000 cycles、1命令1 cycle、保管127,000 cycles/GiB/s）で推計する。Heap・ingress・storage reservation・管理API実測値は未取得として明示し、推計を実料金と呼ばない。

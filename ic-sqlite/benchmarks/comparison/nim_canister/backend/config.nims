@@ -21,6 +21,11 @@ switch("passL", sqliteWasiArtifacts / "sqlite_helpers.o")
 switch("define", "wasi")
 switch("define", "rustcryptoWasi")
 
+# Only the rollback integration test enables the instrumented stable backend.
+# Production benchmark Wasm must not include a write-path failpoint.
+if getEnv("NISQL_ENABLE_FAILPOINT") == "1":
+  switch("define", "benchmarkFailpoint")
+
 # Enforce static linking for the WASI target to make it self-contained.
 switch("passC", "-target wasm32-wasi")
 switch("passL", "-target wasm32-wasi")
