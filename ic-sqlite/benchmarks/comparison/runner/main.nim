@@ -5,6 +5,7 @@ import nicp_cdk/ic_types/candid_types
 import nicp_cdk/ic_types/ic_record except `%`, `%*`
 import ../shared/[bench_report, bench_spec]
 import ./transport
+import ./validate
 
 const
   ComparisonDir = "/application/ic-sqlite/benchmarks/comparison"
@@ -164,6 +165,7 @@ proc main() =
     echo fmt"trial {trial}/{trialCount} complete"
   let nimMedian = median(nimUpdate)
   let rustMedian = median(rustUpdate)
+  validateCoreResults(resultDir / "measurements.jsonl")
   writeFile(resultDir / "summary.md", fmt"# {runId}" & "\n\n" &
     fmt"Core KV workload: 100 rows, {trialCount} fresh Nim/Rust canister pairs." & "\n\n" &
     "| Update instruction median | Count |\n|---|---:|\n" &

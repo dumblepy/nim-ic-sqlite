@@ -140,3 +140,4 @@
 - P1へ`bench_many_rows`と`bench_unbounded_order_by`を追加した。更新済み3行の読取りchecksum 81と10行ORDER BYの非ゼロchecksumを、同じCanister統合試験で確認した。
 - P1へ`bench_read_public_helper`、`bench_read_prepare_each`、`bench_get_many_in`を追加した。public helperはprepared statementを再利用し、prepare-eachとは別経路にした。更新済み3行に対し各endpointのchecksum 81をCanister統合試験で確認した。multi-getはSQLiteのparameter上限に合わせ1〜999行へ制限する。
 - P1へ`bench_growth`を追加した。指定行をseedした後、指定回数の更新を個別SQLite transactionとして実行する。10行・20回更新でchecksum 20を実Canister統合試験で確認した。
+- P5へcore KV JSONLの検証を追加した。Nim/Rust各trialのreset/read/updateが一対一に揃い、成功、命令数、raw stable memory、heap観測が全て存在することをsummary作成前に検査する。

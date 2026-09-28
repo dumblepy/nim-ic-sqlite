@@ -13,3 +13,4 @@ nim c -r benchmarks/comparison/tests/test_failure_atomicity.nim
 nim c -r benchmarks/comparison/tests/test_zero_extent_persistence.nim
 nim c -r benchmarks/comparison/tests/test_memory_region.nim
 nim c -r benchmarks/comparison/tests/test_cost_model.nim
+nim c -r benchmarks/comparison/tests/test_result_validation.nim
