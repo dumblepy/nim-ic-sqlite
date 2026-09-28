@@ -131,3 +131,4 @@
 - production Wasmで5,000件×100周回churnを両実装で完走し、各201ステップを `ic-sqlite/benchmarks/comparison/results/churn-20260927T234335Z/` に保存した。最終行数は両側5,000、raw stable pagesはNim 1,031、Rust 129で周回中に増えなかった。
 - ZeroExtentのtruncate→再拡張→reopen不具合を、VFS確定extentのsuperblock保存・復元とoverlay非活性readのゼロ化で修正し、Native回帰試験で確認した。両実装のupgrade後churn継続、Native rollback、bounded region隔離も確認した。
 - P4の公式Cycle Costs料金スナップショットと30日シナリオ推計をproduction churn runの `cost_estimate.json` に保存した。Heapと管理APIのCycles分類は未取得で、推計はstable memoryとUpdateのみ。
+- `test_memory_region.nim` を、3バイトの接頭部だけではないic-stable-structures 0.7互換MGR fixtureへ更新した。version 1 header、128-page bucket、全割当表、MemoryId 7のsentinelをSQLite操作後に再検証し、固定1025-page offsetが既存所有領域を変更しないことを確認した。
