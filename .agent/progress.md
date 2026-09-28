@@ -133,3 +133,5 @@
 - P4の公式Cycle Costs料金スナップショットと30日シナリオ推計をproduction churn runの `cost_estimate.json` に保存した。Heapと管理APIのCycles分類は未取得で、推計はstable memoryとUpdateのみ。
 - `test_memory_region.nim` を、3バイトの接頭部だけではないic-stable-structures 0.7互換MGR fixtureへ更新した。version 1 header、128-page bucket、全割当表、MemoryId 7のsentinelをSQLite操作後に再検証し、固定1025-page offsetが既存所有領域を変更しないことを確認した。
 - P3のWasm failpoint統合試験を追加した。`NISQL_ENABLE_FAILPOINT=1` の専用Wasmのみ2回目のstable writeを失敗させる。1回目のdirty pageをpublishした後のtrap（IC0503）後も、1000件のchecksum 25,000とraw stable pages 1,028が不変であることをローカルreplicaで確認した。
+- P4のrunnerは`icp canister status --json`の`memory_size`を取得し、raw stable bytesとの差分を`heap_bytes`として記録するようにした。新規artifactの費用推計ではheap storageも加算する。既存artifactのheap nullは未測定のまま保持する。
+- 最新Nim commit `c101d26e99a0c0df70752c95bb005fb20b03de8e` と固定Rust commitでfresh Canister 1組を再実行し、`results/20260928T014842Z/` にheap bytesを含むCSV/JSONLを保存した。Nimは3,273,713 bytes、Rustは3,405,778 bytesで、いずれもraw stable memoryとの差分として記録した。これはrunnerの採取確認用1 trialであり、5 trial比較値ではない。

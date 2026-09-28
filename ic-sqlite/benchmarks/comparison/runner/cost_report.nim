@@ -1,6 +1,6 @@
 ## Explicit scenario estimate from observed churn and a dated rate snapshot.
 ## Usage: nim c -r runner/cost_report.nim <results/churn-run-id>
-import std/[algorithm, json, os, strutils]
+import std/[algorithm, json, os]
 import ../shared/cost_model
 
 const PricingPath = "/application/ic-sqlite/benchmarks/comparison/pricing_2026-09-27.json"
@@ -13,6 +13,7 @@ type Series = object
   resetSeen: bool
   updateInstructionsTotal: uint64
   maxRawBytes: uint64
+  maxHeapBytes: uint64
   firstRawBytes: uint64
   lastRawBytes: uint64
   rowsObserved: uint64
@@ -40,6 +41,8 @@ proc main() =
     let phase = row["phase"].getStr()
     let instructions = uint64(row["instructions_update"].getBiggestInt())
     let raw = uint64(row["raw_stable_bytes"].getBiggestInt())
+    if row["heap_bytes"].kind != JNull:
+      current.maxHeapBytes = max(current.maxHeapBytes, uint64(row["heap_bytes"].getBiggestInt()))
     current.rowsObserved += 1
     current.updateInstructionsTotal += instructions
     if current.firstRawBytes == 0: current.firstRawBytes = raw
@@ -64,7 +67,8 @@ proc main() =
     "description": "retain 5000 rows and perform one 1000-row delete/insert churn cycle per day for 30 days",
     "days": 30, "subnet_nodes": rates.subnetNodes,
     "storage_assumption": "observed maximum raw stable bytes held for all 30 days",
-    "heap_bytes": "not_available", "cycles_metrics": "not_available"
+    "heap_bytes": "derived from canister_status.memory_size minus raw stable memory when available",
+    "cycles_metrics": "not_available"
   }
   for implementation in ["nim", "rust"]:
     let current = if implementation == "nim": addr nim else: addr rust
@@ -78,29 +82,34 @@ proc main() =
     let medianCycle = median(cycleInstructions)
     let updateCycles = rates.estimateUpdateCycles(60, 30'u64 * medianCycle)
     let storageCycles = rates.estimateStableStorageCycles(current.maxRawBytes, 30'u64 * 86_400)
+    let heapCycles = if current.maxHeapBytes == 0: 0.0
+      else: rates.estimateStableStorageCycles(current.maxHeapBytes, 30'u64 * 86_400)
     output[implementation] = %*{
       "observed_churn_update_instructions_total": current.updateInstructionsTotal,
       "median_cycle_instructions": medianCycle,
       "raw_stable_bytes_initial": current.firstRawBytes,
       "raw_stable_bytes_final": current.lastRawBytes,
       "raw_stable_bytes_high_water": current.maxRawBytes,
+      "heap_bytes_high_water": if current.maxHeapBytes == 0: newJNull() else: %current.maxHeapBytes,
       "estimated_30d_update_cycles": updateCycles,
       "estimated_30d_stable_storage_cycles": storageCycles,
-      "estimated_30d_subtotal_excluding_heap_and_other_fees": float64(updateCycles) + storageCycles,
-      "sensitivity_34_node_subtotal_cycles": scaleCyclesForNodes(float64(updateCycles) + storageCycles, 13, 34)
+      "estimated_30d_heap_storage_cycles": heapCycles,
+      "estimated_30d_subtotal_excluding_other_fees": float64(updateCycles) + storageCycles + heapCycles,
+      "sensitivity_34_node_subtotal_cycles": scaleCyclesForNodes(float64(updateCycles) + storageCycles + heapCycles, 13, 34)
     }
   writeFile(resultDir / "cost_estimate.json", output.pretty())
   var summary = readFile(resultDir / "summary.md")
   summary.add("\n## 30-day scenario estimate (13-node rate snapshot)\n\n")
   summary.add("Rates: " & pricing["source"].getStr() & " (retrieved " & pricing["retrieved_utc"].getStr() & ").\n\n")
-  summary.add("| Implementation | Update cycles | Stable storage cycles | Subtotal cycles |\n|---|---:|---:|---:|\n")
+  summary.add("| Implementation | Update cycles | Stable storage cycles | Heap storage cycles | Subtotal cycles |\n|---|---:|---:|---:|---:|\n")
   for implementation in ["nim", "rust"]:
     let row = output[implementation]
     summary.add("| " & implementation & " | " & $row["estimated_30d_update_cycles"].getBiggestInt() &
       " | " & $row["estimated_30d_stable_storage_cycles"].getFloat() &
-      " | " & $row["estimated_30d_subtotal_excluding_heap_and_other_fees"].getFloat() & " |\n")
+      " | " & $row["estimated_30d_heap_storage_cycles"].getFloat() &
+      " | " & $row["estimated_30d_subtotal_excluding_other_fees"].getFloat() & " |\n")
   summary.add("\nAssumes one 1000-row delete/insert cycle daily and holds the observed maximum raw stable bytes for 30 days. " &
-    "Heap, ingress, storage reservation, and other fees are excluded. Local query instruction counts are excluded.\n")
+    "Heap is included only when canister status memory_size was available; ingress, storage reservation, and other fees are excluded. Local query instruction counts are excluded.\n")
   writeFile(resultDir / "summary.md", summary)
   echo resultDir / "cost_estimate.json"
 

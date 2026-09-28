@@ -16,7 +16,7 @@ const
   RustWasm = RustRepo / "benchmarks/kv-canister/target/wasm32-unknown-unknown/release/ic_sqlite_vfs_kv_bench.wasm"
   RustDid = RustRepo / "benchmarks/kv-canister/kv_bench.did"
   ExpectedRustSha = "1386239acff1dd7ede5ac78a2f0a22ef495195de"
-  ExpectedNimSha = "96faaf95a03632c269038ae9b1e61a795cd66968"
+  ExpectedNimSha = "c101d26e99a0c0df70752c95bb005fb20b03de8e"
 
 proc shellOutput(command: string): string =
   let (output, status) = execCmdEx(command)
@@ -65,7 +65,12 @@ proc measure(transport: CliTransport; runId, implementation, repoSha, wasmSha,
   let host = transport.call(canister, didPath, "bench_host_stats", "()", query = true)
   let rawPages = host["raw_stable_pages"].getNat64()
   result.rawStablePages = some(rawPages)
-  result.rawStableBytes = some(host["raw_stable_bytes"].getNat64())
+  let rawBytes = host["raw_stable_bytes"].getNat64()
+  result.rawStableBytes = some(rawBytes)
+  let totalMemory = transport.canisterMemoryBytes(canister)
+  if totalMemory < rawBytes:
+    raise newException(ValueError, "canister status memory_size is smaller than raw stable memory")
+  result.heapBytes = some(totalMemory - rawBytes)
   if baselineRaw.isSome: result.rawGrowthPages = some(rawGrowthPages(baselineRaw.get(), rawPages))
 
 proc main() =
@@ -109,7 +114,7 @@ proc main() =
   manifest["trial_baselines"] = newJArray()
   manifest["notes"] = %["Both implementations use fresh canisters on the same local subnet per trial.",
     "Rust source is pinned plus rust_host_stats.patch; both physical page counts use ic0 stable64_size.",
-    "Heap bytes remain unavailable; null is recorded.",
+    "heap_bytes is derived from canister status memory_size minus raw stable bytes; it is a local status observation.",
     "Nim and nicp_cdk working trees are dirty; source file hashes identify the measured build.",
     "Query instructions are measured separately and are not cycles estimates."]
   writeFile(resultDir / "manifest.json", manifest.pretty())
@@ -167,7 +172,7 @@ proc main() =
     "Raw values, SQLite virtual pages, and physical stable pages are in " &
     "measurements.csv and measurements.jsonl. " &
     "Query instruction counts use different connection warmup paths and are descriptive only. " &
-    "Heap bytes and cycle costs remain unavailable.\n")
+    "heap_bytes is derived from canister status memory_size minus raw stable bytes. Cycle cost metrics remain unavailable.\n")
   echo resultDir
 
 when isMainModule: main()

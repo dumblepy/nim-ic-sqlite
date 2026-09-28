@@ -6,6 +6,11 @@ import nicp_cdk/ic_types/candid_message/candid_decode
 type CliTransport* = object
   projectDir*: string
 
+proc parseCliNat*(value: JsonNode): uint64 =
+  ## `icp canister status --json` prints large counters as strings with `_`.
+  let text = if value.kind == JString: value.getStr().replace("_", "") else: $value.getBiggestInt()
+  parseBiggestUInt(text).uint64
+
 proc runCommand*(transport: CliTransport; command: string): string =
   let previous = getCurrentDir()
   try:
@@ -38,6 +43,10 @@ proc install*(transport: CliTransport; canister, wasmPath: string) =
 proc upgrade*(transport: CliTransport; canister, wasmPath: string) =
   discard transport.runCommand("icp canister install " & quoteShell(canister) &
     " --wasm " & quoteShell(wasmPath) & " -m upgrade -y")
+
+proc canisterMemoryBytes*(transport: CliTransport; canister: string): uint64 =
+  let status = parseJson(transport.runCommand("icp canister status " & quoteShell(canister) & " --json"))
+  status["memory_size"].parseCliNat()
 
 proc call*(transport: CliTransport; canister, didPath, methodName, args: string;
            query = false): CandidRecord =
