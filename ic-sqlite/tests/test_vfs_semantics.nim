@@ -152,4 +152,27 @@ suite "VFS semantics":
       "INSERT INTO blobs(id, body) VALUES (?, ?)",
       [sqlInt(2), sqlBlob(newSeq[byte](7))])
     check small.isOk
+    # Sub-page (1 KiB) and page-boundary (16 KiB) BLOBs must round-trip too;
+    # these exercise the VFS short/whole page boundaries with overflow I/O.
+    var pageBlob = newSeq[byte](16384)
+    for index in 0 ..< pageBlob.len: pageBlob[index] = byte(index mod 251)
+    let boundary = reopened.execValues(
+      "INSERT INTO blobs(id, body) VALUES (?, ?)",
+      [sqlInt(3), sqlBlob(pageBlob)])
+    check boundary.isOk
+    let boundaryCheck = reopened.withQuery(
+      proc(conn: var Connection): Result[bool, DbError] =
+        let prepared = conn.prepare("SELECT body FROM blobs WHERE id = 3")
+        if not prepared.isOk: return Result[bool, DbError](isOk: false, error: prepared.error)
+        var statement = prepared.value
+        defer: statement.finalize()
+        let stepped = statement.step()
+        if not stepped.isOk: return Result[bool, DbError](isOk: false, error: stepped.error)
+        if stepped.value != srRow:
+          return Result[bool, DbError](isOk: false, error: DbError(message: "blob row 3 missing"))
+        if statement.columnBlob(0) != pageBlob:
+          return Result[bool, DbError](isOk: false, error: DbError(message: "page blob mismatch"))
+        Result[bool, DbError](isOk: true, value: true)
+    )
+    check boundaryCheck.isOk and boundaryCheck.value
     reopened.close()

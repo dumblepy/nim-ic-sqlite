@@ -389,3 +389,7 @@ nim c -r runner/validate.nim results/<run-id>
 
 - Nim 2.2.12 の `std/tables` では `withValue` は `Table` に提供される一方、`OrderedTable` には提供されない。dirty page の挿入順は publish 時にキーを収集してソートしており観測可能な意味を持たないため、dirty table を `Table` に変更して `withValue` のスコープ内で resident `seq` を直接更新する。table の追加・削除をまたぐ要素ポインタは保持しない。
 - `heap_bytes` は canister status の `memory_size - raw_stable_bytes` に限る観測値で、ライブ heap の値ではない。churn runner も core runner と同じ順序で host stats の後に status を取得して記録する。
+- Nim 2.2.12 では `when defined(x):` ブロック内に定義した object 型のフィールドを他モジュールからアクセス可能にするには、型ヘッダの `Type*` のみでは不十分で、**フィールドごとの `field*: type` 形式**が必須（`field: type` だと「undeclared field」）。`OverlayProfileStats` / `VfsProfileStats` / `DbProfileStats` に適用。
+- `-d:benchmarkProfile` に分離した Overlay 統計は 1 トランザクションの `Overlay` ごとなので、VFS グローバルで `endOverlay` 時に累計へ `addFrom` して集計する（`initVfs` でリセット）。
+- read connection / statement cache の実験機構は「キャッシュは必ず所有 connection と同一のタイミングで無効化される」制約で実装した: `db.update` 開始時（`beginStableOperation`）に `cachedQueryRaw` と query statement cache をまとめて close/finalize する。read connection を跨いで statement を残す経路は存在しない。
+- clean page cache は update overlay の base read 専用（read-only query connection は overlay を経由しないため影響しない）ため、A/B は `withUpdate` 中の upsert ワークロードで測る必要がある。実測（`results/clean-cache-ab-20260929T101911Z`）では 100 行 upsert × 20 反復のワークロードで dirty 化対象は 2 ページ止まりのため hits が 0 で差分なし。既定無効(0)を維持。

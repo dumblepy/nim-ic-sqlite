@@ -553,25 +553,49 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "SQL exceeds configured limit"))
-  let cacheable = conn.db[].config.statementCacheEnabled and conn.raw == conn.db[].raw
-  if cacheable and conn.db[].statementCache.hasKey(sql):
-    let raw = conn.db[].statementCache[sql]
-    discard sqlite3_reset(raw)
-    discard sqlite3_clear_bindings(raw)
-    inc conn.db[].statementCacheStats.hits
-    return Result[Statement, DbError](isOk: true,
-      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-        cached: true, cacheKey: sql))
+  ## The statement cache can live on the update connection or on the reused
+  ## read connection.  In both cases the cache is invalidated together with
+  ## its owning connection, so a cached statement can never outlive it;
+  ## `finalize` only resets and clears bindings for cached entries.
+  let ownedByDb = conn.raw != nil and conn.raw == conn.db[].raw
+  let ownedByQuery = conn.db[].config.queryConnectionReuse and
+    not ownedByDb and not conn.db[].cachedQueryRaw.isNil and
+    conn.raw == conn.db[].cachedQueryRaw
+  let inDbCache = ownedByDb and conn.db[].config.statementCacheEnabled
+  let inQueryCache = ownedByQuery and conn.db[].config.queryStatementCacheEnabled
+  let cacheable = inDbCache or inQueryCache
+  if cacheable:
+    let cache: ptr Table[string, ptr Sqlite3Stmt] =
+      if inDbCache: addr conn.db[].statementCache
+      else: addr conn.db[].queryStatementCache
+    let stats: ptr StatementCacheStats =
+      if inDbCache: addr conn.db[].statementCacheStats
+      else: addr conn.db[].queryStatementCacheStats
+    if cache[].hasKey(sql):
+      let raw = cache[][sql]
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
+      inc stats[].hits
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+          cached: true, cacheKey: sql))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.raw, code))
-  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
-    conn.db[].statementCache[sql] = raw
-    inc conn.db[].statementCacheStats.misses
-    return Result[Statement, DbError](isOk: true,
-      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-        cached: true, cacheKey: sql))
+  if cacheable:
+    let cache: ptr Table[string, ptr Sqlite3Stmt] =
+      if inDbCache: addr conn.db[].statementCache
+      else: addr conn.db[].queryStatementCache
+    let stats: ptr StatementCacheStats =
+      if inDbCache: addr conn.db[].statementCacheStats
+      else: addr conn.db[].queryStatementCacheStats
+    if uint64(cache[].len) < conn.db[].config.maxCachedStatements:
+      cache[][sql] = raw
+      inc stats[].misses
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+          cached: true, cacheKey: sql))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 

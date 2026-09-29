@@ -30,9 +30,9 @@
 
 ### 0. 現状固定・回帰基盤
 
-- [ ] 現在の `ic-sqlite` HEAD、dirty-tree 状態、Nim/Rust 比較 SHA、ツールチェーン、SQLite compile flags、ページサイズ、cache size を manifest に記録する。
-- [ ] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。
-- [ ] EOF、0-byte I/O、負値／オーバーフロー／nil pointer の扱いを現行 VFS と SQLite callback 境界で調査し、テスト可能な期待結果を確定する。
+- [x] 現在の `ic-sqlite` HEAD、dirty-tree 状態、Nim/Rust 比較 SHA、ツールチェーン、SQLite compile flags、ページサイズ、cache size を manifest に記録する。comparison runner が各 run で `nim_source_sha` / `nim_source_dirty` / `nim_wasm_sha256` / Rust pinned SHA・Wasm hash・ツールチェーンを `manifest.json` に書いていることを確認。
+- [x] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。変更前 HEAD(`bd5763b` 系)でも 16/16 PASS・exit 0（`/tmp/test_sh_run1.log`）。本ブランチの変更後は 17→18/18 PASS・exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。
+- [x] EOF、0-byte I/O、負値／オーバーフロー／nil pointer の扱いを現行 VFS と SQLite callback 境界で調査し、テスト可能な期待結果を確定する。`test_vfs.nim`（short-read tail 全ゼロ、0-byte nil 許容、unsigned 範囲超は `SQLITE_IOERR`）と `test_overlay.nim` の direct I/O 境界値で固定済み。
 - [x] 既存 `test_vfs.nim` / `test_overlay.nim` を拡張し、short-read tail 全ゼロ、境界・複数ページ・overlapping write の回帰を追加する。
 - [x] failure atomicity、zero extent persistence、cross upgrade、memory region の既存比較テストを実行対象として確認する。
 
@@ -121,6 +121,17 @@
 | 2026-09-29 | publish atomicity | `nim c -r tests/test_overlay.nim` | 成功。stable grow の失敗は publish 前の可逆失敗、最初の page write を試行した後の失敗は不可逆として区別されることを確認。 |
 | 2026-09-29 | VFS semantics / profile | `nim c -r tests/test_vfs_semantics.nim`、`nim c -d:benchmarkProfile -r tests/test_overlay.nim` | 成功。4 MiB BLOB の commit/reopen、複数 truncate/re-extend、publish atomicity、clean cache の既定無効と profile build を確認。 |
 | 2026-09-29 | clean cache A/B runner | `nim c benchmarks/comparison/runner/clean_cache_ab.nim` | 成功。0 / 2 / 4 / 8 page、各3反復の profile-instrumented canister 測定 runner をコンパイル。実測は local ICP の実行時間を要するため未開始。 |
+| 2026-09-29 | 回帰ゲート完走 | `./scripts/test.sh`（変更前 HEAD） | 16/16 PASS、exit 0。このセッション開始時点のベースライン固定。 |
+| 2026-09-29 | canister 統合・cross upgrade（終了コード取得） | `./benchmarks/comparison/tests/test_canister_integration`、`./benchmarks/comparison/tests/test_cross_upgrade` | 両方とも local ICP で完走、**exit 0**。CRUD/churn/memory/upgrade、publish failpoint rollback、4 MiB 大 BLOB・join・many rows・multi-get、Rust⇄Nim cross upgrade を確認。前セッションの「終了コード未取得」は解消。 |
+| 2026-09-29 | 5組 paired trial | `NISQL_COMPARE_NIM_SHA=HEAD runner/main.nim 5` → `runner/validate.nim` | exit 0。`results/20260929T062335Z`（Nim/Rust fresh pair ×5、manifest+Wasm hash+dirty-tree 記録）を生成し core 検証ツールで検証済み。後続の別セッション実行（101233Z/101410Z）と併せて中央値・レンジを保存。 |
+| 2026-09-29 | 回帰ゲート完走（新テスト込み） | `./scripts/test.sh` | 18/18 PASS、exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。`test_vfs_semantics.nim`（publish 前破棄 / publish 後不可逆 / 複数回 truncate・re-extend / 4 MiB BLOB 復元）と clean cache の native 回帰（既定無効・2 page 時の hit/eviction・truncate 時の破棄）を含む。 |
+| 2026-09-29 | clean page cache A/B 実測 | `runner/clean_cache_ab`（profile wasm、1 canister、0/2/4/8 × 3反復） | 完走。`results/clean-cache-ab-20260929T101911Z`。全 variant で clean_cache_hits=0（本ワークロードでは base 再読が起きない）、heap_bytes・raw_stable_bytes は全 variant 同一。採用判断: 不採用・既定無効維持（後続セッションの採否記録と整合）。 |
+| 2026-09-29 | read connection / statement cache 実験機構 | `db.nim` に `queryConnectionReuse` / `queryStatementCacheEnabled`（既定 false）と read connection 専用の statement cache・close/update 時の finalize を追加、canister に `bench_set_experiment` を追加、`runner/query_reuse_ab` を追加 | 通常・profile の canister ビルドが両方通過（`NORMAL_EXIT=0`/`PROFILE_EXIT=0`）。`test_db_api.nim` の「reuse when enabled」「invalidation after update」が native で緑。`query_reuse_ab` runner もコンパイル済み（既定無効のまま A/B 可）。 |
+| 2026-09-29 | 大 BLOB 境界値追加・最終ゲート | `tests/test_vfs_semantics.nim`（4 MiB + 16 KiB 境界 BLOB の commit/reopen/内容照合）追加後 `./scripts/test.sh` | **18/18 PASS、exit 0**（`/tmp/test_sh_final.log`）。 |
+
+## 現在の未確定事項
+
+- なし。`test_canister_integration` と `test_cross_upgrade` は local ICP で終了コード取得済み（両方とも 0）。
 
 ## 阻害事項
 
