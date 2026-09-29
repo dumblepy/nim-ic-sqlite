@@ -340,10 +340,10 @@ run_id,implementation,repo_sha,wasm_sha256,scenario,trial,cycle,phase,rows,succe
 - [x] P0: `bench_manifest.json` に Nim (`4735f04908ae9a7ac30bac6d05aa7aaa1e0da260`) と Rust (`1386239acff1dd7ede5ac78a2f0a22ef495195de`) の比較対象を固定し、SQLite/Nim/nicp_cdk の現行値を記録した。
 - [x] P0: Rust固定commitの `kv_bench.did` と `key.rs` を照合し、固定長キー・値・churn範囲をNimで実装して境界値試験を追加した。
 - [x] P0: CSV/JSONLの共通measurement型を追加し、命令数未取得を `null` / 空欄で保持してゼロ扱いしないことを検証した。
-- [ ] P1: reset/insert/update/append/prepared read/churn/stats、large blob、JOIN、many rows、unbounded order-by、public helper、prepare-each、multi-get、growthのNim endpointを実Canisterで確認済み。固定オフセットVFSのNim固有capacity guardは、DB size・SQLite仮想ページ・raw stable memoryの不変性を実測する。Rust契約のprofile、growth profile/capacity guard等は未実装。
-- [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。最新run `20260928T020140Z` はheap bytesも記録する。
+- [x] P1: reset/insert/update/append/prepared read/churn/stats、large blob、JOIN、many rows、unbounded order-by、public helper、prepare-each、multi-get、growthのNim endpointを実Canisterで確認済み。固定オフセットVFSのNim固有capacity guardは、DB size・SQLite仮想ページ・raw stable memoryの不変性を実測する。Nim/Rust のread/write/get-many/growth profileは共通artifactへ保存・検証する。実装固有のcapacity表現は共通指標へ推測変換しない。
+- [x] P2: 検証済み `icp` CLI 1.5.0 の `--json` からCandidバイト列を復号するNim transportを実装。fresh Canister 5組の実行を完了し、commit・Wasm SHA・生CSV/JSONLをrun ID付きで保存した。現存する最新paired run `20260928T174316Z` はheap bytesも記録する。
 - [x] P3: 両実装の5,000件×100周回churn（各201ステップ）とupgrade後の行数、Native rollback/region試験を確認。ZeroExtentのtruncate→再拡張→reopenはsuperblock経由で修正・検証済み。ic-stable-structures互換の有効なMGR metadataとの共存、stable publish途中のWasm failpoint trapとメッセージrollbackも確認した。
-- [ ] P4: 更新命令数、両実装のraw/virtual stable memoryを採取し、公式料金の日時付きスナップショットで30日推計を作成。runnerは`icp canister status --json`の`memory_size`からraw stable memoryを差し引いたWasm heap bytesと、各phase前後の`cycles`/`reserved_cycles`残高を採取する。残高差はローカルreplicaの管理status観測であり、命令実行費用としては扱わない。新しい比較runでの採取と実行費用の照合が残る。
+- [ ] P4: 更新命令数、両実装のraw/virtual stable memoryを採取し、公式料金の日時付きスナップショットで30日推計を作成。runnerは`icp canister status --json`の`memory_size`からraw stable memoryを差し引いたWasm heap bytesと、各phase前後の`cycles`/`reserved_cycles`残高を採取する。`NISQL_COMPARE_NETWORK` と `NISQL_COMPARE_INITIAL_CYCLES` により外部networkにも同じfresh paired測定を実行できる。残高差は管理status観測であり、命令実行費用としては扱わない。Cyclesを伴う外部networkでの実行と費用照合が残る。
 - [x] P5: core KV結果の試行・phase対称性、成功、命令数・stable memory・heap観測の欠測検査をrunnerへ追加した。churn結果（201ステップ両実装、成功・行数・観測項目）の機械検証 `validateChurnResults` も追加し、`cost_report` は検証を通過したrunのみに推計を実行する。`validate` CLIはscenarioからcore/churnを自動判定する。
 - [x] P5: 両Wasm build・paired core-KV測定・結果検証は README の手動手順として維持する。比較測定は時間と外部Rust buildを要するため、`ci.yml` の通常CIから外した。
 

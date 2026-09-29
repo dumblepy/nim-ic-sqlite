@@ -5,6 +5,12 @@ import nicp_cdk/ic_types/candid_message/candid_decode
 
 type CliTransport* = object
   projectDir*: string
+  network*: string
+  initialCycles*: string
+
+proc networkArgs*(transport: CliTransport): string =
+  if transport.network.len == 0: ""
+  else: " --network " & quoteShell(transport.network)
 
 proc parseCliNat*(value: JsonNode): uint64 =
   ## `icp canister status --json` prints large counters as strings with `_`.
@@ -34,18 +40,22 @@ proc stopNetwork*(transport: CliTransport) =
   discard transport.runCommand("icp network stop")
 
 proc createCanister*(transport: CliTransport): string =
-  parseJson(transport.runCommand("icp canister create --detached --json"))["canister_id"].getStr()
+  let cycles = if transport.initialCycles.len == 0: ""
+    else: " --cycles " & quoteShell(transport.initialCycles)
+  parseJson(transport.runCommand("icp canister create --detached --json" &
+    transport.networkArgs() & cycles))["canister_id"].getStr()
 
 proc install*(transport: CliTransport; canister, wasmPath: string) =
   discard transport.runCommand("icp canister install " & quoteShell(canister) &
-    " --wasm " & quoteShell(wasmPath) & " -y")
+    " --wasm " & quoteShell(wasmPath) & " -y" & transport.networkArgs())
 
 proc upgrade*(transport: CliTransport; canister, wasmPath: string) =
   discard transport.runCommand("icp canister install " & quoteShell(canister) &
-    " --wasm " & quoteShell(wasmPath) & " -m upgrade -y")
+    " --wasm " & quoteShell(wasmPath) & " -m upgrade -y" & transport.networkArgs())
 
 proc canisterStatus*(transport: CliTransport; canister: string): JsonNode =
-  parseJson(transport.runCommand("icp canister status " & quoteShell(canister) & " --json"))
+  parseJson(transport.runCommand("icp canister status " & quoteShell(canister) &
+    " --json" & transport.networkArgs()))
 
 proc canisterMemoryBytes*(transport: CliTransport; canister: string): uint64 =
   let status = transport.canisterStatus(canister)
@@ -65,7 +75,8 @@ proc call*(transport: CliTransport; canister, didPath, methodName, args: string;
            query = false): CandidRecord =
   let queryFlag = if query: " --query" else: ""
   let command = "icp canister call " & quoteShell(canister) & " " & quoteShell(methodName) &
-    " " & quoteShell(args) & " --candid " & quoteShell(didPath) & queryFlag & " --json"
+    " " & quoteShell(args) & " --candid " & quoteShell(didPath) & queryFlag &
+    " --json" & transport.networkArgs()
   let response = parseJson(transport.runCommand(command))
   let hex = response["response_bytes"].getStr()
   if hex.len mod 2 != 0: raise newException(ValueError, "odd Candid hex length")

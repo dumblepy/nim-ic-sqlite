@@ -1,7 +1,7 @@
 ## Validates the complete, paired core-KV and churn result sets before they are
 ## summarized or costed.
 ## Usage: nim c -r runner/validate.nim <results/run-id>
-import std/[json, os, sets, strformat]
+import std/[json, os, sets, strformat, strutils]
 
 const
   CorePhases* = ["reset", "read", "update"]
@@ -42,6 +42,62 @@ proc validateCoreResults*(measurementsPath: string) =
       for phase in CorePhases:
         let key = implementation & ":" & $trial & ":" & phase
         if key notin seen: raise newException(ValueError, "missing paired measurement: " & key)
+
+proc validateCoreManifest*(resultDir: string) =
+  ## Local status balances are observations only.  Require their full shape and
+  ## the explicit classification so a report cannot silently call them fees.
+  let manifestPath = resultDir / "manifest.json"
+  if not fileExists(manifestPath):
+    raise newException(OSError, "missing manifest.json")
+  let manifest = parseFile(manifestPath)
+  if not manifest.hasKey("run_kind") or
+      manifest["run_kind"].getStr() notin ["local_comparison", "external_comparison"]:
+    raise newException(ValueError, "manifest is not a core comparison run")
+  if not manifest.hasKey("trials") or manifest["trials"].kind == JNull:
+    raise newException(ValueError, "manifest is missing trials")
+  let trials = manifest["trials"].getBiggestInt()
+  if trials < 1: raise newException(ValueError, "manifest trials must be positive")
+  let measurementsPath = resultDir / "measurements.jsonl"
+  var measuredTrials = initHashSet[int64]()
+  for line in lines(measurementsPath):
+    if line.len > 0:
+      measuredTrials.incl(parseJson(line)["trial"].getBiggestInt())
+  for trial in 1 .. trials:
+    if trial notin measuredTrials:
+      raise newException(ValueError, "manifest trial has no measurements: " & $trial)
+  if measuredTrials.len != int(trials):
+    raise newException(ValueError, "measurements do not match manifest trial count")
+  if not manifest.hasKey("cycle_balance_observations") or
+      manifest["cycle_balance_observations"].kind != JArray:
+    raise newException(ValueError, "manifest is missing cycle balance observations")
+  var seen = initHashSet[string]()
+  for observation in manifest["cycle_balance_observations"]:
+    for field in ["trial", "cycles_before", "cycles_after",
+                  "reserved_cycles_before", "reserved_cycles_after"]:
+      requiredNumber(observation, field, "cycle balance observation")
+    let implementation = observation["implementation"].getStr()
+    let phase = observation["phase"].getStr()
+    let trial = observation["trial"].getBiggestInt()
+    if implementation notin ["nim", "rust"] or phase notin CorePhases or
+        trial < 1 or trial > trials:
+      raise newException(ValueError, "invalid cycle balance observation")
+    let key = implementation & ":" & $trial & ":" & phase
+    if key in seen: raise newException(ValueError, "duplicate cycle balance observation: " & key)
+    seen.incl(key)
+  for trial in 1 .. trials:
+    for implementation in ["nim", "rust"]:
+      for phase in CorePhases:
+        let key = implementation & ":" & $trial & ":" & phase
+        if key notin seen:
+          raise newException(ValueError, "missing cycle balance observation: " & key)
+  if not manifest.hasKey("notes") or manifest["notes"].kind != JArray:
+    raise newException(ValueError, "manifest is missing notes")
+  var accountingNoteFound = false
+  for note in manifest["notes"]:
+    if note.kind == JString and note.getStr().contains("not instruction-only execution costs"):
+      accountingNoteFound = true
+  if not accountingNoteFound:
+    raise newException(ValueError, "manifest does not classify local cycle balances")
 
 const
   ChurnCycles* = 100
@@ -127,13 +183,19 @@ proc runKind*(measurementsPath: string): string =
 proc main() =
   if paramCount() != 1:
     raise newException(ValueError, "pass a comparison result directory")
-  let measurementsPath = paramStr(1) / "measurements.jsonl"
+  let resultDir = paramStr(1)
+  let measurementsPath = if fileExists(resultDir / "profile_measurements.jsonl"):
+    resultDir / "profile_measurements.jsonl"
+  else:
+    resultDir / "measurements.jsonl"
   if not fileExists(measurementsPath):
     raise newException(OSError, "missing measurements.jsonl")
   case runKind(measurementsPath)
   of "churn_capacity": validateChurnResults(measurementsPath)
   of "profile": validateProfileResults(measurementsPath)
-  else: validateCoreResults(measurementsPath)
+  else:
+    validateCoreResults(measurementsPath)
+    validateCoreManifest(resultDir)
   echo fmt"validated {measurementsPath}"
 
 when isMainModule: main()

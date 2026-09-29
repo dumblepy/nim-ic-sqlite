@@ -11,7 +11,7 @@
 完了条件:
 - `cd /application/ic-sqlite && ./scripts/test.sh` が終了コード 0 で完了する。
 - 手動 paired 測定で両 Wasm の build、fresh core-KV trial、結果検証を完了できる。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T020140Z` が終了コード 0 で完了する。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T174316Z` が終了コード 0 で完了する。
 - profile/capacity の共通比較指標を含む artifact を Nim/Rust の両方から生成し、欠測を機械検証できる。
 - 管理 status 残高と料金推計の照合条件を、ローカル replica の会計値と区別して artifact に記録する。
 
@@ -38,7 +38,7 @@
 
 完了条件:
 - `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_result_validation.nim` が終了コード 0 で完了する。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T020140Z` が終了コード 0 で完了する。
+- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T174316Z` が終了コード 0 で完了する。
 - `.github/workflows/ci.yml` に comparison regression job が存在せず、通常 CI は native/canister test のみを実行する。
 
 条件は「コードを見て正しそう」ではなく、**テスト・lint・typecheck・curl・Playwright 等の実行可能な検証**で機械的に判定できるものとする。
@@ -88,7 +88,31 @@
 - 試したこと: Nim 固有 read/growth/write/get-many profile と capacity guard を追加し、直接観測できる命令区間と stable backend I/O のみを返した。
 - 結果: read/growth/write/get-many profile と capacity guard は実 Canister 統合試験で成功。
 - 否定された仮説: Rust の page-table 固有 record へ Nim 側の推測値を入れれば比較できるという仮説。
-- 次に試すこと: profile validator と summary を実行し、artifact を検証する。
+- 次に試すこと: P1/P4/P5 の完了条件を再確認し、未達の外部Cycles照合を除く測定基盤を完了する。
+
+### 2026-09-28: profile validator の単体試験
+
+- 現在の問題: profile validator の完全性・欠測検出を実artifactだけでしか確認していなかった。
+- 試したこと: Nim/Rust × 4 profile のfixture、共通field欠落、run kind判定の単体試験を追加した。
+- 結果: `test_result_validation.nim` のprofileを含む12ケースが成功した。
+- 否定された仮説: core/churn の検証だけでprofile artifactの欠測も検出できるという仮説。
+- 次に試すこと: P1/P4/P5 の完了条件を再確認する。
+
+### 2026-09-28: P4 fresh paired trial
+
+- 現在の問題: phase 前後の heap/Cycles 観測を、profile追加後のrunnerでも確認する必要があった。
+- 試したこと: `NISQL_COMPARE_NIM_SHA=HEAD nim c -r benchmarks/comparison/runner/main.nim 1` を実行した。
+- 結果: `results/20260928T174316Z/` を生成。manifestにbaseline 1件と phase前後Cycles観測6件を保存し、validatorも成功した。
+- 否定された仮説: profile endpoint追加がcore paired runnerのartifact形式へ影響しないことを実行なしで保証できるという仮説。
+- 次に試すこと: P1/P4/P5の残る外部Cycles照合以外の条件を総合テストで確認する。
+
+### 2026-09-28: profile artifact の検証と summary
+
+- 現在の問題: profile run は `profile_measurements.jsonl` を使うが、既存 validator は `measurements.jsonl` 固定だった。
+- 試したこと: validator に profile artifact の自動選択・Nim/Rust × 4 profile の完全性検証を追加し、`profile_summary.nim` を実装した。
+- 結果: `profile-20260928T115537Z` の8測定を検証し、read/write/get-many/growth の instruction 比を `profile_summary.md` に出力した。
+- 否定された仮説: core/churn 用 validator を profile artifact にそのまま適用できるという仮説。
+- 次に試すこと: profile summary を README の手順へ追記し、P1/P4/P5 の完了条件を再確認する。
 
 ### 2026-09-28: profile artifact runner
 
@@ -105,6 +129,62 @@
 - 結果: fresh 1 trial `results/20260928T073944Z/` に全6 status 観測を保存。core/churn validator は実装済みで、比較手順は README に記録した。
 - 否定された仮説: local replica の残高差だけで mainnet の命令実行費用を照合できるという仮説。
 - 次に試すこと: profile artifact runner を追加後、P1/P4/P5 の完了条件を順に再実行する。
+
+### 2026-09-28: 総合テストの再検証
+
+- 現在の問題: profile artifact のvalidator追加後も、通常ライブラリと比較基盤を通した全体テストが成立する必要がある。
+- 試したこと: `cd /application/ic-sqlite && ./scripts/test.sh` を実行した。
+- 結果: 終了コード 0。通常テスト16件と、fixture、report、storage、rollback、zero extent、MGR、cost model、result validation、profile reportの比較テストがすべて成功した。
+- 否定された仮説: profile validatorの追加で既存の比較基盤または通常ライブラリのテストが壊れるという仮説。
+- 次に試すこと: Canister build・統合試験・既存artifact検証を再実行し、P1/P4/P5の機械検証を確定する。
+
+### 2026-09-28: 現在の artifact を完了条件へ固定
+
+- 現在の問題: 進捗条件が削除済みの `20260928T020140Z` artifact を指し、機械検証が実行不能だった。
+- 試したこと: results 配下を確認し、manifest と measurements が揃う fresh paired run を特定した。
+- 結果: `20260928T174316Z` が現存する完全な paired core artifact であることを確認し、完了条件の対象を更新した。
+- 否定された仮説: 過去run IDを進捗条件に固定しても、artifact保持設定に依存せず検証できるという仮説。
+- 次に試すこと: 現存 paired/profile artifact と Canister統合試験の終了結果を検証する。
+
+### 2026-09-28: P4/P5 artifact の再検証
+
+- 現在の問題: current paired run と profile run が、validator の入力自動選択後も機械検証できる必要がある。
+- 試したこと: paired `20260928T174316Z` と profile `profile-20260928T115537Z` に validator を実行し、profile summary も再生成した。さらに `test_transport.nim` と CI workflow の比較job不在検査を実行した。
+- 結果: 両artifactのvalidator、profile summary、management status復号テスト、CI workflow検査が成功した。
+- 否定された仮説: profile artifact の追加により core artifact のvalidator選択またはCI対象が壊れるという仮説。
+- 次に試すこと: 外部環境でのCycles実行費用照合を除く完了条件は満たした状態として、手動測定手順を維持する。
+
+### 2026-09-28: P4 manifest 会計観測の検証
+
+- 現在の問題: local status のCycles残高をmanifestへ保存するだけでは、観測の欠落や費用指標との混同を機械的に防げない。
+- 試したこと: core validatorにtrial・実装・phaseごとのCycles/reserved Cycles観測、測定trialとの対応、費用非同一性を示すnotesの検証を追加した。費用reportにもlocal status残高を除外する旨を出力した。
+- 結果: 正常artifactを受理し、会計分類注記のないfixtureを拒否するテストが成功した。
+- 否定された仮説: JSON manifestへ値を保存するだけで、費用推計との分類を保証できるという仮説。
+- 次に試すこと: 外部環境でのCycles実行費用照合を除く測定基盤を維持する。
+
+### 2026-09-28: P4変更後の総合テスト
+
+- 現在の問題: manifest検証の追加が通常ライブラリ、比較fixture、既存artifactの検証を壊していないことを確認する必要がある。
+- 試したこと: `cd /application/ic-sqlite && ./scripts/test.sh` と、現存paired artifactに対するvalidatorを実行した。
+- 結果: 総合テストは終了コード 0。通常テスト16件と全comparison testが成功し、`20260928T174316Z` artifactもmanifestを含めて検証できた。
+- 否定された仮説: manifestのCycles観測検証は既存のcore artifactと互換にならないという仮説。
+- 次に試すこと: 認証情報・Cyclesを伴う外部環境照合が可能になった場合、手動測定手順で実料金との照合を実施する。
+
+### 2026-09-28: 外部network対応のローカル回帰
+
+- 現在の問題: `NISQL_COMPARE_NETWORK` 未指定時も従来どおりlocal networkで実行できる必要がある。
+- 試したこと: fresh paired trialを実行した。
+- 結果: 初回はCanister作成時にlocal networkが停止して失敗した。
+- 否定された仮説: `if` ブロック内の `defer` がmain終了時までnetwork停止を遅延するという仮説。Nimではブロック終了時に実行された。
+- 次に試すこと: 外部環境の認証情報とCyclesが利用可能になった場合に、同じrunnerで実費照合を実施する。
+
+### 2026-09-28: external network runner の実装
+
+- 現在の問題: external networkで残高観測を行うには、local networkの開始・停止をせず、全 `icp` 操作へ同じnetworkと初期Cyclesを渡す必要がある。
+- 試したこと: `NISQL_COMPARE_NETWORK` と `NISQL_COMPARE_INITIAL_CYCLES` をtransport・paired runnerへ追加し、external artifactをvalidatorが受理する試験を追加した。local modeでfresh paired trialを再実行した。
+- 結果: transportとvalidatorの単体試験が成功。local trial `20260928T182157Z` が6件のCycles/reserved Cycles観測を保存し、manifestを含めvalidatorに合格した。
+- 否定された仮説: network指定をtransportの一部の操作だけへ付与すれば外部測定を一貫して実行できるという仮説。
+- 次に試すこと: external networkでCanister作成・installを実行できる認証情報とCyclesが提供された場合、READMEの手順で1 trialを実測する。
 
 コンテキストが圧縮された場合でも、`progress.mdc` と git diff とテスト結果を確認して作業を継続する。
 

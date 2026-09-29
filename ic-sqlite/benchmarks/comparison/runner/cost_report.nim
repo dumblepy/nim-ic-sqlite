@@ -71,7 +71,7 @@ proc main() =
     "days": 30, "subnet_nodes": rates.subnetNodes,
     "storage_assumption": "observed maximum raw stable bytes held for all 30 days",
     "heap_bytes": "derived from canister_status.memory_size minus raw stable memory when available",
-    "cycles_metrics": "not_available"
+    "cycles_metrics": "local management-status balances are observational only and excluded from this estimate"
   }
   for implementation in ["nim", "rust"]:
     let current = if implementation == "nim": addr nim else: addr rust
@@ -112,7 +112,7 @@ proc main() =
       " | " & $row["estimated_30d_heap_storage_cycles"].getFloat() &
       " | " & $row["estimated_30d_subtotal_excluding_other_fees"].getFloat() & " |\n")
   summary.add("\nAssumes one 1000-row delete/insert cycle daily and holds the observed maximum raw stable bytes for 30 days. " &
-    "Heap is included only when canister status memory_size was available; ingress, storage reservation, and other fees are excluded. Local query instruction counts are excluded.\n")
+    "Heap is included only when canister status memory_size was available; ingress, storage reservation, and other fees are excluded. Local management-status cycle balances and query instruction counts are excluded.\n")
   writeFile(resultDir / "summary.md", summary)
   echo resultDir / "cost_estimate.json"
 

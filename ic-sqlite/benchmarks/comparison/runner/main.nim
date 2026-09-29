@@ -77,6 +77,9 @@ proc measure(transport: CliTransport; runId, implementation, repoSha, wasmSha,
 proc main() =
   let trialCount = if paramCount() == 0: 5 else: parseInt(paramStr(1))
   if trialCount < 1: raise newException(ValueError, "trial count must be positive")
+  let targetNetwork = getEnv("NISQL_COMPARE_NETWORK")
+  let externalNetwork = targetNetwork.len > 0
+  let initialCycles = getEnv("NISQL_COMPARE_INITIAL_CYCLES")
   if not fileExists(RustWasm) or not fileExists(RustDid):
     raise newException(OSError, "run benchmarks/comparison/prepare_rust.sh first")
   let rustSha = shellOutput("git -C " & quoteShell(RustRepo) & " rev-parse HEAD")
@@ -97,16 +100,17 @@ proc main() =
   let resultDir = ComparisonDir / "results" / runId
   createDir(resultDir)
   var manifest = parseFile(ComparisonDir / "bench_manifest.json")
-  manifest["run_kind"] = %"local_comparison"
+  manifest["run_kind"] = %(if externalNetwork: "external_comparison" else: "local_comparison")
   manifest["run_id"] = %runId
   manifest["toolchains"]["icp_cli"] = %shellOutput("icp --version")
   manifest["toolchains"]["rustc"] = %shellOutput("rustc --version")
   manifest["toolchains"]["nim"] = %shellOutput("nim --version").splitLines()[0]
   manifest["toolchains"]["wasi_sdk"] = %shellOutput(quoteShell(getEnv("WASI_SDK_PATH") / "bin/clang") & " --version").splitLines()[0]
   manifest["toolchains"]["pocket_ic"] = %"not_used"
-  manifest["subnet"]["kind"] = %"icp_cli_local_managed"
+  manifest["subnet"]["kind"] = %(if externalNetwork: "icp_cli_external" else: "icp_cli_local_managed")
+  manifest["subnet"]["network"] = %(if externalNetwork: targetNetwork else: "local")
   manifest["subnet"]["node_count"] = %"not_exposed_by_icp_cli"
-  manifest["subnet"]["initial_cycles"] = %"2000000000000"
+  manifest["subnet"]["initial_cycles"] = %(if initialCycles.len > 0: initialCycles else: "2000000000000")
   manifest["artifacts"]["nim_wasm_sha256"] = %nimWasmSha
   manifest["artifacts"]["rust_wasm_sha256"] = %rustWasmSha
   manifest["artifacts"]["rust_host_stats_patch_sha256"] = %rustPatchSha
@@ -119,7 +123,9 @@ proc main() =
   manifest["rows_per_trial"] = %100'u32
   manifest["trial_baselines"] = newJArray()
   manifest["cycle_balance_observations"] = newJArray()
-  manifest["notes"] = %["Both implementations use fresh canisters on the same local subnet per trial.",
+  manifest["notes"] = %[(if externalNetwork:
+      "Both implementations use fresh canisters on the same explicitly selected network per trial."
+    else: "Both implementations use fresh canisters on the same local subnet per trial."),
     "Rust source is pinned plus rust_host_stats.patch; both physical page counts use ic0 stable64_size.",
     "heap_bytes is derived from canister status memory_size minus raw stable bytes; it is a local status observation.",
     "cycle_balance_observations are management-status balance deltas; they include local replica accounting and are not instruction-only execution costs.",
@@ -127,11 +133,15 @@ proc main() =
     "Query instructions are measured separately and are not cycles estimates."]
   writeFile(resultDir / "manifest.json", manifest.pretty())
 
-  let transport = CliTransport(projectDir: CanisterDir)
-  try: transport.stopNetwork()
-  except OSError: discard
-  transport.startNetwork()
-  defer: transport.stopNetwork()
+  let transport = CliTransport(projectDir: CanisterDir, network: targetNetwork,
+    initialCycles: initialCycles)
+  if not externalNetwork:
+    try: transport.stopNetwork()
+    except OSError: discard
+    transport.startNetwork()
+  defer:
+    if not externalNetwork:
+      transport.stopNetwork()
   var csv = MeasurementCsvHeader & "\n"
   var jsonl = ""
   var nimUpdate = newSeq[uint64]()
@@ -185,6 +195,7 @@ proc main() =
   let nimMedian = median(nimUpdate)
   let rustMedian = median(rustUpdate)
   validateCoreResults(resultDir / "measurements.jsonl")
+  validateCoreManifest(resultDir)
   writeFile(resultDir / "summary.md", fmt"# {runId}" & "\n\n" &
     fmt"Core KV workload: 100 rows, {trialCount} fresh Nim/Rust canister pairs." & "\n\n" &
     "| Update instruction median | Count |\n|---|---:|\n" &

@@ -2,6 +2,10 @@ import std/[json, unittest]
 import ../runner/transport
 
 suite "icp CLI transport":
+  test "adds an explicit network only when configured":
+    check CliTransport(projectDir: ".").networkArgs() == ""
+    check CliTransport(projectDir: ".", network: "ic").networkArgs() == " --network ic"
+
   test "parses status counters with separators":
     check parseCliNat(%"70_992_848") == 70_992_848'u64
     check parseCliNat(%42) == 42'u64
