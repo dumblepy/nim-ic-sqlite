@@ -1,0 +1,5 @@
+/main.wasm
+/main_ic_wasm.wasm
+/wasi.wasm
+/.icp/
+/.nimcache/

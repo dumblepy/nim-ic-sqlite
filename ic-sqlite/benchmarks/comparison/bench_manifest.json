@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "run_kind": "template",
+  "nim_implementation": {
+    "repository": "dumblepy/nim-ic-sqlite",
+    "commit": "4735f04908ae9a7ac30bac6d05aa7aaa1e0da260",
+    "sqlite_version": "3.53.4",
+    "sqlite_page_size": 16384,
+    "build_flags_source": "scripts/build_sqlite.sh"
+  },
+  "rust_implementation": {
+    "repository": "humandebri/ic-sqlite-vfs",
+    "commit": "1386239acff1dd7ede5ac78a2f0a22ef495195de",
+    "benchmark_did": "benchmarks/kv-canister/kv_bench.did",
+    "memory_id": 120
+  },
+  "toolchains": {
+    "nim": "2.2.12",
+    "nicp_cdk_commit": "d30c7f973784a204b530497e1616147aceb0052b",
+    "wasi_sdk": null,
+    "pocket_ic": null,
+    "icp_cli": null
+  },
+  "subnet": {
+    "kind": null,
+    "node_count": null,
+    "initial_cycles": null
+  },
+  "artifacts": {
+    "nim_wasm_sha256": null,
+    "rust_wasm_sha256": null
+  },
+  "notes": [
+    "This is a source manifest template, not a measurement result.",
+    "A run manifest must replace every null toolchain, subnet, and Wasm value before execution."
+  ]
+}

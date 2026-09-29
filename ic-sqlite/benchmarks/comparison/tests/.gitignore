@@ -1,0 +1,9 @@
+/test_keys
+/test_report
+/test_storage_stats
+/test_failure_atomicity
+/test_zero_extent_persistence
+/test_memory_region
+/test_cost_model
+/test_canister_integration
+/test_cross_upgrade

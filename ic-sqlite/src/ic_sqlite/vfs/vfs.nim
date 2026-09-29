@@ -28,6 +28,20 @@ var randomState = 1'u64
 var currentTimeNanoseconds*: uint64
 var configuredMaxDirtyPages = high(uint64)
 var configuredMaxDirtyBytes = high(uint64)
+var persistedZeroExtents: seq[ZeroExtent]
+var persistedZeroExtentPageSize = 16_384'u64
+
+proc zeroPersistedRange(bytes: var seq[byte]; offset: uint64) =
+  ## Query connections read without an active overlay. Apply the logical
+  ## truncation map before returning bytes from the stable backing store.
+  let endOffset = offset + uint64(bytes.len)
+  for extent in persistedZeroExtents:
+    let zeroStart = extent.startPage * persistedZeroExtentPageSize
+    let zeroEnd = extent.endPage * persistedZeroExtentPageSize
+    let start = max(offset, zeroStart)
+    let finish = min(endOffset, zeroEnd)
+    if start < finish:
+      for index in int(start - offset) ..< int(finish - offset): bytes[index] = 0
 
 when defined(wasm32):
   proc ic0TimeNanoseconds(): uint64 {.importc: "ic0_time", cdecl, header: "ic0.h".}
@@ -40,18 +54,28 @@ proc vfsTimeNanoseconds*(): uint64 =
 proc setLastError*(message: string) = lastError = message
 proc lastErrorMessage*(): string = lastError
 proc initVfs*(backend: StableBackend; dbSize = 0'u64; seed = 1'u64;
-              maxDirtyPages = high(uint64); maxDirtyBytes = high(uint64)) =
+              maxDirtyPages = high(uint64); maxDirtyBytes = high(uint64);
+              zeroExtents: openArray[ZeroExtent] = []; pageSize = 16_384'u32) =
+  if pageSize == 0: raise newException(ValueError, "VFS page size must not be zero")
   storage = backend; databaseSize = dbSize; randomState = seed; files.clear(); nextHandleId = 1
   configuredMaxDirtyPages = maxDirtyPages; configuredMaxDirtyBytes = maxDirtyBytes
+  persistedZeroExtents = @zeroExtents
+  persistedZeroExtentPageSize = uint64(pageSize)
   overlayActive = false
 proc beginOverlay*(pageSize = 16384'u32) =
   if storage.isNil: raise newException(ValueError, "VFS backend is not configured")
   activeOverlay = initOverlay(databaseSize, pageSize,
     maxDirtyPages = configuredMaxDirtyPages, maxDirtyBytes = configuredMaxDirtyBytes)
+  activeOverlay.zeroExtents = persistedZeroExtents
+  persistedZeroExtentPageSize = uint64(pageSize)
   overlayActive = true
 proc endOverlay*(publish = false) =
-  if publish: activeOverlay.publishDirtyPages(storage); databaseSize = activeOverlay.size
+  if publish:
+    activeOverlay.publishDirtyPages(storage)
+    databaseSize = activeOverlay.size
+    persistedZeroExtents = activeOverlay.zeroExtents
   activeOverlay.discardOverlay(); overlayActive = false
+proc currentZeroExtents*(): seq[ZeroExtent] = persistedZeroExtents
 proc openFile*(name: string; flags: cint; handleId: var uint32; outFlags: var cint): cint =
   if name.endsWith("-wal"): return SqliteCantOpen
   let state = FileState(kind: if name == "/main.db": fkMainDb else: fkTemp,
@@ -79,6 +103,7 @@ proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cin
       bytes = newSeq[byte](size); short = uint64(offset) + uint64(size) > databaseSize
       let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
       if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), addr bytes[0], readable)
+      bytes.zeroPersistedRange(uint64(offset))
     if size > 0: copyMem(dst, addr bytes[0], size)
     if short: SqliteIoErrShortRead else: SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErrRead
