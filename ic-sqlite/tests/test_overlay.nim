@@ -263,3 +263,47 @@ suite "Overlay":
       check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
     # No cache -> every whole-page read goes back to stable memory.
     check CountingReadBackend(storage).readCount == readsAfterFill + 3
+
+  test "partial zero-fill writes only the uncovered range":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(2)
+    let storage: StableBackend = CountingReadBackend(delegate: raw)
+    var base = newSeq[byte](16)
+    for index in 0 ..< base.len: base[index] = byte(index + 1)
+    raw.write(64, addr base[0], uint64(base.len))
+    var overlay = initOverlay(16, pageSize = 16, dbBaseOffset = 64)
+    var buffer = newSeq[byte](32)
+    for index in 0 ..< buffer.len: buffer[index] = 0xAA
+    check not overlay.readInto(storage, 0, addr buffer[0], uint64(buffer.len))
+    check buffer[0 .. 15] == base
+    check buffer[16 .. 31] == newSeq[byte](16)
+    # offset >= size is a full zero short read.
+    for index in 0 ..< buffer.len: buffer[index] = 0xAA
+    check not overlay.readInto(storage, 32, addr buffer[0], uint64(buffer.len))
+    check buffer == newSeq[byte](32)
+
+  test "dirty pages and zero extents are served without touching the base":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(4)
+    let storage: StableBackend = CountingReadBackend(delegate: raw)
+    var base = newSeq[byte](32)
+    for index in 0 ..< base.len: base[index] = byte(index + 1)
+    raw.write(64, addr base[0], uint64(base.len))
+    var overlay = initOverlay(32, pageSize = 16, dbBaseOffset = 64)
+    overlay.truncate(16)
+    let readsAfterTruncate = CountingReadBackend(storage).readCount
+    var output = newSeq[byte](16)
+    for index in 0 ..< output.len: output[index] = 0xAA
+    # Past the truncated EOF: a full zero short read that never reaches base.
+    check not overlay.readInto(storage, 16, addr output[0], 16)
+    check output == newSeq[byte](16)
+    check CountingReadBackend(storage).readCount == readsAfterTruncate
+    # A full-page dirty write is read back entirely from the resident page.
+    var full = newSeq[byte](16)
+    for index in 0 ..< full.len: full[index] = byte(200 + index)
+    overlay.writeFrom(storage, 0, addr full[0], uint64(full.len))
+    let readsAfterWrite = CountingReadBackend(storage).readCount
+    for index in 0 ..< output.len: output[index] = 0xAA
+    check overlay.readInto(storage, 0, addr output[0], 16)
+    check output == full
+    check CountingReadBackend(storage).readCount == readsAfterWrite

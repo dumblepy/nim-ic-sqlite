@@ -13,6 +13,9 @@ service : {
   bench_reset : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_insert_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_update_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed_string : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed_general : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_append_insert : (nat32, nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_large_blob : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_join : (nat32) -> (variant { Ok : BenchReport; Err : text });

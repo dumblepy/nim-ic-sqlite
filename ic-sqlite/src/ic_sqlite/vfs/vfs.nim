@@ -146,10 +146,14 @@ proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cin
     elif overlayActive:
       short = not activeOverlay.readInto(storage, uint64(offset), dst, uint64(size))
     else:
-      if size > 0: zeroMem(dst, size)
       short = uint64(offset) >= databaseSize or uint64(size) > databaseSize - uint64(offset)
       let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
       if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), dst, readable)
+      ## Only the bytes past the logical EOF need an explicit zero fill; the
+      ## persisted truncation map is applied on top and covers its own ranges.
+      if readable < uint64(size):
+        let target = cast[ptr UncheckedArray[byte]](dst)
+        zeroMem(addr target[int(readable)], int(uint64(size) - readable))
       zeroPersistedRange(dst, uint64(size), uint64(offset))
     when defined(benchmarkProfile):
       inc vfsProfile.readCalls

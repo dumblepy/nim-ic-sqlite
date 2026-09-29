@@ -66,6 +66,16 @@ type
   VirtualStableBackend* = ref object of StableBackend
     manager: MemoryManager
     id: MemoryId
+    ## One-entry bucket cache. It caches the virtual-to-physical translation of
+    ## a single logical bucket so a request that stays inside that bucket skips
+    ## the division, bucket-array lookup and splitting loop. It is per
+    ## `VirtualStableBackend` instance, never shared across MemoryIds. Bucket
+    ## allocation only ever appends, so an existing bucket never moves and the
+    ## cache cannot go stale across `grow`.
+    cacheValid: bool
+    cacheLogicalBase: uint64   ## bucketIndex * bucketBytes
+    cachePhysicalBase: uint64  ## bucketAddress(physical bucket)
+    cacheLength: uint64        ## bucketBytes
 
 proc newMemoryId*(id: uint8): MemoryId =
   ## `255` is the unallocated bucket marker and is not a legal memory id.
@@ -303,6 +313,11 @@ method read*(vm: VirtualStableBackend; offset: uint64; dst: pointer; size: uint6
   let manager = vm.manager
   manager.assertVirtualBounds(vm.id, offset, size)
   let bucketBytes = manager.bucketBytes
+  if vm.cacheValid and offset >= vm.cacheLogicalBase:
+    let relative = offset - vm.cacheLogicalBase
+    if relative < vm.cacheLength and size <= vm.cacheLength - relative:
+      manager.backend.read(vm.cachePhysicalBase + relative, dst, size)
+      return
   let buckets = manager.memoryBuckets[int(uint8(vm.id))]
   let target = cast[ptr UncheckedArray[byte]](dst)
   var logical = offset
@@ -313,6 +328,10 @@ method read*(vm: VirtualStableBackend; offset: uint64; dst: pointer; size: uint6
     let inBucket = logical - bucketIndex * bucketBytes
     let chunk = min(remaining, bucketBytes - inBucket)
     let physical = manager.bucketAddress(buckets[int(bucketIndex)]) + inBucket
+    vm.cacheValid = true
+    vm.cacheLogicalBase = bucketIndex * bucketBytes
+    vm.cachePhysicalBase = physical - inBucket
+    vm.cacheLength = bucketBytes
     manager.backend.read(physical, addr target[int(written)], chunk)
     written += chunk
     logical += chunk
@@ -325,6 +344,11 @@ method write*(vm: VirtualStableBackend; offset: uint64; src: pointer; size: uint
   let manager = vm.manager
   manager.assertVirtualBounds(vm.id, offset, size)
   let bucketBytes = manager.bucketBytes
+  if vm.cacheValid and offset >= vm.cacheLogicalBase:
+    let relative = offset - vm.cacheLogicalBase
+    if relative < vm.cacheLength and size <= vm.cacheLength - relative:
+      manager.backend.write(vm.cachePhysicalBase + relative, src, size)
+      return
   let buckets = manager.memoryBuckets[int(uint8(vm.id))]
   let source = cast[ptr UncheckedArray[byte]](src)
   var logical = offset
@@ -335,6 +359,10 @@ method write*(vm: VirtualStableBackend; offset: uint64; src: pointer; size: uint
     let inBucket = logical - bucketIndex * bucketBytes
     let chunk = min(remaining, bucketBytes - inBucket)
     let physical = manager.bucketAddress(buckets[int(bucketIndex)]) + inBucket
+    vm.cacheValid = true
+    vm.cacheLogicalBase = bucketIndex * bucketBytes
+    vm.cachePhysicalBase = physical - inBucket
+    vm.cacheLength = bucketBytes
     manager.backend.write(physical, addr source[int(consumed)], chunk)
     consumed += chunk
     logical += chunk

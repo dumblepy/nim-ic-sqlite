@@ -219,3 +219,47 @@ suite "MemoryManager virtual stable memory":
     # Requesting more buckets than the allocation table can hold is rejected.
     let tooManyPages = (MaxNumBuckets + 1) * uint64(DefaultBucketSizeInPages)
     check not manager.getMemory(newMemoryId(6)).grow(tooManyPages)
+
+  test "bucket cache serves same-bucket reads and stays valid across grow":
+    let raw: StableBackend = newVecStableBackend()
+    let manager = initMemoryManager(raw)
+    let vm = manager.getMemory(newMemoryId(4))
+    check vm.grow(2 * MgrBucketSizePages)
+    let bucketBytes = MgrBucketSizePages * StablePageSize
+
+    # Populate a small pattern inside logical bucket 0 and read it back on the
+    # fast path (the first read also establishes the one-entry cache).
+    var pattern: seq[byte]
+    for index in 0 ..< 64: pattern.add byte(index)
+    vm.write(StablePageSize, addr pattern[0], uint64(pattern.len))
+    var firstRead = newSeq[byte](pattern.len)
+    vm.read(StablePageSize, addr firstRead[0], uint64(firstRead.len))
+    check firstRead == pattern
+    var secondRead = newSeq[byte](pattern.len)
+    vm.read(StablePageSize, addr secondRead[0], uint64(secondRead.len))
+    check secondRead == pattern
+
+    # Multiply-adjacent MemoryId must not share the cached translation.
+    let other = manager.getMemory(newMemoryId(9))
+    check other.grow(MgrBucketSizePages)
+    vm.write(0, addr pattern[0], uint64(pattern.len))
+    var otherBytes = newSeq[byte](pattern.len)
+    other.read(0, addr otherBytes[0], uint64(otherBytes.len))
+    check otherBytes == @(newSeq[byte](pattern.len))
+    var vmBytes = newSeq[byte](pattern.len)
+    vm.read(0, addr vmBytes[0], uint64(vmBytes.len))
+    check vmBytes == pattern
+
+    # A write straddling the bucket boundary must still map both halves.
+    var crossing = newSeq[byte](16)
+    for index in 0 ..< crossing.len: crossing[index] = byte(0xC0 + index)
+    vm.write(bucketBytes - 8, addr crossing[0], uint64(crossing.len))
+    var crossingBack = newSeq[byte](crossing.len)
+    vm.read(bucketBytes - 8, addr crossingBack[0], uint64(crossingBack.len))
+    check crossingBack == crossing
+
+    # Grow appends buckets only; the cached bucket 0 translation stays correct.
+    check vm.grow(MgrBucketSizePages)
+    var afterGrow = newSeq[byte](pattern.len)
+    vm.read(0, addr afterGrow[0], uint64(afterGrow.len))
+    check afterGrow == pattern

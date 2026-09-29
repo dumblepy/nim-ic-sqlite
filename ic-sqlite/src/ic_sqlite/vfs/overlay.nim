@@ -73,10 +73,12 @@ proc cleanPageCached(overlay: var Overlay; page: uint64) =
 
 proc pageBytes(overlay: Overlay): uint64 {.inline.} = uint64(overlay.pageSize)
 proc pageIsZero(overlay: Overlay; page: uint64): bool =
+  if overlay.zeroExtents.len == 0: return false
   for extent in overlay.zeroExtents:
     if page >= extent.startPage and page < extent.endPage: return true
 
 proc removeZeroPage(overlay: var Overlay; page: uint64) =
+  if overlay.zeroExtents.len == 0: return
   var revised: seq[ZeroExtent]
   for extent in overlay.zeroExtents:
     if page < extent.startPage or page >= extent.endPage:
@@ -135,13 +137,18 @@ proc ensureDirtyPage(overlay: var Overlay; storage: StableBackend; page: uint64;
 
 proc readInto*(overlay: var Overlay; storage: StableBackend; offset: uint64;
                dst: pointer; length: uint64): bool =
-  ## Reads directly into a borrowed VFS buffer. The buffer is zero-filled
-  ## before copying so EOF and logical zero extents cannot expose old bytes.
+  ## Reads directly into a borrowed VFS buffer without zero-filling the whole
+  ## buffer up front. Only bytes that are not supplied by a dirty page or the
+  ## base image are zeroed: logical zero extents, the base-image EOF tail and
+  ## the EOF tail of the request. This keeps short-read semantics (all bytes
+  ## after EOF are zero) and never exposes stale or sparse bytes.
   if length == 0: return true
   if dst.isNil or length > uint64(high(int)):
     raise newException(ValueError, "invalid overlay read buffer")
-  zeroMem(dst, int(length))
-  if offset >= overlay.size: return false
+  let target = cast[ptr UncheckedArray[byte]](dst)
+  if offset >= overlay.size:
+    zeroMem(dst, int(length))
+    return false
   let validLen = min(length, overlay.size - offset)
   var position = offset
   var destination = 0'u64
@@ -149,11 +156,12 @@ proc readInto*(overlay: var Overlay; storage: StableBackend; offset: uint64;
     let page = position div overlay.pageBytes
     let inPage = int(position mod overlay.pageBytes)
     let take = min(validLen - destination, overlay.pageBytes - uint64(inPage))
-    let target = cast[ptr UncheckedArray[byte]](dst)
     if overlay.dirtyPages.hasKey(page):
       let source = overlay.dirtyPages[page]
       copyMem(addr target[int(destination)], unsafeAddr source[inPage], int(take))
-    elif not overlay.pageIsZero(page) and position < overlay.baseSize:
+    elif overlay.pageIsZero(page) or position >= overlay.baseSize:
+      zeroMem(addr target[int(destination)], int(take))
+    else:
       let readable = min(take, overlay.baseSize - position)
       if readable > 0:
         if inPage == 0 and take == overlay.pageBytes:
@@ -184,10 +192,16 @@ proc readInto*(overlay: var Overlay; storage: StableBackend; offset: uint64;
                 overlay.profile.cleanCacheReadBytes += readable
             else:
               storage.read(overlay.dbBaseOffset + position, addr target[int(destination)], readable)
+              if readable < take:
+                zeroMem(addr target[int(destination) + int(readable)], int(take - readable))
         else:
           storage.read(overlay.dbBaseOffset + position, addr target[int(destination)], readable)
+          if readable < take:
+            zeroMem(addr target[int(destination) + int(readable)], int(take - readable))
     position += take
     destination += take
+  if validLen < length:
+    zeroMem(addr target[int(validLen)], int(length - validLen))
   result = validLen == length
 
 proc readAt*(overlay: var Overlay; storage: StableBackend; offset, length: uint64): seq[byte] =

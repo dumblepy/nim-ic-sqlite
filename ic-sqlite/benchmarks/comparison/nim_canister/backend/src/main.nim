@@ -264,6 +264,87 @@ proc bench_update_only() {.update.} =
   if not updated.isOk: replyErr(updated.error.message); return
   replyOk(report(rows, start, uint64(rows)))
 
+proc bench_update_only_borrowed_string() {.update.} =
+  ## A1: same seed/SQL/transaction/report as `bench_update_only`, but the two
+  ## TEXT parameters are bound with the allocation-free internal
+  ## `executeTextTextBorrowed` while the strings are still formatted per row.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = resetBench(rows)
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  let start = ic0_performance_counter(0'u32)
+  let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let prepared = conn.prepare("UPDATE bench SET value = ? WHERE key = ?")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let value = updatedValue(index)
+      let key = benchKey(index)
+      let executed = statement.executeTextTextBorrowed(value, key)
+      if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+    Result[uint64, DbError](isOk: true, value: uint64(rows))
+  )
+  if not updated.isOk: replyErr(updated.error.message); return
+  replyOk(report(rows, start, uint64(rows)))
+
+proc bench_update_only_borrowed() {.update.} =
+  ## A2: `executeTextTextBorrowed` with fixed-length `array` inputs that match
+  ## the Rust `updated_value()` / `key()` fixtures byte for byte. This removes
+  ## the per-row string formatting as well as the SQLITE_TRANSIENT copy.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = resetBench(rows)
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  let start = ic0_performance_counter(0'u32)
+  let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let prepared = conn.prepare("UPDATE bench SET value = ? WHERE key = ?")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let valueBuffer = updatedValueBuffer(index)
+      let keyBuffer = benchKeyBuffer(index)
+      let executed = statement.executeTextTextBorrowed(valueBuffer, keyBuffer)
+      if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+    Result[uint64, DbError](isOk: true, value: uint64(rows))
+  )
+  if not updated.isOk: replyErr(updated.error.message); return
+  replyOk(report(rows, start, uint64(rows)))
+
+proc bench_update_only_borrowed_general() {.update.} =
+  ## A2-general: the same workload through the public scoped API
+  ## `executeBorrowed(openArray[SqlValue])`, which supports N parameters and
+  ## mixed types. It must match the specialized A2 path (no SQLITE_TRANSIENT
+  ## copy) while adding the `SqlValue` construction overhead.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let seeded = resetBench(rows)
+  if not seeded.isOk: replyErr(seeded.error.message); return
+  let start = ic0_performance_counter(0'u32)
+  let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    let prepared = conn.prepare("UPDATE bench SET value = ? WHERE key = ?")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for index in 0'u32 ..< rows:
+      let values = [sqlText(updatedValue(index)), sqlText(benchKey(index))]
+      let executed = statement.executeBorrowed(values)
+      if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+    Result[uint64, DbError](isOk: true, value: uint64(rows))
+  )
+  if not updated.isOk: replyErr(updated.error.message); return
+  replyOk(report(rows, start, uint64(rows)))
+
 proc bench_append_insert() {.update.} =
   let request = Request.new()
   let baseRows = request.getNat32(0)

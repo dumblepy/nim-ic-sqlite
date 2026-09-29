@@ -65,6 +65,18 @@ proc benchValueBuffer*(index: uint32): array[25, char] =
   for position in 0 ..< Suffix.len:
     result[Prefix.len + digits.len + position] = Suffix[position]
 
+proc updatedValueBuffer*(index: uint32): array[27, char] =
+  ## Allocation-free counterpart of `updatedValue`; the update-phase A2 input.
+  ## Its bytes must match the Rust `updated_value()` fixture exactly.
+  const Prefix = "updated-"
+  const Suffix = "-stable-vfs"
+  for position in 0 ..< Prefix.len: result[position] = Prefix[position]
+  var digits: array[8, char]
+  fixedIndexInto(index, digits)
+  for position in 0 ..< digits.len: result[Prefix.len + position] = digits[position]
+  for position in 0 ..< Suffix.len:
+    result[Prefix.len + digits.len + position] = Suffix[position]
+
 proc churnDeleteRange*(cycle: uint32): tuple[start, count: uint32] =
   if cycle >= 100'u32:
     raise newException(ValueError, "churn cycle must be less than 100")

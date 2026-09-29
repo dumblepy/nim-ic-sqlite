@@ -3,404 +3,266 @@ description: 11-update-memory-management ブランチでの開発時に読み込
 alwaysApply: false
 ---
 
-# nim-ic-sqlite メモリ効率・VFS 改善設計書
+# nim-ic-sqlite 性能改善設計書 — ic-sqlite-vfs（Rust）との実装比較
 
-| 項目 | 内容 |
-|---|---|
-| ステータス | Draft — 実装・レビュー用 |
-| 作成日 | 2026-09-29 |
-| 対象 | `dumblepy/nim-ic-sqlite` / `ic-sqlite/` |
-| Nim 基準コミット | [`bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32`](https://github.com/dumblepy/nim-ic-sqlite/commit/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32) |
-| Rust 比較基準コミット | [`1386239acff1dd7ede5ac78a2f0a22ef495195de`](https://github.com/humandebri/ic-sqlite-vfs/commit/1386239acff1dd7ede5ac78a2f0a22ef495195de) |
-| 主要目的 | Rust 比で約20%多いという観測値を、再現可能な測定で分解し、不要なヒープ確保・コピーを減らす |
+- 作成日: 2026-09-30
+- 対象: `dumblepy/nim-ic-sqlite`、`11-update-memory-management` ブランチ
+- 比較対象: `humandebri/ic-sqlite-vfs`、Rust 実装
+- 文書種別: **実装前の設計・検証計画**。本書に記す改善効果は仮説であり、実測済みではない。
+- 調査時に確認したソース: Nim [`c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8`](https://github.com/dumblepy/nim-ic-sqlite/commit/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8)、Rust [`1386239acff1dd7ede5ac78a2f0a22ef495195de`](https://github.com/humandebri/ic-sqlite-vfs/tree/1386239acff1dd7ede5ac78a2f0a22ef495195de)。以下のコード参照は原則としてこれらのコミットに固定する。
 
-> **測定上の前提**：約20%という値は現時点の利用者による観測であり、本設計書が実測・再現した数値ではない。公開リポジトリで確認できた実装差を修正候補とする。メモリ改善幅や性能向上を事前に保証しない。
+## 1. 結論と実装方針
 
-## 1. 背景と要約
+今回のCore KV 100行・5組の結果は、Nim のupdate instruction中央値が **1,925,589**、Rust が **1,484,474**、比率 **1.2971523920257277**。差分は中央値同士の比較で **441,115 instructions** である。クエリのウォームアップ経路は異なり、cycle costの測定はない。`heap_bytes`もcanister statusの`memory_size`からraw stable bytesを引いた派生指標であり、割当トレースではない。
 
-Nim 実装は、SQLite の C VFS に渡された入出力ポインタを利用する際に、中間 `seq[byte]` を生成する。Overlay もページの取得・更新に `seq` の値渡しを利用している。Rust 実装は VFS バッファに直接入出力し、管理中の dirty page に対する可変参照、上限付き clean page cache、固定長ベンチマーク入力と短寿命の borrowed TEXT binding を利用する。
+**優先度の高い順に、次の分離実験を行う。**
 
-現在の `heap_bytes` は `canister status.memory_size - ic0_stable64_size()*65536` による観測値であり、ライブな Nim オブジェクト量や操作中のピーク確保量ではない。したがって、原因の同定と修正の効果検証を分ける。
+1. **P0: 比較条件を可視化・一致させる。** 現状のNim/Rustベンチマークは文字列生成方式、SQLiteのバインド方式、MemoryManagerの経由有無が異なる。まず`benchmark parity`を確立し、ライブラリとベンチマークCanisterのコストを分離する。
+2. **P1: Rustの借用バインドをNimの既存内部API上に、安全な高水準操作として導入する。** 新しい低レベル `SQLITE_STATIC` FFIは不要。既存の`bindStaticText`を使い、バッファの寿命と全エラー経路での`clear_bindings`を一か所で保証する。
+3. **P1: Overlayのread/writeホットパスを改良する。** `readInto`の先行全域ゼロ埋め、空のzero extentに対する毎回の処理、小規模dirty-pageに対するハッシュ表オーバーヘッドを独立したA/Bで評価する。
+4. **P2: `VirtualStableBackend`にRustの1-entry BucketCache相当を追加する。** ただし、現在のNim Core KV比較用CanisterはSQLite-owned `MemoryManager.getMemory()` を使用していないため、**現行のCore KV差分がこの変更で縮むとは限らない**。MemoryManager経由の別系列で測る。
+5. **P2以降: 読み取り専用ファイルの小型ページキャッシュ、VFSハンドル参照削減、ビルド最適化を順に検証する。** 更新ベンチマークとqueryベンチマークを混ぜない。
 
-設計方針は次のとおり。
+最初からレイアウトやトランザクション公開規則を書き換えない。RustとNimはすでに16 KiB SQLiteページ、類似のSQLiteビルドフラグ、stable memory上のin-place DBページ、heap overlayという骨格を共有している。
 
-1. **正しさの回帰テストを先行**：EOF、truncate、sparse extend、COMMIT／ROLLBACK／upgrade を固定化する。
-2. **VFS 境界のゼロコピー化**：公開 API は変えず、内部 `readInto` / `writeFrom` を追加する。
-3. **Overlay の in-place 更新**：ページを `seq` として取り出して再代入する動作をなくす。
-4. **測定の分離**：ライブラリ自体のメモリ、ベンチマーク入力の文字列確保、SQLite cache、Wasm の高水位を別々に記録する。
-5. **キャッシュや接続再利用は条件付き**：命令数改善とメモリ常駐増加のトレードオフを検証後に採用する。
+## 2. 現状と測定上の交絡要因
 
-## 2. 対象範囲と非対象
+### 2.1 Core KVの実装は完全には同一ではない
 
-### 対象
-
-- VFS の main DB / temp file 入出力と短い読み込みの処理。
-- dirty page の生成・読み取り・再書き込み・破棄と zero extent の管理。
-- 可視化用カウンタと比較ベンチマークへの heap 観測追加。
-- 必要に応じた内部専用の borrowed bind と固定長入力生成。
-- Native／Canister 統合テスト、cross-upgrade、failure atomicity の回帰。
-
-### 非対象
-
-- 公開されている `Db`、`withUpdate`、`SqlValue`、Query Builder の破壊的 API 変更。
-- 既存 Stable Memory イメージのフォーマット、superblock magic、論理 DB オフセットの変更。
-- Rust 実装のページオフセットキャッシュや memory manager 構造の機械的移植。両実装のレイアウトが異なる。
-- SQLite の page size（16,384 bytes）や既定 cache size（`-32768` KiB）の初手での変更。
-- 公開 API 全体を安全性検証なしに `SQLITE_STATIC` に切り替えること。
-
-## 3. 現状と根拠
-
-| 対象 | Nim 現行 | Rust 参照 |
-|---|---|---|
-| VFS 読み込み | `readFile` で `seq[byte]` を生成して最終 `dst` にコピー | `x_read` で `dst: &mut [u8]` を直接利用 |
-| VFS 書き込み | `src` から新規 `seq[byte]` へコピー後 `writeAt` | `src: &[u8]` を直接利用 |
-| Overlay | `loadPage(): seq[byte]`、`dirtyPages[page] = target` | dirty page への `&mut Vec<u8>`、既存 full page に直接上書き |
-| clean page | dirty でない読み込みでは原則16KiBの一時ページを生成 | Overlay に最大8ページの clean cache |
-| read-only ページ | 中間配列を介する読み込み | read-only VFS 側に上限付きデータキャッシュ |
-| 比較入力 | `benchKey` / `benchValue` が `string` を生成 | 固定長 `[u8; N]` で生成 |
-| TEXT bind | `SQLITE_TRANSIENT` により SQLite 内にもコピー | 特定の即時実行関数に限り `SQLITE_STATIC` と実行後の解除をセットで利用 |
-| read connection | `withQuery` ごとに open / close | コンテキスト単位の再利用、update 時に無効化 |
-
-**主要参照：**
-
-- Nim: [`vfs.nim` L91–119](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/vfs/vfs.nim#L91-L119)、[`overlay.nim` L56–139](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L56-L139)、[`temp_file.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/vfs/temp_file.nim)、[`db.nim` L410–469](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/db.nim#L410-L469)。
-- Rust: [`file.rs` L98–185](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/file.rs#L98-L185)、[`overlay.rs` L13–35, L55–110, L207–317](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs)、[`stable_blob.rs`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/stable_blob.rs)、[`db/mod.rs` L256–313](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/mod.rs#L256-L313)。
-
-## 4. 変更後に維持する不変条件
-
-**VFS / SQLite 契約**
-
-- `xRead` の要求範囲がファイル末尾を越える場合、読める範囲だけを返し、残余の **出力先バッファ全体をゼロ埋め**し、`SQLITE_IOERR_SHORT_READ` を返す。範囲内なら `SQLITE_OK`。
-- `xWrite` は入力 `src` のポインタと長さを呼び出し期間中だけ参照し、保持しない。受け取った領域を変更しない。
-- 0-byte I/O は境界外参照を行わない。負のオフセット、負の長さ、整数オーバーフロー、nil ポインタの処理はエラー経路を含めて明示する。
-- read-only 接続は Stable Memory と公開済み superblock に対応する論理 DB イメージだけを参照する。rollback 済みの dirty page を参照しない。
-
-**Overlay / トランザクション**
-
-- dirty page は論理ページ番号をキーとし、1ページを16KiBで管理。最後に行った重複書き込みが優先する。
-- 既存 dirty page の再書き込みではバッファを再確保しない。full-page overwrite は不要な base page read をしない。
-- 論理ファイル EOF 以降は読み込み時にゼロとし、縮小後の再拡張でも以前のデータを露出させない。
-- zero extent、dirty page、`baseSize`、`size` の状態は COMMIT / ROLLBACK 後に整合する。
-- SQLite `COMMIT` 完了まで dirty page を stable に公開しない。publish 開始後に失敗した場合は既存の canister trap / atomicity 戦略を保つ。
-- `maxDirtyPages` と `maxDirtyBytes` を引き続き強制する。
-
-**互換性**
-
-- 既存の stable superblock、ページサイズ、オフセット、公開 API とデフォルト設定を維持する。
-- 既存 DB の init、migration、query、update、Canister upgrade で内容が変わらないこと。
-
-## 5. 設計 A：VFS 入出力の中間バッファ削除（必須）
-
-### 5.1 内部 API
-
-`ic-sqlite/src/ic_sqlite/vfs/overlay.nim` に、戻り値を `seq[byte]` にしない API を設ける。名前と引数は例示であり、公開 export は必須ではない。
-
-```nim
-proc readInto*(overlay: var Overlay; storage: StableBackend;
-               offset: uint64; dst: pointer; length: uint64): bool
-  ## dst に直接コピー/ゼロ埋め。完全に読めたかを返す。
-
-proc writeFrom*(overlay: var Overlay; storage: StableBackend;
-                offset: uint64; src: pointer; length: uint64)
-  ## src を保持せず、必要な dirty page にのみコピーする。
-```
-
-`temp_file.nim` にも `readInto(file, offset, dst, length): bool` と `writeFrom(file, offset, src, length)` を作る。既存の `readAt` / `writeAt` がテストや内部呼び出しで使われる場合は薄いラッパーとして残し、最終的に VFS の hot path では利用しない。
-
-### 5.2 `vfs.nim` の変更
-
-- `readFile` で `var bytes: seq[byte]` と最後の `copyMem(dst, addr bytes[0], size)` を削除。
-- temp file：`TempFile.readInto()` に `dst` を直接渡す。
-- Overlay 有効時：`Overlay.readInto()` に `dst` を直接渡す。
-- Overlay 無効時：まず `dst` 全体をゼロ化し、`databaseSize` 内の `readable` 分だけ `storage.read(SuperblockReservedBytes + offset, dst, readable)`。その後 persisted zero extents を **dst 上で**上書きゼロ化する。
-- `short` は `offset + size` の無検査加算ではなく `offset >= fileSize` / `size > fileSize - offset` のようにオーバーフローを避けて判定する。
-- `writeFile` で一時 `newSeq[byte](size)` を削除し、`src` と `size` を直接 `TempFile.writeFrom` / `Overlay.writeFrom` に渡す。
-- main DB の `overlayActive == false` に対する既存の read-only 挙動は維持する。ポインタから `openArray` を組み立てる場合は、**length > 0 の場合だけ** `toOpenArray` 等に渡す。
-
-#### データフロー
-
-変更前：`SQLite dst <- copyMem <- temporary seq <- Overlay / StableBackend`
-
-変更後：`SQLite dst <- direct copy / read <- Overlay / StableBackend`
-
-変更前：`SQLite src -> temporary seq -> Overlay / TempFile`
-
-変更後：`SQLite src -> Overlay / TempFile`（dirty page に保持すべきデータだけコピー）
-
-### 5.3 バッファ寿命とエラー処理
-
-- C ポインタは `xRead` / `xWrite` 呼び出し期間中だけ有効。関数終了後に retain しない。
-- `storage.read()` が失敗したら現行の `lastError` / SQLite IOERR に変換する。部分的に書かれた `dst` を呼び出し元が成功扱いしないようにする。
-- `src` が dirty page 自身の領域と重なる経路を将来許容する場合、`copyMem` の非重複前提を満たすか検証し、必要なら `moveMem` を使う。現在の SQLite 入力ポインタが VFS 管理領域を指すと決めつけない。
-- `readFile` / `writeFile` の `amount == 0` の取り扱いをテストし、nil 許容範囲を sqlite3_io_methods の契約に合わせる。
-
-### 5.4 完了条件
-
-- メイン DB / temp file の VFS hot path に「I/O 呼び出しごとに新しい `seq[byte]` を作る」処理が残らない。
-- Short read の戻り値とゼロ埋めが従来と一致する。
-- 大きな BLOB、複数ページ I/O、境界値で AddressSanitizer 相当の native テストまたは検証用ビルドに通る。
-- Baseline と比較して `vfs_temp_alloc_count` / `vfs_temp_alloc_bytes` が減ることをプロファイルで確認する。
-
-## 6. 設計 B：Overlay dirty page の in-place 更新（必須）
-
-### 6.1 現行構造の問題
-
-現行の `loadPage(): seq[byte]`、`target = loadPage(...)`、`dirtyPages[page] = target` は、ORC のコピー／move ルールとコンテナ格納経路によってページデータの余計な移動・コピーが生じ得る。特に full-page overwrite が既存ページに対しても `newSeq[byte](pageSize)` を実行する点は明確に改善できる。
-
-### 6.2 方針
-
-- `ensureDirtyPage(page)` を用意し、テーブル内のページを**可変アクセス**できるようにする。Nim の実際の `std/tables` API（`mgetOrPut` / `withValue` 等）と生成 C の結果を確認し、深いコピーを生まない実装を選ぶ。
-- 新規ページ：zero masked または base EOF 以降なら16KiBゼロ初期化。既存領域なら stable から16KiB以内を読み込み、未読部分はゼロのままとする。
-- 既存ページ：取得した resident buffer に直接 `copyMem` する。再度テーブルに代入しない。
-- full-page overwrite：既存 dirty page なら同じバッファを書き換える。新規 dirty page なら stable read せず16KiBバッファを一回確保し、入力から直接コピー。
-- `maxDirtyPages` / `maxDirtyBytes` は新規 dirty page を作る前にチェックする。既存 dirty page の上書きではカウントを増やさない。
-- page を dirty 化したら、そのページと重なる zero extent を必要に応じて削除する。
-
-推奨内部 API（擬似コード）：
-
-```nim
-proc ensureDirtyPage(overlay: var Overlay; storage: StableBackend;
-                     page: uint64): ptr seq[byte]
-  ## 新規であれば上限確認・1回確保・必要に応じて stable read。
-  ## 既存であればテーブル内の seq の可変参照を返す。
-
-proc writeFullPage(overlay: var Overlay; page: uint64;
-                   src: pointer)
-  ## 既存 resident page に上書き／新規時は stable read を行わない。
-```
-
-`ptr seq[byte]` は実装を固定する要求ではない。Nim table の rehash でポインタが無効化され得るため、**テーブルに新規要素を挿入した後で取り直す**、ポインタを `add` や `del` をまたいで保持しない等の制約を設ける。
-
-### 6.3 読み込みアルゴリズム
-
-`readInto()` は `dst` をゼロで初期化し、`offset` が EOF 以降なら短い読み込みとして終了する。ページごとに次を選択する。
-
-1. dirty page があれば resident buffer の必要範囲を直接コピー。
-2. zero extent に含まれるページなら出力はゼロのまま。
-3. base image の EOF 以降なら出力はゼロのまま。
-4. その他は stable backend から、論理 DB EOF とページ境界の内側だけを **dst に直接**読み込む。ページ全体を保持する必要がある場合だけ後述の clean cache を使う。
-
-複数ページ read でも `newSeq[byte](pageSize)` を毎ページ作らない。`dst` の読み込み可能部分だけ処理し、要求サイズを越えて読まない。
-
-### 6.4 publish と overlay 破棄
-
-- publish のキー収集・ソートを残してもよい（先に hot path を最適化する）。ただし `let data = dirtyPages[page]` の値取得で深いコピーが生じないことを確認し、必要ならテーブル内バッファを一時的に借用して `storage.write` に渡す。
-- publish 中はテーブルの要素追加・削除を行わない。
-- `discardOverlay` / `endOverlay` 後、dirty page を保持していないことを内部統計で確認する。`Table.clear` の capacity 保持と Wasm linear memory の高水位は別に観測する。
-
-### 6.5 完了条件
-
-- 同じ dirty page への反復更新で resident page の確保回数が1回になる（必要な初期化は除く）。
-- full-page overwrite 時に stable read が0回になる。
-- `dirtyPageCount` と上限制限、publish／rollback が従来どおり動作する。
-
-## 7. 設計 C：EOF・truncate・sparse extend の整合性（必須、独立 PR 可）
-
-現行 `Overlay.readAt` は論理 EOF を直接制限しておらず、`truncate` は保持される部分ページの末尾を明示的にゼロ化していない。バッファ API の変更と同時に意味論を固定する。
-
-### 7.1 読み込み
-
-要求範囲 `[offset, offset + length)` に対し、`validLen = min(length, size - offset)` をオーバーフローなしで算出する（`offset >= size` なら0）。`validLen` 以外の `dst` はゼロのままにする。完全に読めた場合だけ `true` を返す。
-
-### 7.2 縮小
-
-`newSize < size` の場合：
-
-1. `newSize` が16KiB境界の途中なら、そのページを dirty 化し、`newSize mod pageSize` 以降をゼロ化する。残すべき先頭部分は base／dirty の正しい内容から復元する。
-2. `ceil(newSize/pageSize)` から旧終端までの完全ページを zero extent として記録する。
-3. 範囲外になった dirty / clean ページを削除する。
-4. `size = newSize` に更新する。
-
-### 7.3 拡張・間隔を空けた書き込み
-
-`newSize > size` の場合：旧 EOF を含む部分ページの未使用領域をゼロ化し、新しく有効になる完全ページを zero extent として表現する。新たな書き込み範囲が `zero extent` と重なる場合、書かれたページを extent から除く。後続の読み込みで以前の truncation により無効化されたバイト列が再露出しないことを保証する。
-
-実装時は Rust の [`overlay.rs` L113–203](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L113-L203) をアルゴリズム参照としつつ、Nim 固有の `persistedZeroExtents` / superblock の保存・復元と一致することを確認する。
-
-### 7.4 atomicity に関する注意
-
-Stable Memory にページを書き始めた後の publish failure は、現行の `PublishStartedError` から canister trap に至る経路を保持する。途中まで反映された内容をアプリケーションレベルの通常エラーとして返してはいけない。`publish` 前の失敗は overlay を破棄できることを確認する。
-
-## 8. 設計 D：clean page cache（実験後に採否決定）
-
-Rust Overlay は最大8ページの `clean_pages` を保持する。Nim ではまず 0 / 2 / 4 / 8 ページで比較する。16KiB × 8 = 128KiB の payload に、管理構造・allocator overhead が加わる。メモリ削減が第一目的のため、初期状態は**無効**とする。
-
-- key: 論理ページ番号。value: 一回読み込んだ16KiBの clean buffer。
-- dirty 化時：可能なら clean buffer の所有権を dirty 側へ移す。併存させない。
-- COMMIT/ROLLBACK、truncate、base image 更新、再初期化では整合性に応じて invalidate / discard。
-- hit/miss、stable read bytes、常駐 cache bytes と heap を測定する。
-- Rust の page-offset cache（64件）は異なる物理レイアウト由来の最適化であり、現行 Nim へ移植しない。
-
-**採用基準**：同じ workload で命令数または stable read が有意に改善し、追加の常駐 heap とメモリ目標の兼ね合いが明確な場合のみデフォルト化を検討する。
-
-## 9. 設計 E：ベンチマーク入力・binding の比較条件を整える
-
-Rust の固定長スタックバッファ＋短寿命 borrowed binding と、Nim の `string` 生成＋`SQLITE_TRANSIENT` は同一の割り当て戦略ではない。比較値を次の2系列に分ける。
-
-1. **Public API 比較**：各言語の既存推奨 API を使い、利用者が経験する実際の end-to-end cost を測る。
-2. **VFS/core 比較**：同じ形式・長さの固定バッファ、同じ SQL、同じ transaction・prepare/step/reset 回数で、文字列生成と binding コピーの差を極力排除する。
-
-### 9.1 Nim の固定長入力
-
-`bench_spec.nim` の既存 `benchKey` / `benchValue` を廃止せず、追加で `array[9, char]` 等に数字を直接書き込む helper を作る。入力値と key のバイト列が既存仕様と一致することをテストする。
-
-### 9.2 borrowed binding は内部専用
-
-`SQLITE_STATIC` を使う helper は、原則として `bind → step → reset / clear_bindings` を単一関数内で完結させる。`defer` 等で**成功時・失敗時の両方**に binding を解除し、参照先ポインタが生きている期間にしか `step` しない。汎用 `Statement.bind(SqlValue)` や公開 `SqlValue` の寿命を暗黙に変更しない。
-
-BLOB も `sqlBlob(openArray)` が `@value` を作ることと、その後の `SQLITE_TRANSIENT` とのコピー回数を分けて測定する。borrowed path は専用 API に限定する。
-
-参照：Nim [`value.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/value.nim)、[`sqlite_helpers.c`](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/c/sqlite_helpers.c)、Rust [`statement.rs` L124–142, L718–745](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/statement.rs)、[`kv-canister/src/lib.rs` L241–343](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/benchmarks/kv-canister/src/lib.rs#L241-L343)。
-
-## 10. 設計 F：read connection / statement cache（独立した任意最適化）
-
-現在 Nim の `withQuery` は Stable DB で新しい read-only SQLite 接続を開き、終了時に閉じる。Rust は read connection を context 単位に cache し、update 時に invalidate する。Nim に再利用を入れる場合は、古いページや query 状態が更新後に残らないように明確な lifecycle を設計する。
-
-- 当面は現状維持。VFS 修正の前後比較に混在させない。
-- 別実験で「query ごと open/close」「読み込み専用接続再利用」「statement cache 無効／上限付き有効」を比較する。
-- read connection の invalidation、active reader と update の衝突禁止、upgrade 後の初期化、close 時の statement finalize を必須条件にする。
-- 接続再利用が heap 常駐を増やす場合、低メモリ用途ではデフォルト無効の選択肢を残す。
-
-## 11. 計測・ベンチマーク設計
-
-### 11.1 基準を固定する
-
-- 比較 Rust SHA は `1386239...`、Nim baseline は `bd5763b...` または記録した変更前の SHA に固定する。Rust 側には現行 runner が適用する `rust_host_stats.patch` があることを manifest で記録する。
-- `NISQL_COMPARE_NIM_SHA=HEAD` で各 PR の Nim HEAD をビルドし、Wasm hash と dirty-tree 状態を必ず残す。
-- Nim `--mm:orc` / `-d:release` / `useMalloc`、SQLite compile flags、16KiB page size、`cache_size=-32768`、測定 rows と環境を維持。
-- Core KV は fresh canister pair、churn は各実装1 canisterを継続して使うという現行条件を維持する。warm/cold query を混同しない。
-
-### 11.2 追加する計測項目
-
-| 層 | 項目 | 目的 |
-|---|---|---|
-| Host/Canister | `memory_size`、raw stable pages、差分 `heap_bytes` | 現行と同じ外部観測 |
-| Host/Canister | install/init 直後・phase 前後・反復終了後 | 基礎メモリ／高水位の分離 |
-| Overlay | `dirty_pages_current/peak`、新規ページ確保回数・バイト数 | dirty resident footprint |
-| VFS | temporary buffer allocations / bytes、full-page overwrite 数 | ゼロコピー化の検証 |
-| Stable backend | read/write/grow calls、bytes | clean cache の効果 |
-| SQLite | `sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)` 等、利用可能な cache 使用量 | pager と VFS の分離 |
-| Runtime | `GC_getStatistics` 等の利用可否を調査、必要なら検証用ビルド | Nim allocator の挙動を補助観測 |
-
-SQLite の `SQLITE_DEFAULT_MEMSTATUS=0` は両実装の現行 compile flags にあるため、SQLite status API の各値が実際に有効かはテストしてから採用する。カウンタ instrumentation は `-d:benchmarkProfile` 等で分離し、通常ベンチマークの hot path に計測負荷を入れない。
-
-### 11.3 集計方法
-
-各 phase の raw 値・差分値を残し、最低5組の paired trial から中央値とレンジを出す。メモリが非縮小の Wasm 高水位を表すこと、`heap_bytes` がライブヒープではないことをレポートに明記する。instructions と memory は別指標で評価する。結果は `measurements.jsonl` / CSV / manifest に保存し、検証ツールで欠損値・一致しない checksum・Wasm hash を拒否する。
-
-特に現行 `churn.nim` は raw stable memory を記録するが `heap_bytes` を保存しないため、core と同じ host status 観測を追加する。通常の `db_stats`、`bench_host_stats` 呼び出し自体が次の heap 観測へ影響する可能性があるので、観測順序は両実装で固定し、可能なら状態取得前後の差も記録する。
-
-### 11.4 比較シナリオ
-
-- Core: reset → point read → update（各100行、fresh pairs）。
-- Profile: read、write、multi-get、growth。通常 workload と instrumentation 版の instruction 値は合算しない。
-- Churn: 5,000行 → 1,000行DELETE / 1,000行INSERT を100 cycle。heap の推移も保存。
-- Large BLOB: 少なくとも16KiB未満、16KiB境界、複数ページの値で copy・resident footprint を比較。
-- Same-page overwrite: 同ページ反復上書きと全ページ上書き。ページ確保回数と stable read 回数を確認。
-- Repeated query: 初回／warm／接続再作成時の違いを測る。
-
-## 12. テスト計画
-
-既存テストを残した上で、必要に応じて以下を追加する（ファイル名は提案）。
-
-| 種類 | ケース | 必須の確認 |
-|---|---|---|
-| `test_vfs_buffer_io.nim` | 空、1 byte、ページ境界内外、複数ページ read/write | bytes、IOERR、短い読み込みの tail 全ゼロ |
-| `test_overlay_semantics.nim` | 重複 write、順序の異なる overlapping write | 最後の書き込みが勝つ |
-| 同上 | full-page append / overwrite | stable base read 0回 |
-| 同上 | dirty page 再書き込み | 同一 resident buffer を再利用 |
-| 同上 | truncate 1 byte → gap → write → extend | gap がゼロ、古い tail が漏れない |
-| 同上 | truncate / re-extend を複数回 | zero extent の merge/split と正しい bytes |
-| 同上 | dirty 上限値境界・大きすぎる offset | 正しいエラー／状態不整合なし |
-| `test_borrowed_binding.nim` | TEXT・BLOB の正常終了と SQLite error path | 参照先寿命内に binding が必ず解除 |
-| 統合 | COMMIT / ROLLBACK / failure injection | 未公開 dirty page が残らない、publish failure が原子的に扱われる |
-| 統合 | canister upgrade / 既存 DB 復元 | superblock と既存データ互換性 |
-| Benchmark | 固定 key/value と従来 generator の全件一致 | 比較 workload の意味論維持 |
-
-**既存回帰の実行**：`ic-sqlite/scripts/test.sh` を利用し、comparison の `test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_cross_upgrade.nim`、`test_memory_region.nim` を含める。Canister が必要なテストは Docker / WASI SDK / nicp_cdk / icp CLI の既存環境で実施する。
-
-## 13. PR 分割・レビューゲート
-
-| PR | 内容 | 依存 | Merge 条件 |
+| 項目 | Nimの比較Canister | Rustの比較Canister | 設計上の扱い |
 |---|---|---|---|
-| 0 | Baseline 固定・診断カウンタと EOF/size テスト追加 | なし | 変更前の正しい挙動と既知の不具合を可視化できる |
-| 1 | VFS `readInto` / `writeFrom`、temp direct I/O | PR 0 | hot path の中間 `seq` なし、short-read 回帰クリア |
-| 2 | Overlay in-place、full-page overwrite 再利用 | PR 1 | 同一 dirty page の再確保なし、上限・rollback 正常 |
-| 3 | EOF / truncate / sparse extend の整合性 | PR 0（PR 1・2と衝突調整） | Native・Canister のデータ保全テスト通過 |
-| 4 | fixed-buffer / borrowed-bind 比較ベンチマーク | PR 1–3 | 入力・SQL・checksum が一致、公開 API は既存動作 |
-| 5 | clean cache、read connection / statement cache の各 A/B | PR 1–4 | resident heap と instructions のトレードオフが数値化される |
+| update時の入力生成 | `benchKey(index)` / `updatedValue(index)` が`string`を生成 | `[u8; 9]` / `[u8; 27]`をループ内で組み立てる | 入力生成・allocation分離 |
+| バインド | 汎用`sqlText`→`Statement.bind`→`SQLITE_TRANSIENT` | `execute_text_text`→`SQLITE_STATIC`→明示clear | P0/P1で一致させる |
+| prepare | 1 transactionにつき1回、100回step/reset | 1 transactionにつき1回、100回execute | 既に概ね同条件 |
+| stable backend | `newIcStableBackend()`を`Db.init`へ渡す。wasi2ic MGRを検出すると固定prefixの後ろへoffset | `MemoryManager.get(SQLITE_MEMORY_ID)`を`Db::init`へ渡す | ストレージ構成を別系列で揃える |
+| clean base-page cache | Nim Overlayではデフォルト0、全ページ読取時のみヒット/挿入 | Rust Overlayで8ページ。部分読取からもbase pageをcache | 更新時に本当にアクセスされるか計測 |
+| クエリ | 異なるconnection warmup経路 | 異なるconnection warmup経路 | 共通のupdate改善と分離 |
 
-**推奨マージ順**：0 → 1 → 2 → 3 → 4 → 5。ただし PR 3 の correctness テストは PR 0 から先行して用意し、性能変更の受け入れゲートにする。各 PR は1種類の最適化だけを含め、測定結果と変更前後の SHA / Wasm hash を PR に添付する。
+根拠: Nim [`insertRows` と `bench_update_only`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/nim_canister/backend/src/main.nim#L179-L265)、Rust [`bench_update_only`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/benchmarks/kv-canister/src/lib.rs#L305-L323)、Nim [`ensureDatabase`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/nim_canister/backend/src/main.nim#L145-L160)、Rust [`init_db`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/benchmarks/kv-canister/src/lib.rs#L230-L239)。
 
-## 14. 受け入れ基準（Definition of Done）
+したがって、この441,115 instructionsを「Nim版MemoryManagerの遅さ」「Nim版VFSの遅さ」「Nim言語の遅さ」のいずれかと断定しない。
 
-- [ ] 変更前・各 PR 後の paired benchmark に再現可能な manifest がある。
-- [ ] VFS の main DB / temp file I/O に不要な per-call `seq` がない。
-- [ ] 同一 dirty page 上書きによる不要な16KiBの再確保がない。
-- [ ] EOF、truncate、sparse extend、COMMIT／ROLLBACK／upgrade の全回帰テストに通る。
-- [ ] Baseline と同じ logical DB size・SQLite page count・内容 checksum を確認できる（仕様上変わるケースは理由を記録）。
-- [ ] `raw_stable_bytes` と `heap_bytes` の両方を保存し、混同しない。
-- [ ] `heap_bytes` に改善が見られない場合も、allocation / VFS read / SQLite cache のどこに差が残るか説明できる。
-- [ ] 公開 API、stable image format と安全な binding 規則を保持する。
-- [ ] キャッシュ・接続再利用は実測値なしにデフォルト化しない。
+### 2.2 計測した正確なソースを固定する
 
-## 15. 追加検討事項とリスク
+[`bench_manifest.json`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/bench_manifest.json#L1-L36) は**テンプレート**であり、Nim欄は`4735f04908ae9a7ac30bac6d05aa7aaa1e0da260`、Rust欄は`1386239acff1dd7ede5ac78a2f0a22ef495195de`を記している。一方、調査したNimブランチ先端は上記の`c33c47...`。[`runner/main.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/runner/main.nim#L77-L134)は`NISQL_COMPARE_NIM_SHA=HEAD`で比較対象を変更でき、実行時`manifest.json`にソースやWasm SHAなどを保存する。
 
-1. **Nim ORC の move/copy**：`seq` の値渡しや `Table` への代入は、意図どおりゼロコピーになるとは限らない。該当箇所の生成 C / heap profile で確認する。
-2. **Pointer と table rehash**：テーブル内要素へのポインタを挿入・削除後も持ち続けない。
-3. **Wasm linear memory**：解放された領域と canister `memory_size` の減少を同一視しない。
-4. **clean cache**：Stable Memory read を減らす代わりに常駐メモリを増やし得る。
-5. **`SQLITE_STATIC`**：短寿命の内部 helper でのみ使用し、全退出経路で `sqlite3_clear_bindings` を保証する。
-6. **リリース互換性**：stable image の移行を発生させない。Rust と Nim の stable image が相互にバイナリ互換という前提は置かない。
-7. **アルゴリズムと計測の分離**：profiling backend の追加コストを core benchmark の instruction 値と混ぜない。
+提示された`summary.md`だけでは実行時manifest、各5組の分布、生成Wasm SHA、Nimのdirty tree、raw/virtualページ数を検証できない。以後のすべての比較で **`manifest.json`、`measurements.csv`、`measurements.jsonl`、Wasm SHA、ベンチマークソースSHAをセットで保存**し、改善前後に同条件で再構築する。Rust側は[`prepare_rust.sh`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/prepare_rust.sh#L1-L27)が固定SHAに`rust_host_stats.patch`を適用している点も再現する。
 
-## 16. 実装開始時のチェックリスト
+### 2.3 すでに実装済みで、二重実装しないもの
 
-```bash
-# 基準コミットと測定条件を記録
-cd /application/ic-sqlite
-git rev-parse HEAD
+- Nimの[`overlay.ensureDirtyPage` / `writeFrom`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L104-L134)は**16 KiBの全ページ書込時にbase readを省略**する。Rustの[`write_full_page`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L226-L233)を単に移植する必要はない。
+- Nimには[`bindStaticText` / `bindStaticBlob`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L660-L693)が存在し、Cの[`sqlite_helpers.c`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/c/sqlite_helpers.c#L3-L17)にも`SQLITE_STATIC`のshimがある。不足しているのは**安全に閉じた組合せ操作**。
+- NimはVFSの[`readInto` / `writeFrom`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L136-L227)で借用ポインタを直接処理し、余分なVFS staging bufferを既に回避している。
+- Nimは長寿命の書込SQLite connectionを保持しており、Rustのpersistent write connectionを新規移植する必要はない。Nimの[`Db.raw` と `Db.init`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L65-L81)、Rustの[`WRITE_CONNECTIONS`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/mod.rs#L27-L30)。
+- SQLiteのCコンパイルフラグは列挙レベルでは一致する。Nim [`build_sqlite.sh`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/scripts/build_sqlite.sh#L29-L49)、Rust [`build-flags.txt`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/vendor/sqlite/build-flags.txt)。単純なPRAGMA/コンパイルフラグ変更を主因と決め打ちしない。
 
-# 既存の Native / Canister テスト（必要な toolchain をセットアップ済みの環境で）
-./scripts/test.sh
+## 3. 設計案A（P0/P1）: Core KVのベンチマーク条件一致と借用バインド
 
-# 比較ベンチマークを再実行（リポジトリの README と環境設定に従う）
-cd benchmarks/comparison
-./prepare_rust.sh
-nim c -d:release runner/main.nim
-NISQL_COMPARE_NIM_SHA=HEAD ./runner/main 5
+### 3.1 変更箇所
 
-# 出力された実際の run ID を用いて検証
-nim c -r runner/validate.nim results/<run-id>
+- `ic-sqlite/benchmarks/comparison/shared/bench_spec.nim`: 既存`benchKeyBuffer`と並列に**`updatedValueBuffer(index): array[27,char]`**を導入する。全長・内容をRustの`updated_value()`と完全に一致させる。
+- `ic-sqlite/src/ic_sqlite/db.nim`: ライブラリ内部向け（あるいは明示的なスコープ制約つきAPI）の**`executeTextTextBorrowed`**を追加。`Statement`を使い回し、2本の値を長さ指定`SQLITE_STATIC`でbindして`sqlite3_step`し、**成功・bind失敗・step失敗の全経路でbindingを消去**する。公開汎用`bind`のコピー安全性は変えない。
+- `ic-sqlite/benchmarks/comparison/nim_canister/backend/src/main.nim`: 既存`bench_update_only`を残し、実験用`bench_update_only_borrowed`を追加する。seed、SQL、transaction境界、測定開始位置、更新後report、100 rowsを同じにし、行ループの**フォーマットとバインドの実装だけ**変える。既存`bench_vfs_core_profile`にも`newString`と`SQLITE_TRANSIENT`が残るため、名前だけでallocation-freeとして扱わない（[該当行](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/nim_canister/backend/src/main.nim#L950-L1016)）。
+
+Rust根拠: [`execute_text_text`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/statement.rs#L124-L142)と[`reset_and_bind_two_text_borrowed`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/statement.rs#L707-L752)。Nim現状の汎用bindは[`SQLITE_TRANSIENT` shim](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L637-L658)を経由する。
+
+### 3.2 擬似APIと所有権・例外保証
+
+```nim
+# 内部用APIの概念図。コンパイル済みパッチではない。
+proc executeTextTextBorrowed(
+  stmt: var Statement;
+  first: openArray[char]; second: openArray[char]
+): Result[bool, DbError] =
+  # 1. stmtがliveか、バインド対象が2つか、長さ上限を先に検査。
+  # 2. sqlite3_resetで前回実行状態を解除。
+  # 3. firstとsecondを長さ指定SQLITE_STATICでbind。
+  # 4. sqlite3_stepはSQLITE_DONEのみ成功とする。
+  # 5. defer/finally相当で常にsqlite3_clear_bindings、必要ならreset。
+  #    このcleanup完了まではfirst/secondの参照元を破棄・変更しない。
+  discard
 ```
 
-`<run-id>` は実際の生成ディレクトリ名に置き換える。結果ファイルは無ければ「未測定」と明記し、性能値を推測で埋めない。
+**重要な契約**: `SQLITE_STATIC`はSQLiteが参照元を所有しない。Nimのスタック`array`は同期実行・非エスケープ・非再入のstep〜clear区間でのみ参照させる。`bindStaticText(data: cstring,length)`に渡すポインタは非終端でも**明示length**を使う。`sqlite3_reset`が直前のstepエラーコードを返す場合も、`clear_bindings`を省略しない。クロージャ内のearly return / `CatchableError` / constraint errorにも対応する。公開`Statement.bind`を一律`SQLITE_STATIC`へ置換することは**禁止**。
 
----
+### 3.3 切り分けるAB実験
 
-### ソース／測定手順
+- A0: 現状の`bench_update_only`（string生成+TRANSIENT）。
+- A1: 文字列生成はそのまま、内部`executeTextTextBorrowed`のみ変更（コピー削減）。
+- A2: `array`バッファ生成+安全なborrowed実行（Rustと入力形式を一致）。
+- A3: A2にOverlay改良を重ねる。改善の相乗・回帰を記録する。
 
-- [nim-ic-sqlite / README](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/README.md)
-- [Nim VFS](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/vfs/vfs.nim)、[Nim Overlay](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/vfs/overlay.nim)、[Nim DB facade](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/src/ic_sqlite/db.nim)
-- [Nim comparison runner](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/benchmarks/comparison/runner/main.nim)、[Nim churn runner](https://github.com/dumblepy/nim-ic-sqlite/blob/bd5763b0a264ffb2aacf6c0bb289a3d7d0281f32/ic-sqlite/benchmarks/comparison/runner/churn.nim)
-- [Rust file.rs](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/file.rs)、[Rust overlay.rs](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs)、[Rust statement.rs](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/statement.rs)
+A1とA2を分けないと、借用bindの効果とフォーマット・アロケーション削減を区別できない。Rustのソースと同じ`UPDATE bench SET value = ? WHERE key = ?`、同じ桁詰め、100 step、1 prepare、1 update transactionを固定する。`bench_update_only`そのものの既存の意味は変えない。
+
+## 4. 設計案B（P1）: Overlay read zero-fillの最小化
+
+### 4.1 問題とRustからの参照
+
+Nim [`readInto`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L136-L191)は入口で`zeroMem(dst, length)`し、その後にdirty pageやstable memoryから有効範囲を上書きする。通常の完全読取では最初のゼロ埋めが余分になり得る。overlayなしの[`vfs.readFile`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/vfs.nim#L138-L158)でも同様の先行全域ゼロ埋めがある。Rustの[`Overlay::read_at`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L55-L72)は読めた範囲を読み、**不足分のみ**ゼロ埋めする。（注: 上記RustリンクのSHAは下記参照欄の正本を使用すること。）
+
+### 4.2 提案
+
+1. `validLen = min(length, max(size-offset,0))`をoverflow-safeに求める。
+2. 有効範囲の各segmentをdirty / persisted zero extent / base-readに振り分ける。**ゼロextentに相当する部分だけ個別にzeroMem**。
+3. `validLen < length`の場合、`dst[validLen ..< length]`のみzeroMemしてSQLite規約のshort-readを返す。`offset >= size`では全域ゼロでshort-read。
+4. overlayなしのmain DB読取も、有効範囲を直接`storage.read`し、論理ゼロextentをマスクし、最後にEOF tailのみゼロ埋めする。
+5. `readInto`のdirty-page参照で`hasKey`+`[]`の二重探索を`withValue`等へまとめる変更は、別コミット・別計測で試す。
+
+**保持すべき不変条件**: 短い読取の残りは必ず0、truncated後の古いstable bytesは返さない、新規ページやsparse gapも0、offset/length加算overflowで誤読取をしない。SQLite `SQLITE_IOERR_SHORT_READ`の返却条件を維持する。
+
+## 5. 設計案C（P1/P2）: Dirty-page保持方式・zero extent処理の軽量化
+
+### 5.1 Rust方式の移植は条件付き
+
+Rust [`Overlay`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L13-L35)はdirty/clean双方に`Vec<(page_no, Vec<u8>)>`を使用し、dirty indexは線形探索する（[235–247行](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L235-L247)）。Nimは[`Table[uint64, seq[byte]]`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L18-L33)を用い、writeごとに存在確認、ページ取得、zero mask処理を行う。小さなトランザクションでは`seq`が安い可能性があるが、dirtyページ数が増えると線形探索は不利になる。**全ケースでVecが優位という主張はしない**。
+
+### 5.2 提案: feature flagで3方式を比較
+
+- C0: 既存Tableを変更せず基準とする。
+- C1: 最大8/16/32件の小型`seq[DirtyPage]`、探索を線形にする。`seq`の再確保は先行`reserve`相当で軽減。`seq[byte]`本体を読み出すときの不用意なコピーを防ぎ、既存の`withValue`方針を保つ。
+- C2: 小型seqから一定件数でTableへ移行するhybrid。閾値は実測で選び、`maxDirtyPages` / `maxDirtyBytes`制限を維持する。
+
+`removeZeroPage`がzero extents空でも毎回新しいseqを構築する経路は、先頭に`if zeroExtents.len == 0: return`を加える。`pageIsZero`も空を高速判定。既存[`removeZeroPage` / `addZeroExtent`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L74-L102)の重なり結合・分割を壊さない。さらに`publishDirtyPages`はkeysを複製してsortしている（[270–288行](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L270-L288)）。並び替え省略は物理write順序を変えるので、まずpublish内instructionを測定し、sortあり/なしを**別途**比較する。トラップ時の部分公開保護は維持する。
+
+**任意の追加試験**: 全ページ上書きではNimの`newSeq[byte]`ゼロ埋め直後に16 KiBを完全copyしている。Rustの`bytes.to_vec()`と同等の初期化コストを目指す未初期化allocationは、安全な専用full-overwrite分岐でのみ実験し、ページの一部でも未初期化で露出しないことを証明・テストできない限り採用しない。通常の部分ページ読取やrollbackには適用しない。
+
+## 6. 設計案D（P2）: MemoryManagerの1-entry BucketCache
+
+### 6.1 実装比較
+
+Rustは[`BucketCache`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/stable/memory_layout.rs#L34-L79)に最後の仮想bucket区間と実物理base addressを格納し、[`VirtualMemory.read/write`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/stable/memory_manager.rs#L304-L374)は一つのbucketに収まる場合、segment cache hitでアドレス変換・ループを省略する。Nimの[`VirtualStableBackend.read/write`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/stable/memory_manager.nim#L293-L346)には該当キャッシュがなく、毎回除算・bucket配列参照・whileで変換する。
+
+### 6.2 データ構造と判定
+
+```nim
+# 概念構造のみ
+VirtualStableBackend = ref object of StableBackend
+  manager: MemoryManager
+  id: MemoryId
+  cacheValid: bool
+  cacheLogicalBase: uint64   # bucketIndex * bucketBytes
+  cachePhysicalBase: uint64  # bucketAddress(physicalBucket)
+  cacheLength: uint64        # bucketBytes
+  # 必要ならmemory manager再初期化/世代の識別子を追加
+```
+
+`read/write`は**既存の`assertVirtualBounds`を先に行う**。cacheがvalid、`offset >= cacheLogicalBase`、`relative = offset - cacheLogicalBase`、`relative < cacheLength`、`size <= cacheLength - relative`である場合のみ`manager.backend.read/write(cachePhysicalBase + relative, ..., size)`へ直行。それ以外は従来のbucket分割処理を行い、各bucketの論理/物理baseをcacheに保存。`offset + size`を先に計算しない。`size=0`と境界ちょうど/跨ぎ/`high(uint64)`も検証する。
+
+cacheは**VirtualStableBackendインスタンス単位**（MemoryId単位の誤共有を防ぐ）。現在のallocationは既存bucketの物理割当を変更しないためgrowで既存entryが無効化されないか設計上確認し、将来配置変更を導入する場合に備え世代または明示invalidateを準備する。保存形式・MGR header・bucket allocation tableは変更しない。旧Rust/`ic-stable-structures` 0.7互換のbyte imageを維持する。
+
+### 6.3 効果を測る適切な条件
+
+現在のNim Core KV用`ensureDatabase()`はraw`newIcStableBackend()`を渡し、RustのCore KVはMemoryId 120を使用する。このままではNimの`VirtualStableBackend`改良はCore KVの主要経路を通らない。次の2系列を分ける。
+
+- **D1**: Nim`initMemoryManager(raw).getMemory(120)`を用いる新規比較CanisterとRust双方をfresh MGR上で動かす。MGR header、virtual pagesとraw pages、wasi2ic予約prefixの扱いもmanifestに記録する。
+- **D2**: MemoryManager単体のread/writeマイクロベンチ。same bucket repeated、隣接bucket crossing、interleaved MemoryId 2種、cold-cache、grow直後。`backend.read/write`回数とinstructionsを収集する。
+
+Nimの[`Wasi2icReservedStablePages = 1025`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/stable/memory_manager.nim#L39-L55)や`stableBackendAfterForeignManager`の所有領域を単純に削る・重ねることは禁止。
+
+## 7. 設計案E（P2/P3）: clean-page/read-onlyページキャッシュ
+
+Rustの[`Overlay::read_range`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs#L288-L316)は**部分読取ミス**でもbase page全体を取得して小型cacheへ入れ、次回の部分読取で再利用する。一方、Nimの[`overlay.readInto`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L153-L188)はclean cacheが0（default）で、非ゼロにしても全ページ揃った読取でのみcacheを使う。比較したいのは「Rustと同じ8ページを常時有効」だけではなく、**0 / 2 / 4 / 8ページ × 部分読取対応あり/なし**の組合せ。Nimに既存の[`clean_cache_ab.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/runner/clean_cache_ab.nim#L1-L41)があるので、ここへvariantを足す。
+
+読み取り専用側について、Rustの[`IcStableFile`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/file.rs#L17-L51)はファイル固有のsuperblock snapshotと`PageOffsetCache`を持ち、[`stable_blob.rs`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/stable_blob.rs#L20-L127)には小さなpage-offset/data cacheがある。Nimは[`vfs.readFile`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/vfs.nim#L138-L158)で直接stable readする。Nim側で同等機能を追加する場合、**query-onlyファイルhandleに限定**した8ページ程度のデータcacheから始め、update直前にcached reader/statementとcacheが無効化されることを保証する。
+
+SQLite pager cacheが既にあるため、VFS clean cacheは負担増だけで効果がない可能性もある。`cache_used_bytes`、stable read call/bytes、heap bytes、instructionを同時に記録する。update側のOverlay cacheとquery側のreadonly file cacheは**別機能として測る**。既存の`queryConnectionReuse`/`queryStatementCacheEnabled`はdefault offであり、ソース上既存の機構（[`DbConfig`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L45-L64)）を踏まえて設計する。
+
+## 8. 設計案F（P3）: VFS間接参照とstatement cache
+
+- NimではC [`ic_sqlite_vfs_shim.c`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/c/ic_sqlite_vfs_shim.c#L21-L35)がhandle IDを渡し、Nim [`stateFor`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/vfs.nim#L126-L141)は`files.hasKey()`の後`files[handleId]`を実行する。まず`withValue`等による一回lookup化とhandle数1時のspecialized branchをA/Bする。Rustの[`IcStableFile`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/file.rs#L17-L26)はsqlite3_file内に状態を直接持つが、Nimで生ポインタを埋め込む移植はGC/ORCでの寿命・SQLite所有メモリとの契約が増えるため後回し。結果が小さければ見送る。
+- Rustには[`prepare_cached`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/connection.rs#L29-L87)がある。Nimもquery/Db connection用cacheを持つが、[`UpdateConnection.prepare`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L596-L607)は毎回prepareしている。今回のCore KVでは1 transactionの中でstatementを100回再利用しているため、この改善は**主に多数のupdateメッセージ跨ぎ**のテストで評価する。commit/rollback・schema変更・SQLite error時の無効化、lease終了後のstatementエスケープ防止、capacity制限を必須とする。
+- さらに`-Os` vs `-O2`/LTOなどのビルド変更は、上記ソース差分の検証後にWasm SHAとサイズ・命令数を同時記録して単独実験する。Nim（`wasm32-wasip1` + wasi2ic）とRust（`wasm32-unknown-unknown`）を単純なコンパイラ比較にしない。
+
+## 9. 実装ステップ・PR分割
+
+| 順位/PR | 変更内容 | 主対象 | 実験と合格条件 |
+|---|---|---|---|
+| PR-0 | benchmark manifest/測定固定、A0/A1/A2比較endpoint、入力内容 parity | `bench_spec.nim`、`main.nim`、`runner/` | 同じ100行・同じSQL結果・同じstep/prepare/txn回数。計測内のseedを増やさない |
+| PR-1 | 安全なborrowed 2 TEXT一括実行と固定長updated value | `db.nim`、`bench_spec.nim`、tests | success/error/constraint/early-returnでdangling pointerなし、公開generic bindの意味不変 |
+| PR-2 | Overlay readの部分的zero fill、zero extent空fast path | `overlay.nim`、`vfs.nim` | short-read/部分ページ/truncate/rollbackの全テスト通過、update/read単独A/B |
+| PR-3 | small seq / hybrid dirty-page A/B、必要ならpublish sort最適化 | `overlay.nim`、profile/tests | dirty=1..128と大量dirty双方を測り、上限・エラー/公開規則維持 |
+| PR-4 | VirtualBackend one-entry BucketCache | `memory_manager.nim`、memory manager tests | MGR image不変、跨bucket/複数MemoryId/grow/overflow適合。D1/D2で測定 |
+| PR-5 | update partial clean cacheとreadonly per-file cacheを別に検証 | `overlay.nim`、`vfs.nim` | stable read bytes、instructions、heapのバランスを評価。query invalidation保持 |
+| PR-6 | file-handle lookupとupdate statement cache実験 | `vfs.nim`、`db.nim` | 高頻度multi-messageで差が出るときだけ採用 |
+
+各PRには通常ビルドのWasm artifactと`benchmarkProfile`ビルドのprofileを分けて保管する。細粒度計測コードをrelease benchmarkに混入させない。PRごとにA/Bの変更点を**1つ**に限定する。
+
+## 10. 測定設計と採用基準
+
+### 10.1 ワークロードマトリクス
+
+| シリーズ | シナリオ | 主要分離対象 |
+|---|---|---|
+| Core KV parity | fresh canisterペア、100 rows×5（可能なら繰返しを増やす） | A0/A1/A2、同一ソース固定 |
+| Micro step | 1/10/100/1000更新、同SQL、1 prepared statement | format / bind-reset / SQLite stepの内訳 |
+| Overlay read | full page、partial page、EOF、zero-masked、dirty page | 不要zero-fillと部分cache |
+| Overlay write | partial/full page、dirty=1/2/4/8/16/32/128/4096 | seq/table閾値とメモリ |
+| MemoryManager | cache hit、cold miss、cross-bucket、複数ID、grow | BucketCache効率と境界安全 |
+| Query | fresh/warmの2系列、point queryとscan | query connectionとreadonly page cache |
+| Churn/容量増加 | delete/reinsert、truncate/reextend、stable grow | 長期回帰・zero extent・物理ページ |
+
+`runner/profile.nim`、`runner/vfs_core.nim`、`runner/clean_cache_ab.nim`、`runner/query_reuse_ab.nim`を活用する。ただし`vfs_core`の既存版には`newString`とTRANSIENT bindがあるため「真の無割当」系列は新たに明示的に定義する。Nim/Rustのprofileカウンタ定義が異なる場合は**命令数の内訳を直接差し引かず**、共通の測定境界を追加して比較する。
+
+### 10.2 必須レポート項目
+
+`instructions`の中央値・全個票・最小最大・分散、Wasm SHA、ソースSHA、SQLite version/page size、SQL/入力checksum、transaction/prepare/step/reset数、DB size、SQLite page_count/freelist、virtual stable pages、raw stable pages、raw growth、heap_bytes、SQLite cache used、dirty peak、base read/write calls/bytes、zero extents数、cache hit/miss、Wasm bytes。cycle cost unavailableは引き続き**未取得**と明示する。中央値のみで性能の因果を推論しない。メモリを比較する際はraw stable memoryとSQLiteが見ているvirtual memoryを混同しない。
+
+### 10.3 採用ゲート
+
+正しさは必須条件。改善採用は**同一条件のunprofiled build**で有意かつ再現性のあるinstructions削減、または明確なstable I/O削減が観測された場合に限定する。単一100行データでよくても、1行/大規模dirty/churn/queryで大きな退行があれば閾値・default off・不採用を判断する。「Nim/Rust比1.0」を事前達成保証にしない。heap増、stable growth、物理ページ数、コード/Wasmサイズも記録してトレードオフを示す。
+
+## 11. 回帰・互換・安全性テスト
+
+1. **SQLite意味論**: INSERT/UPDATE/DELETE、`WITHOUT ROWID`、拘束違反、SELECT、transaction成功/rollback、prepare/step/reset、blob/textの空値・最大長・長さ指定文字列。
+2. **借用bind**: 2回目bind失敗、stepエラー、`sqlite3_reset`が直前エラーを返すケース、early return、連続1000回実行、bind後の元配列がclear完了まで不変、汎用TRANSIENT APIが引き続きコピー保証。
+3. **Overlay**: full/partial/跨ページ、短い読取残余全0、EOF、既存0 mask、truncate→extend→再利用、書込順序が重なるケース、失敗したtransactionのdirty page非公開、publish開始後の例外がtrap扱いであること。
+4. **MGR互換**: header/alloc tableにbyte-level変更がないこと、既存Rust/`ic-stable-structures`画像をロード、A/B/A interleaveでMemoryId間の物理bucketが重ならないこと、0/境界/最大近傍のoverflow、cache中のgrow、WASI polyfill固定prefix（1025ページ）との共存、upgrade round-trip。既存[`test_memory_manager.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/tests/test_memory_manager.nim)を拡張する。
+5. **read-only cache**: commit/rollback後の旧snapshot不露出、reader invalidation、query handle close、cacheページ上書きとtruncation、multi-context混線の不在。
+6. **運用保証**: 同期closureを跨ぐawaitなし、`SQLITE_THREADSAFE=0`/WAL offの前提を維持、resource capを維持、失敗後のsilent partial publishを許容しない。
+
+重要: Rustのin-place publishはdirtyページを先に書き、superblockを後で格納し、途中失敗はpanicする（[`commit_overlay_in_place`](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/stable_blob.rs#L518-L580)）。Nimにも[`PublishStartedError`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim#L270-L288)を[`trapPublishFailure`](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L326-L338)へつなぐ既存保護がある。性能改善でこの順序を変えてはならない。
+
+## 12. 非目標と未確認事項
+
+- 現在の`NIMSQLV1` superblockやMGRのon-stableバイト形式をRustと同一に書き換えることは、本計画の対象外。互換性破壊を伴う別設計にする。
+- すべてのNim public bindを借用に置換しない。APIの呼出元が文字列を早期破棄する可能性がある。
+- 「RustのVecを丸ごと模倣」「キャッシュは大きいほどよい」「命令数＝cycle費用」と決めない。
+- 付与されたベンチマーク要約だけでは、実測したNimのcommit/dirty tree、5個票、`benchmarkProfile`の内訳、現行branch最新での再計測結果は確認できない。本書は**両リポジトリの公開ソース読解に基づく実装提案**であり、PR適用、コンパイル、test実行、改善後benchmarkは未実施。
+
+## 13. 参照先（固定コミット）
+
+### Nim
+
+- [benchmark runner / source pin / measurement windows](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/runner/main.nim#L10-L207)
+- [benchmark canister / Core KV](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/nim_canister/backend/src/main.nim#L145-L265)
+- [fixed-length key/value helpers](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/benchmarks/comparison/shared/bench_spec.nim#L22-L66)
+- [database binding / update transaction](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/db.nim#L596-L703)
+- [overlay](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/overlay.nim)
+- [VFS](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/vfs/vfs.nim)
+- [MemoryManager / virtual backend](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/src/ic_sqlite/stable/memory_manager.nim)
+- [SQLite C build flags](https://github.com/dumblepy/nim-ic-sqlite/blob/c33c47ce505f2a8a6ce77ac38c55931c1fd4cef8/ic-sqlite/scripts/build_sqlite.sh)
+
+### Rust
+
+- [KV benchmark](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/benchmarks/kv-canister/src/lib.rs#L305-L323)
+- [borrowed statement execution](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/db/statement.rs#L124-L142)
+- [overlay and clean-page cache](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/overlay.rs)
+- [BucketCache / overflow-safe VirtualSegment](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/stable/memory_layout.rs#L34-L100)
+- [MemoryManager read/write fast path](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/stable/memory_manager.rs#L304-L374)
+- [readonly per-file snapshot/cache](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/file.rs#L17-L154)
+- [stable blob page caches and commit](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/src/sqlite_vfs/stable_blob.rs)
+- [SQLite build flags](https://github.com/humandebri/ic-sqlite-vfs/blob/1386239acff1dd7ede5ac78a2f0a22ef495195de/vendor/sqlite/build-flags.txt)
 
 ## 調査結果・設計まとめ（実装時追記）
 
-- 本ブランチ `11-update-memory-management` の分岐点 (`b236b5c`) は `9-update-vsf`（PR #10）のマージコミットであり、本設計書（設計 A〜F）の必須実装はすでに同一リポジトリへ取り込まれている。設計の要件は「再実装」ではなく、既存実装が本設計の不変条件・完了条件を満たすことの検証として扱う。
-- 検証（native, `./scripts/test.sh`）: wasi-sdk 34 環境で `install.sh` → `build_sqlite.sh` → Testament を実行し **28/28 PASS / exit 0**。設計 A（`readInto`/`writeFrom` の直接 I/O）、設計 B（dirty page の in-place 更新・full-page overwrite の base read 0 回）、設計 C（EOF/truncate/sparse extend）、設計 E（固定長入力・borrowed binding）、設計 D/F（clean cache・read connection/statement cache の既定無効）が回帰で緑。
-- Nim 2.2.12 の `std/tables` では `withValue` が `Table` にのみ提供される。dirty page の挿入順は publish 時にキーをソートするため意味を持たず、dirty table を `Table` にして `withValue` スコープ内で resident `seq` を直接更新する（table の追加・削除をまたいで要素ポインタを保持しない）。
-- `heap_bytes` は canister status の `memory_size - raw_stable_bytes` に限る観測値で、ライブ heap の値ではない。churn runner も core runner と同じ順序で host stats の後に status を取得して記録する。
-- `-d:benchmarkProfile` は Overlay 統計を 1 トランザクションの `Overlay` ごとに持ち、VFS グローバルで `endOverlay` 時に累計へ `addFrom` して集計する（`initVfs` でリセット）。`vfs.nim` の `countTempBuffer` は direct I/O 後の hot path が中間 `seq[byte]` を生成しないこと（常に 0）を回帰の目安として残している。
-- clean page cache は update overlay の base read 専用（read-only query connection は overlay を経由しないため影響しない）で、A/B 実測（`results/clean-cache-ab-20260929T101911Z`）では 100 行 upsert × 20 反復でも dirty 化対象が 2 ページ止まりのため hits 0・差分なし。既定無効(0)を維持する。
-- read connection / statement cache は「キャッシュは必ず所有 connection と同じタイミングで無効化される」制約で実装済み・既定無効。`db.update` 開始時（`beginStableOperation`）に `cachedQueryRaw` と query statement cache をまとめて close/finalize する。
-- `GC_getStatistics`（設計 11.2 の Runtime 層）は Nim 2.2.12 / `--mm:orc` で参照可能だが、外部観測の `heap_bytes` と SQLite pager cache で原因分離が可能なため、通常ベンチマークの hot path へ計測負荷を入れない方針（「必要なら検証用ビルド」）を維持し、既定の計測には追加しない。
-
-### 追記: MemoryManager 互換（設計 9.2 方式B / 9.3 / Phase 6）
-
-- Rust `ic-sqlite-vfs` の `stable/memory_manager.rs` は `ic-stable-structures` 0.7 の `MGR` レイアウトを fork し、仮想 `MemoryId` 経由のバイトアドレス `Memory` を提供する。これを Nim 側で `src/ic_sqlite/stable/memory_manager.nim` に移植した。
-- 物理レイアウトは上流とバイト互換: page 0 の header 2080B（magic `MGR`, version 1, allocatedBuckets u16, bucketSizeInPages u16, reserved 32B, MemoryId ごとの size u64 ×255）と bucket allocation table 32768B（owner id, 255=空き）、page 1 以降が 1 bucket = `bucketSizeInPages * 64KiB`。
-- API: `initMemoryManager(backend)`（fresh / 全ゼロは新規作成、既存 `MGR` は検証ロード、それ以外の非空領域は上書きせず `ValueError`）、`newMemoryId(u8)`、`getMemory(id): VirtualStableBackend`、`growMemory`、`memorySizePages`。`VirtualStableBackend` は `StableBackend` を継承するため `Db.init` / `initDatabase` にそのまま渡せる。
-- ロード時検証は Rust の `memory_manager_validation` に合わせ、allocatedBuckets 上限・bucket size 非ゼロ・サイズの byte オーバーフロー・未割当 bucket の owner 不整合・MemoryId ごとの size と bucket 数の不一致・backing の truncation を拒否する。
-- wasi2ic 同居: `stableBackendAfterForeignManager(raw)` が先頭 `MGR` を検出して 1025 ページ（1 header + 8 MemoryId × 128 ページ）の後方へ offset する。SQLite 専有の MemoryManager は polyfill の allocation table を共有せず、後方の独立した `MGR` 領域を持つ。既存 `db.nim` の `sqliteStableBackend` はこの関数へ委譲し、exclusive 既定の挙動・既存 stable image を変更しない。
-- テスト `tests/test_memory_manager.nim`: fresh 画像のバイト配置、bucket 境界をまたぐ read/write、既存 `MGR` 画像のロードと MemoryId 7 との共存（SQLite の CRUD と再オープン永続化）、wasi2ic prefix 後方への配置、foreign/corrupt 拒否、境界・オーバーフロー・bucket 上限。
+- 分岐点から取り込み済みの実装を確認した。`bindStaticText` / `bindStaticBlob` と C shim の `SQLITE_STATIC` は存在するが、`executeTextTextBorrowed`・`updatedValueBuffer`・A1/A2 endpoint・`VirtualStableBackend` の BucketCache・`removeZeroPage`/`pageIsZero` の空 fast path は未実装だった。本書の PR-1/PR-0/PR-4/PR-2 を追加した。
+- `executeTextTextBorrowed` は `sqlite3_reset` → 長さ指定 `SQLITE_STATIC` 2 本 bind → `sqlite3_step`（`SQLITE_DONE` のみ成功）→ 常時 `sqlite3_clear_bindings` の順で、bind 失敗・step 失敗・constraint error・early return の全経路で binding を残さない。step 後に `code` を見る前に clear するため、戻り値の時点で参照元ポインタは要求しない。公開 `Statement.bind`（`SQLITE_TRANSIENT`）は変更しない。
+- A1 は「文字列生成はそのまま・bind のみ borrowed」、A2 は「固定長 `array` 入力＋borrowed」で、A0（既存 `bench_update_only`）と seed/SQL/transaction/report を一致させた。runner は `NISQL_COMPARE_NIM_UPDATE_ENDPOINT` で Nim 側 update endpoint（`bench_update_only` / `bench_update_only_borrowed_string` / `bench_update_only_borrowed`）を選択し、manifest に記録する。
+- Overlay `readInto` は入口の全域 `zeroMem` を廃止し、dirty page / base image で供給される範囲だけを書き込み、zero extent・base EOF・要求 EOF の不足分のみを明示的にゼロ化する。`vfs.readFile`（overlay なし）も logical EOF 以降だけをゼロ化し、persisted zero extent を重ねる。short-read の tail 全ゼロ契約は不変。
+- `removeZeroPage` / `pageIsZero` に `zeroExtents` 空の fast path を追加した。zero extent が空のトランザクションでは、dirty 化のたびに新しい `seq` を構築する経路を通らない。
+- `VirtualStableBackend` にインスタンス単位の 1-entry BucketCache を追加した。bucket 割当は既存 bucket を移動しないため grow 後も cache は無効化されない。`assertVirtualBounds` を先に行い、cache 内に完全に収まる場合のみ物理 base + relative へ直行する。MGR header / alloc table / byte image は変更しない。
+- PR-3 の small `seq` / hybrid dirty store と publish sort 省略は、`10.3 採用ゲート`（同一条件の unprofiled build で有意な削減、または明確な stable I/O 削減）を満たす実測が本環境で得られないため、既定 C0（`Table`）と sort ありを維持し、実装・既定変更を見送る。判断根拠は progress.mdc の実行記録に残す。
+- **実測による仮説の確認（2026-09-29）**: 同一 Wasm SHA・fresh canister ペア・100 rows×5 trials で A0=1,927,772、A1=1,675,310（−13.10%）、A2=1,446,843（−24.95%、Rust 1,484,474 比 **0.9747**）。Nim の update 命令数は 5/5 完全に同一で、`db_size` / `page_count` / `raw_stable_bytes` / `heap_bytes` は A0/A1/A2 で不変。§1 の「借用 bind が主因」という P1 仮説と §3.3 の A1/A2 分離方針が実測で裏付けられた。公開 `Statement.bind` は TRANSIENT のまま維持する。
+- **A2 の全体採用方針（追補）**: A2 の正体は「単一呼び出しで `reset`〜`bind`〜`step`〜`clear_bindings` を完結させる借用バインド」であり、公開 `bind` と `step` が別呼び出しの汎用 API に一律適用してはならない（§3.2/§12 の禁止どおり）。そこで、寿命契約を守れるスコープ限定 API へ一般化して採用する。`executeBorrowed(stmt, values: openArray[SqlValue])` は N 引数・TEXT/BLOB/INT/FLOAT/NULL を STATIC で bind し、`SQLITE_DONE` のみ成功、全経路で clear する。値は引数として呼び出し中有効であるため外部呼出元でも安全。one-call ヘルパー `execTextRaw` / `execValues` をこれへ移行した。query（step=ROW）系は行読み取り中の binding 寿命が別問題のため対象外とし、`queryOneText` は TRANSIENT を維持する。
+- **空 BLOB の不正バインドを発見・修正**: SQLite は `sqlite3_bind_blob(..., NULL, 0, ...)` で NULL を bind する（NOT NULL 制約が誤って発火）。空 `seq[byte]` は非 NULL ポインタ長さ 0 で bind するよう `bind` / `executeBorrowed` を修正し、回帰テストを追加した。汎用 `string` 入力での期待効果は A1 相当（約 −13%）で、A2 の追加分は呼出元が固定長バッファを直接渡せる場合に限られる。
+- **汎用スコープ API の実測（追補）**: `executeBorrowed(openArray[SqlValue])` を追加した新 Wasm `1a07c0e8…` で再計測。A0=1,927,772、A2=1,446,843（旧 Wasm と同値、汎用追加が既存経路に影響しないことを確認）、汎用=**1,808,512**（A0 比 −6.19%、Rust 比 1.2183）。行ごとの `SqlValue` 配列構築・`sqlText` コピー・パラメータ検査のため専用 A1（−13.1%）/A2（−25.0%）には届かないが、TRANSIENT よりは改善する。使い分け: N 引数・混在型は `executeBorrowed`、ホットな同型 TEXT ループは `executeTextTextBorrowed`。

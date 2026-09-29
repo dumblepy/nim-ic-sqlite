@@ -198,6 +198,18 @@ let changed = database.execValues(
   [sqlInt(0), sqlInt(1)])
 ```
 
+`execText` / `execValues` are scoped: the values given to the call are bound
+with `SQLITE_STATIC` and the bindings are cleared before the proc returns, so no
+borrowed pointer can escape the call. Prepared statements reused in a loop can
+use the same scoped binding through the internal `executeTextTextBorrowed`
+(exactly two TEXT parameters) and `executeBorrowed` (N typed parameters).
+Those require the source values to stay alive for the call and the statement to
+finish with `SQLITE_DONE`. The public `Statement.bind(SqlValue)` keeps using
+`SQLITE_TRANSIENT` for the separate bind-then-step pattern, so a caller may drop
+the value before `step`.
+
+An empty `seq[byte]` binds as a zero-length BLOB, not SQL `NULL`.
+
 `exec(sql)` is intended for trusted static SQL, such as schema migrations. Do
 not build its SQL string from user input.
 
@@ -399,6 +411,27 @@ nim c -r runner/validate.nim results/<run-id>
 
 `NISQL_COMPARE_NIM_SHA=HEAD` measures the currently checked-out Nim source.
 Omit it to reproduce a pinned SHA.
+
+The Nim update phase can select one of three equivalent mid-benchmark
+endpoints with `NISQL_COMPARE_NIM_UPDATE_ENDPOINT` so the borrowed bindings can
+be measured against each other on the same harness. All three run the same
+100-row `UPDATE bench SET value = ? WHERE key = ?` transaction and report the
+same checksum; only the per-row input formatting and binding differ:
+
+- `bench_update_only` (default): formatted `string` plus `SQLITE_TRANSIENT`.
+- `bench_update_only_borrowed_string`: formatted `string`, borrowed
+  `SQLITE_STATIC` bind.
+- `bench_update_only_borrowed`: fixed-length `array` inputs with the borrowed
+  `SQLITE_STATIC` bind.
+- `bench_update_only_borrowed_general`: the same workload through the general
+  scoped `executeBorrowed(openArray[SqlValue])` API.
+
+```bash
+NISQL_COMPARE_NIM_SHA=HEAD \
+NISQL_COMPARE_NIM_UPDATE_ENDPOINT=bench_update_only_borrowed ./runner/main 5
+```
+
+The chosen endpoint is recorded as `nim_update_endpoint` in `manifest.json`.
 
 To also record balance changes on an external network, set the network and the
 initial cycles per fresh canister explicitly. This creates, installs, and runs
