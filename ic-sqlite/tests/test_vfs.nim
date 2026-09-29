@@ -40,3 +40,37 @@ suite "VFS registry":
     var second = [byte 0, 0, 0, 0]
     discard randomBytes(addr second[0], 4)
     check first == second
+
+  test "short reads zero-fill the complete unread suffix and zero-byte I/O accepts nil":
+    let backend: StableBackend = newVecStableBackend()
+    check backend.grow(2)
+    initVfs(backend, dbSize = 2)
+    var id: uint32
+    var flags: cint
+    check openFile("/main.db", 0, id, flags) == SqliteOk
+    var persisted = [byte 4, 5]
+    backend.write(65536, addr persisted[0], 2)
+    var output = [byte 99, 99, 99, 99]
+    check readFile(id, addr output[0], 4, 1) == SqliteIoErrShortRead
+    check output == [byte 5, 0, 0, 0]
+    check readFile(id, nil, 0, 0) == SqliteOk
+    check writeFile(id, nil, 0, 0) == SqliteReadOnly
+
+  test "main DB direct I/O handles page boundaries and multiple pages":
+    let backend: StableBackend = newVecStableBackend()
+    check backend.grow(3)
+    initVfs(backend)
+    var id: uint32
+    var flags: cint
+    check openFile("/main.db", 0, id, flags) == SqliteOk
+    beginOverlay(pageSize = 16)
+    var input = newSeq[byte](48)
+    for index in 0 ..< input.len: input[index] = byte(index + 1)
+    check writeFile(id, addr input[0], cint(input.len), 0) == SqliteOk
+    var output = newSeq[byte](48)
+    check readFile(id, addr output[0], cint(output.len), 0) == SqliteOk
+    check output == input
+    endOverlay(publish = true)
+    output = newSeq[byte](48)
+    check readFile(id, addr output[0], cint(output.len), 0) == SqliteOk
+    check output == input

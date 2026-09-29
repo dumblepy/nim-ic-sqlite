@@ -1,6 +1,10 @@
 import std/unittest
 import ../shared/bench_spec
 
+proc asString(buffer: openArray[char]): string =
+  result = newString(buffer.len)
+  for index, value in buffer: result[index] = value
+
 suite "comparison benchmark fixtures":
   test "Rust fixed-width key boundary fixtures match":
     check benchKey(0) == "k00000000"
@@ -15,6 +19,11 @@ suite "comparison benchmark fixtures":
     check updatedValue(42) == "updated-00000042-stable-vfs"
     check growthValue(42) == "growth-00000042-stable-vfs"
     check writeValue(42) == "write-00000042"
+
+  test "fixed buffers exactly match the established workload strings":
+    for index in [0'u32, 42'u32, 99_999_999'u32]:
+      check asString(benchKeyBuffer(index)) == benchKey(index)
+      check asString(benchValueBuffer(index)) == benchValue(index)
 
   test "key limits prevent eight-digit truncation":
     check validateFixedBenchKeyRows(100_000_000)

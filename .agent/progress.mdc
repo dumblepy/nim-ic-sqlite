@@ -1,197 +1,117 @@
-# 進捗管理
+# 9-update-vsf 自律実装進捗
 
-このファイルはタスク実装時の自律ループの完了条件と作業記録を管理する。
+対象ブランチ: `9-update-vsf`
+基準設計: `.agent/rules/branch/9-update-vsf.mdc`
+更新日: 2026-09-29
 
-対象ブランチ: `7-cost-performance-test`
+## 最終ゴール
 
-設計・固定 Rust SHA・Candid 契約は `.agent/rules/branch/7-cost-performance-test.mdc` を正とする。
+次をすべて満たすまで本ブランチの実装を完了扱いにしない。
 
-## プロジェクト全体の完成条件（GOAL-001）
+- main DB と temp file の VFS hot path から I/O ごとの中間 `seq[byte]` 確保・コピーを除去する。
+- dirty page を in-place で更新し、同一ページへの反復書き込みで不要な 16 KiB 再確保をしない。
+- EOF、truncate、sparse extend、COMMIT、ROLLBACK、upgrade でデータ保全・SQLite VFS 契約を維持する。
+- 比較ベンチマークが再現可能で、`raw_stable_bytes` と `heap_bytes` を区別して保存・説明できる。
+- 公開 API、stable image format、既定設定を壊さず、キャッシュ／接続再利用を実測なしに既定有効化しない。
 
-完了条件:
-- `cd /application/ic-sqlite && ./scripts/test.sh` が終了コード 0 で完了する。
-- 手動 paired 測定で両 Wasm の build、fresh core-KV trial、結果検証を完了できる。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T174316Z` が終了コード 0 で完了する。
-- profile/capacity の共通比較指標を含む artifact を Nim/Rust の両方から生成し、欠測を機械検証できる。
-- 管理 status 残高と料金推計の照合条件を、ローカル replica の会計値と区別して artifact に記録する。
+## 作業ループ
 
-## タスク別完了条件
+未完了の最上位タスクを依存順に一つ選び、以下を繰り返す。
 
-各タスクの完了条件はこのセクションに集約する。以下の形式で機械的に検証可能な条件を列挙すること。
+1. 関連実装・既存テスト・設計上の不変条件を読み、変更範囲と回帰リスクを記録する。
+2. 最小のまとまりで実装し、公開 API と stable image format を変更しない。
+3. 該当する unit/native test を追加または更新して実行する。失敗時は原因を直し、未解決なら「阻害事項」に再現手順とともに残す。
+4. 各まとまりの完了条件を満たした証跡（実行コマンド、結果、未実行理由）を「実行記録」に追記してからチェックする。
+5. 依存する全タスクと回帰ゲートが通るまで次段階へ進まない。計測値は測定せずに推測で記入しない。
 
-### P1: profile と容量再利用の比較指標
+設計との相違または新たな事実が判明した場合は、`.agent/rules/branch/9-update-vsf.mdc` の「調査結果・設計まとめ」に根拠とともに追記し、このファイルの該当タスクを更新する。
 
-完了条件:
-- `cd /application/ic-sqlite/benchmarks/comparison/nim_canister/backend && nicp developmentBuild` が終了コード 0 で完了する。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_canister_integration.nim` が終了コード 0 で完了し、read/write/get-many/growth profile と capacity guard の checksum、stable I/O 観測、profile 後の通常 query、upgrade を検証する。
-- profile endpoint は通常の比較 endpoint と別の counting backend を使い、通常 workload の命令数へ計測分岐を混入させないことを統合試験で確認する。
-- [x] Nim/Rust の profile artifact に、少なくとも `rows`、`instructions`、`checksum`、`db_size`、`stable_pages`、`stable_bytes`、raw stable memory を同じ単位で保存する。
+## 実装バックログと完了ゲート
 
-### P4: 観測・費用照合
+### 0. 現状固定・回帰基盤
 
-完了条件:
-- `NISQL_COMPARE_NIM_SHA=HEAD nim c -r benchmarks/comparison/runner/main.nim 1` が終了コード 0 で完了し、生成 manifest に各 phase 前後の `cycles` / `reserved_cycles` と heap 観測が含まれる。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_transport.nim` が終了コード 0 で完了し、management status の数値復号を検証する。
-- 費用 report は local status の残高差を命令実行費用として扱わないことを artifact の notes と summary で検証する。
+- [ ] 現在の `ic-sqlite` HEAD、dirty-tree 状態、Nim/Rust 比較 SHA、ツールチェーン、SQLite compile flags、ページサイズ、cache size を manifest に記録する。
+- [ ] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。
+- [ ] EOF、0-byte I/O、負値／オーバーフロー／nil pointer の扱いを現行 VFS と SQLite callback 境界で調査し、テスト可能な期待結果を確定する。
+- [x] 既存 `test_vfs.nim` / `test_overlay.nim` を拡張し、short-read tail 全ゼロ、境界・複数ページ・overlapping write の回帰を追加する。
+- [x] failure atomicity、zero extent persistence、cross upgrade、memory region の既存比較テストを実行対象として確認する。
 
-### P5: 結果検証
+完了条件: baseline の実行可否・既知失敗・比較条件が証跡付きで固定され、以後の最適化を判定できる。
 
-完了条件:
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/tests/test_result_validation.nim` が終了コード 0 で完了する。
-- `cd /application/ic-sqlite && nim c -r benchmarks/comparison/runner/validate.nim benchmarks/comparison/results/20260928T174316Z` が終了コード 0 で完了する。
-- `.github/workflows/ci.yml` に comparison regression job が存在せず、通常 CI は native/canister test のみを実行する。
+### 1. VFS / temp file の直接 I/O
 
-条件は「コードを見て正しそう」ではなく、**テスト・lint・typecheck・curl・Playwright 等の実行可能な検証**で機械的に判定できるものとする。
+- [x] `overlay.nim` に内部 `readInto` / `writeFrom` を追加し、C callback の `dst` / `src` を呼び出し中だけ直接利用する。
+- [x] `temp_file.nim` に同等の直接 I/O API を追加する。既存 `readAt` / `writeAt` は互換ラッパーとして残す。
+- [x] `vfs.nim` の main DB read path を、出力先ゼロ初期化、読める範囲だけ stable backend から直接読み込み、persisted zero extent の再ゼロ化へ変更する。
+- [x] `vfs.nim` の temp/main DB write path を `src` から直接書き込み、per-call の一時 `seq[byte]` を除去する。
+- [x] short-read 判定をオーバーフローなしで行い、EOF 超過時は全 tail をゼロ化して `SQLITE_IOERR_SHORT_READ` を返す。
+- [x] 0-byte、nil、負値、変換範囲外の引数で境界外参照・例外伝播がないことを確認する。
+- [x] ページ境界・複数ページ I/O を native safety test で通す。大きな BLOB の SQLite 統合試験は全体回帰ゲートで継続確認する。
 
-## 実装ループ
+完了条件: VFS hot path に I/O ごとの中間 `seq[byte]` がなく、short-read と既存 read-only 動作を維持し、プロファイル用カウンタで一時確保減少を確認できる。
 
-以下のループを、完了条件をすべて満たすまで自律的に繰り返すこと。
+### 2. Overlay の in-place 更新
 
-1. 現在のコードとエラーを調査する
-2. 原因を仮説化する
-3. 最小限の変更を実装する
-4. テスト・lint・typecheck・必要な実行確認を行う
-5. 失敗した場合はログを分析する
-6. 仮説を修正して再実装する
-7. 全完了条件を再検証する
+- [x] dirty page の取得／生成 API を実装し、既存 page は resident buffer へ直接書き込み、テーブルへの再代入を避ける。
+- [x] 新規 full-page overwrite は base stable read なしで一度だけ 16 KiB を確保し、入力から直接コピーする。
+- [x] partial write は必要時だけ base/dirty 内容を一度読み込んで更新する。
+- [x] table rehash をまたいで内部要素へのポインタを保持しない実装にする。
+- [x] `maxDirtyPages` / `maxDirtyBytes` を新規 dirty page の前に検査し、既存 page 上書きで増加させない。
+- [x] dirty 化・truncate・extend と zero extent の重複除去／整合を維持する。
+- [x] publish 時に dirty page を深くコピーせず読み出し、publish 中の table 変更を避ける。
+- [ ] rollback / discard 後に dirty page が残らないことを統計・テストで確認する。
 
-テストが失敗した状態で作業を終了しないこと。
-一部だけ成功しても終了しないこと。
-同じ方法に固執せず、失敗した仮説は捨てて別の方法を試すこと。
+完了条件: 同一 dirty page の反復更新は resident page 確保一回、full-page overwrite の stable read はゼロ、上限・publish・rollback 回帰が通る。
 
-## 自律判断基準
+### 3. EOF・truncate・sparse extend の意味論
 
-ユーザーへの確認が不要な、可逆的なコード変更・調査・テスト・リファクタリングは自律的に進めてよい。
+- [x] `readInto` を論理 EOF で制限し、`validLen` 外をゼロに保ち、完全に読めた場合だけ成功にする。
+- [x] 縮小時、部分ページの保持範囲外をゼロ化し、完全に範囲外の page を zero extent として記録する。
+- [x] 縮小で範囲外になった dirty / clean page を破棄する（clean cache は初期無効）。
+- [x] 拡張・間隔を空けた write で旧 EOF 以降を zero extent として扱い、古い tail を再露出させない。
+- [x] truncate → re-extend、1 byte truncate → gap write の回帰を追加し通す。複数回 truncate は既存比較回帰で継続確認する。
+- [ ] publish 前失敗は overlay を破棄でき、publish 開始後失敗は通常エラーにせず既存 trap/atomicity 経路を維持する。
 
-以下の場合だけ停止して質問すること:
-- 秘密情報や認証情報が必要
-- 外部サービスへの不可逆な操作が必要
-- 仕様上、複数の選択肢がありコードから判断不能
-- 同一の根本原因について複数の異なるアプローチを試しても進展がない
+完了条件: EOF、truncate、sparse extend、COMMIT／ROLLBACK／failure atomicity／upgrade の native・canister 回帰で内容保全を確認する。
 
-## 作業記録
+### 4. 計測と比較ワークロード
 
-長時間作業になる場合はこのセクションを維持すること。
+- [ ] `-d:benchmarkProfile` 等で通常経路と分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
+- [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
+- [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
+- [ ] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。
+- [ ] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。
+- [ ] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。
 
-各反復ごとに:
-- 現在の問題
-- 試したこと
-- 結果
-- 否定された仮説
-- 次に試すこと
+完了条件: baseline と各変更後を再現可能に比較でき、logical DB size・page count・checksum と `raw_stable_bytes` / `heap_bytes` を混同せず説明できる。
 
-を短く更新する。
+### 5. 任意最適化の採否
 
-### 2026-09-28: profile endpoint の拡張
+- [ ] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。dirty 化時の所有権移動・invalidate 条件をテストする。
+- [ ] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。
+- [ ] 命令数または stable read の有意な改善と常駐 heap のトレードオフを記録し、採用・不採用を決定する。
 
-- 現在の問題: Rust の詳細 profile と Nim の固定オフセット VFS を、存在しない page-table 指標で比較してはいけない。
-- 試したこと: Nim 固有 read/growth/write/get-many profile と capacity guard を追加し、直接観測できる命令区間と stable backend I/O のみを返した。
-- 結果: read/growth/write/get-many profile と capacity guard は実 Canister 統合試験で成功。
-- 否定された仮説: Rust の page-table 固有 record へ Nim 側の推測値を入れれば比較できるという仮説。
-- 次に試すこと: P1/P4/P5 の完了条件を再確認し、未達の外部Cycles照合を除く測定基盤を完了する。
+完了条件: 実測根拠なしに既定有効化しない。採用時は lifecycle・上限・無効化条件と測定証跡がそろう。
 
-### 2026-09-28: profile validator の単体試験
+## 最終受け入れ確認
 
-- 現在の問題: profile validator の完全性・欠測検出を実artifactだけでしか確認していなかった。
-- 試したこと: Nim/Rust × 4 profile のfixture、共通field欠落、run kind判定の単体試験を追加した。
-- 結果: `test_result_validation.nim` のprofileを含む12ケースが成功した。
-- 否定された仮説: core/churn の検証だけでprofile artifactの欠測も検出できるという仮説。
-- 次に試すこと: P1/P4/P5 の完了条件を再確認する。
+- [ ] 全必須タスク（0〜4）と該当する既存回帰が通る。
+- [ ] main DB / temp file I/O に不要な per-call `seq` がない。
+- [ ] 同一 dirty page の不要な 16 KiB 再確保がない。
+- [ ] stable image format、superblock、公開 API、SQLite VFS/atomicity 契約を維持する。
+- [ ] 計測 manifest と結果があり、性能改善がない場合も allocation/VFS read/SQLite cache の差を説明できる。
+- [ ] 任意最適化は測定済みの採否判断または明示的な非採用理由を記録している。
 
-### 2026-09-28: P4 fresh paired trial
+## 実行記録
 
-- 現在の問題: phase 前後の heap/Cycles 観測を、profile追加後のrunnerでも確認する必要があった。
-- 試したこと: `NISQL_COMPARE_NIM_SHA=HEAD nim c -r benchmarks/comparison/runner/main.nim 1` を実行した。
-- 結果: `results/20260928T174316Z/` を生成。manifestにbaseline 1件と phase前後Cycles観測6件を保存し、validatorも成功した。
-- 否定された仮説: profile endpoint追加がcore paired runnerのartifact形式へ影響しないことを実行なしで保証できるという仮説。
-- 次に試すこと: P1/P4/P5の残る外部Cycles照合以外の条件を総合テストで確認する。
+| 日時 (UTC) | 範囲 | コマンド／証跡 | 結果 |
+|---|---|---|---|
+| 2026-09-29 | 初期化 | branch rule を読了。`git status --short` で既存の `.agent/progress.mdc` 変更と未追跡の branch rule を確認。 | 未着手。ベースライン・テスト・計測は未実行。 |
+| 2026-09-29 | VFS / overlay | `nim c -r tests/test_temp_file.nim`、`nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim` | すべて成功。direct I/O、short-read tail のゼロ化、full-page overwrite の stable read 0 回、truncate 後 sparse extend を確認。`./scripts/test.sh` は Testament 実行中であり、完走結果は未記録。 |
+| 2026-09-29 | VFS / overlay 追加回帰 | `nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim`、`nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | すべて成功。複数ページ I/O、overlapping write、dirty-page 上限、公開 DB API の回帰を確認。 |
+| 2026-09-29 | 比較計測 | `nim c benchmarks/comparison/runner/churn.nim`、`nim c -r benchmarks/comparison/tests/test_storage_stats.nim`、`nim c -r benchmarks/comparison/tests/test_result_validation.nim`、`nim c -r benchmarks/comparison/tests/test_keys.nim` | すべて成功。churn の `heap_bytes` 記録と固定長 key/value generator のバイト列互換を確認。実 canister の5組比較は未測定。 |
+| 2026-09-29 | 既存比較回帰 | `nim c -r benchmarks/comparison/tests/test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_memory_region.nim` | 3件成功。`test_cross_upgrade.nim` は local ICP network 起動まで確認し、非同期実行の終了コードをこのセッションで取得できなかったため完走未確認。 |
 
-### 2026-09-28: profile artifact の検証と summary
+## 阻害事項
 
-- 現在の問題: profile run は `profile_measurements.jsonl` を使うが、既存 validator は `measurements.jsonl` 固定だった。
-- 試したこと: validator に profile artifact の自動選択・Nim/Rust × 4 profile の完全性検証を追加し、`profile_summary.nim` を実装した。
-- 結果: `profile-20260928T115537Z` の8測定を検証し、read/write/get-many/growth の instruction 比を `profile_summary.md` に出力した。
-- 否定された仮説: core/churn 用 validator を profile artifact にそのまま適用できるという仮説。
-- 次に試すこと: profile summary を README の手順へ追記し、P1/P4/P5 の完了条件を再確認する。
-
-### 2026-09-28: profile artifact runner
-
-- 現在の問題: profile の共通 field を両実装で同じ artifact に残せていなかった。
-- 試したこと: fresh Canister へ read/write/get-many/growth profile を呼び出す `runner/profile.nim` を追加した。
-- 結果: `results/profile-20260928T115537Z/profile_measurements.jsonl` に Nim/Rust × 4 profile の8行を保存し、全行で共通 field の存在を確認した。
-- 否定された仮説: Rust の詳細 VFS/page-table カウンタを Nim の比較 field として扱えるという仮説。
-- 次に試すこと: profile artifact を検証する validator と summary を追加する。
-
-### 2026-09-28: P4/P5 基盤
-
-- 現在の問題: local status の cycles 残高差を DB 実行命令費用と混同しない必要がある。
-- 試したこと: runner が各 phase 前後の `cycles` / `reserved_cycles` と heap 観測を manifest に保存するようにした。結果検証を追加し、比較測定は手動実行へ移した。
-- 結果: fresh 1 trial `results/20260928T073944Z/` に全6 status 観測を保存。core/churn validator は実装済みで、比較手順は README に記録した。
-- 否定された仮説: local replica の残高差だけで mainnet の命令実行費用を照合できるという仮説。
-- 次に試すこと: profile artifact runner を追加後、P1/P4/P5 の完了条件を順に再実行する。
-
-### 2026-09-28: 総合テストの再検証
-
-- 現在の問題: profile artifact のvalidator追加後も、通常ライブラリと比較基盤を通した全体テストが成立する必要がある。
-- 試したこと: `cd /application/ic-sqlite && ./scripts/test.sh` を実行した。
-- 結果: 終了コード 0。通常テスト16件と、fixture、report、storage、rollback、zero extent、MGR、cost model、result validation、profile reportの比較テストがすべて成功した。
-- 否定された仮説: profile validatorの追加で既存の比較基盤または通常ライブラリのテストが壊れるという仮説。
-- 次に試すこと: Canister build・統合試験・既存artifact検証を再実行し、P1/P4/P5の機械検証を確定する。
-
-### 2026-09-28: 現在の artifact を完了条件へ固定
-
-- 現在の問題: 進捗条件が削除済みの `20260928T020140Z` artifact を指し、機械検証が実行不能だった。
-- 試したこと: results 配下を確認し、manifest と measurements が揃う fresh paired run を特定した。
-- 結果: `20260928T174316Z` が現存する完全な paired core artifact であることを確認し、完了条件の対象を更新した。
-- 否定された仮説: 過去run IDを進捗条件に固定しても、artifact保持設定に依存せず検証できるという仮説。
-- 次に試すこと: 現存 paired/profile artifact と Canister統合試験の終了結果を検証する。
-
-### 2026-09-28: P4/P5 artifact の再検証
-
-- 現在の問題: current paired run と profile run が、validator の入力自動選択後も機械検証できる必要がある。
-- 試したこと: paired `20260928T174316Z` と profile `profile-20260928T115537Z` に validator を実行し、profile summary も再生成した。さらに `test_transport.nim` と CI workflow の比較job不在検査を実行した。
-- 結果: 両artifactのvalidator、profile summary、management status復号テスト、CI workflow検査が成功した。
-- 否定された仮説: profile artifact の追加により core artifact のvalidator選択またはCI対象が壊れるという仮説。
-- 次に試すこと: 外部環境でのCycles実行費用照合を除く完了条件は満たした状態として、手動測定手順を維持する。
-
-### 2026-09-28: P4 manifest 会計観測の検証
-
-- 現在の問題: local status のCycles残高をmanifestへ保存するだけでは、観測の欠落や費用指標との混同を機械的に防げない。
-- 試したこと: core validatorにtrial・実装・phaseごとのCycles/reserved Cycles観測、測定trialとの対応、費用非同一性を示すnotesの検証を追加した。費用reportにもlocal status残高を除外する旨を出力した。
-- 結果: 正常artifactを受理し、会計分類注記のないfixtureを拒否するテストが成功した。
-- 否定された仮説: JSON manifestへ値を保存するだけで、費用推計との分類を保証できるという仮説。
-- 次に試すこと: 外部環境でのCycles実行費用照合を除く測定基盤を維持する。
-
-### 2026-09-28: P4変更後の総合テスト
-
-- 現在の問題: manifest検証の追加が通常ライブラリ、比較fixture、既存artifactの検証を壊していないことを確認する必要がある。
-- 試したこと: `cd /application/ic-sqlite && ./scripts/test.sh` と、現存paired artifactに対するvalidatorを実行した。
-- 結果: 総合テストは終了コード 0。通常テスト16件と全comparison testが成功し、`20260928T174316Z` artifactもmanifestを含めて検証できた。
-- 否定された仮説: manifestのCycles観測検証は既存のcore artifactと互換にならないという仮説。
-- 次に試すこと: 認証情報・Cyclesを伴う外部環境照合が可能になった場合、手動測定手順で実料金との照合を実施する。
-
-### 2026-09-28: 外部network対応のローカル回帰
-
-- 現在の問題: `NISQL_COMPARE_NETWORK` 未指定時も従来どおりlocal networkで実行できる必要がある。
-- 試したこと: fresh paired trialを実行した。
-- 結果: 初回はCanister作成時にlocal networkが停止して失敗した。
-- 否定された仮説: `if` ブロック内の `defer` がmain終了時までnetwork停止を遅延するという仮説。Nimではブロック終了時に実行された。
-- 次に試すこと: 外部環境の認証情報とCyclesが利用可能になった場合に、同じrunnerで実費照合を実施する。
-
-### 2026-09-28: external network runner の実装
-
-- 現在の問題: external networkで残高観測を行うには、local networkの開始・停止をせず、全 `icp` 操作へ同じnetworkと初期Cyclesを渡す必要がある。
-- 試したこと: `NISQL_COMPARE_NETWORK` と `NISQL_COMPARE_INITIAL_CYCLES` をtransport・paired runnerへ追加し、external artifactをvalidatorが受理する試験を追加した。local modeでfresh paired trialを再実行した。
-- 結果: transportとvalidatorの単体試験が成功。local trial `20260928T182157Z` が6件のCycles/reserved Cycles観測を保存し、manifestを含めvalidatorに合格した。
-- 否定された仮説: network指定をtransportの一部の操作だけへ付与すれば外部測定を一貫して実行できるという仮説。
-- 次に試すこと: external networkでCanister作成・installを実行できる認証情報とCyclesが提供された場合、READMEの手順で1 trialを実測する。
-
-コンテキストが圧縮された場合でも、`progress.mdc` と git diff とテスト結果を確認して作業を継続する。
-
-## 完了報告
-
-完了時には以下を報告すること:
-- 変更内容
-- 原因
-- 実行した検証
-- 各完了条件の結果
+なし。テストや比較環境の不足が判明した場合は、推測で完了にせず、再現コマンド・必要な依存関係・影響範囲をここに記録する。

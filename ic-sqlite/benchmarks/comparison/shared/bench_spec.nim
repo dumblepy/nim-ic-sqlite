@@ -38,6 +38,33 @@ proc updatedValue*(index: uint32): string = "updated-" & fixedIndex(index) & "-s
 proc growthValue*(index: uint32): string = "growth-" & fixedIndex(index) & "-stable-vfs"
 proc writeValue*(index: uint32): string = "write-" & fixedIndex(index)
 
+proc fixedIndexInto(index: uint32; dst: var array[8, char]) =
+  if not validateFixedBenchKeyIndex(index):
+    raise newException(ValueError, "benchmark key index must be less than 100000000")
+  var value = index
+  for position in countdown(7, 0):
+    dst[position] = char(ord('0') + int(value mod 10))
+    value = value div 10
+
+proc benchKeyBuffer*(index: uint32): array[9, char] =
+  ## Allocation-free counterpart of `benchKey`; intended for core/VFS probes.
+  result[0] = 'k'
+  var digits: array[8, char]
+  fixedIndexInto(index, digits)
+  for position in 0 ..< digits.len: result[position + 1] = digits[position]
+
+proc benchValueBuffer*(index: uint32): array[25, char] =
+  ## Allocation-free counterpart of `benchValue`; this is deliberately an
+  ## internal benchmark input, not a public SQLite binding API.
+  const Prefix = "value-"
+  const Suffix = "-stable-vfs"
+  for position in 0 ..< Prefix.len: result[position] = Prefix[position]
+  var digits: array[8, char]
+  fixedIndexInto(index, digits)
+  for position in 0 ..< digits.len: result[Prefix.len + position] = digits[position]
+  for position in 0 ..< Suffix.len:
+    result[Prefix.len + digits.len + position] = Suffix[position]
+
 proc churnDeleteRange*(cycle: uint32): tuple[start, count: uint32] =
   if cycle >= 100'u32:
     raise newException(ValueError, "churn cycle must be less than 100")

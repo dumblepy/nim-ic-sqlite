@@ -31,17 +31,19 @@ var configuredMaxDirtyBytes = high(uint64)
 var persistedZeroExtents: seq[ZeroExtent]
 var persistedZeroExtentPageSize = 16_384'u64
 
-proc zeroPersistedRange(bytes: var seq[byte]; offset: uint64) =
+proc zeroPersistedRange(dst: pointer; length, offset: uint64) =
   ## Query connections read without an active overlay. Apply the logical
   ## truncation map before returning bytes from the stable backing store.
-  let endOffset = offset + uint64(bytes.len)
+  if length == 0: return
+  let endOffset = offset + length
+  let target = cast[ptr UncheckedArray[byte]](dst)
   for extent in persistedZeroExtents:
     let zeroStart = extent.startPage * persistedZeroExtentPageSize
     let zeroEnd = extent.endPage * persistedZeroExtentPageSize
     let start = max(offset, zeroStart)
     let finish = min(endOffset, zeroEnd)
     if start < finish:
-      for index in int(start - offset) ..< int(finish - offset): bytes[index] = 0
+      zeroMem(addr target[int(start - offset)], int(finish - start))
 
 when defined(wasm32):
   proc ic0TimeNanoseconds(): uint64 {.importc: "ic0_time", cdecl, header: "ic0.h".}
@@ -89,32 +91,32 @@ proc stateFor(handleId: uint32): FileState =
   if not files.hasKey(handleId): raise newException(ValueError, "unknown VFS handle")
   files[handleId]
 proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cint =
-  if dst.isNil or amount < 0 or offset < 0: return SqliteIoErrRead
+  if amount < 0 or offset < 0 or (amount > 0 and dst.isNil): return SqliteIoErrRead
   try:
     let state = stateFor(handleId); let size = int(amount)
-    var bytes: seq[byte]
     var short = false
     if state.kind == fkTemp:
-      short = int(offset) + size > state.temp.len; bytes = state.temp.readAt(int(offset), size)
+      if offset > int64(high(int)): return SqliteIoErrRead
+      short = not state.temp.readInto(int(offset), dst, size)
     elif overlayActive:
-      short = uint64(offset) + uint64(size) > activeOverlay.size
-      bytes = activeOverlay.readAt(storage, uint64(offset), uint64(size))
+      short = not activeOverlay.readInto(storage, uint64(offset), dst, uint64(size))
     else:
-      bytes = newSeq[byte](size); short = uint64(offset) + uint64(size) > databaseSize
+      if size > 0: zeroMem(dst, size)
+      short = uint64(offset) >= databaseSize or uint64(size) > databaseSize - uint64(offset)
       let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
-      if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), addr bytes[0], readable)
-      bytes.zeroPersistedRange(uint64(offset))
-    if size > 0: copyMem(dst, addr bytes[0], size)
+      if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), dst, readable)
+      zeroPersistedRange(dst, uint64(size), uint64(offset))
     if short: SqliteIoErrShortRead else: SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErrRead
 proc writeFile*(handleId: uint32; src: pointer; amount: cint; offset: int64): cint =
-  if src.isNil or amount < 0 or offset < 0: return SqliteIoErrWrite
+  if amount < 0 or offset < 0 or (amount > 0 and src.isNil): return SqliteIoErrWrite
   try:
-    let state = stateFor(handleId); let size = int(amount); var bytes = newSeq[byte](size)
-    if size > 0: copyMem(addr bytes[0], src, size)
-    if state.kind == fkTemp: state.temp.writeAt(int(offset), bytes)
+    let state = stateFor(handleId); let size = int(amount)
+    if state.kind == fkTemp:
+      if offset > int64(high(int)): return SqliteIoErrWrite
+      state.temp.writeFrom(int(offset), src, size)
     elif not overlayActive: return SqliteReadOnly
-    else: activeOverlay.writeAt(storage, uint64(offset), bytes)
+    else: activeOverlay.writeFrom(storage, uint64(offset), src, uint64(size))
     SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErrWrite
 proc truncateFile*(handleId: uint32; size: int64): cint =
