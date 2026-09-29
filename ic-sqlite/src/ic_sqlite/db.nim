@@ -3,6 +3,7 @@ import std/[options, tables]
 import ./ffi/sqlite_api
 import ./ffi/vfs_exports
 import ./stable/[backend, superblock]
+import ./stable/memory_manager
 import ./vfs/vfs
 import ./vfs/overlay
 import ./value
@@ -97,8 +98,6 @@ type
     sql*: string
   IcSqliteDb* = Db
 
-const Wasi2icReservedStablePages = 1025'u64
-
 proc defaultDbConfig*(): DbConfig =
   ## `cleanCachePages` stays 0 by default: the optional clean page cache is an
   ## experiment and must not change resident memory without explicit opt-in.
@@ -187,17 +186,12 @@ proc clearStatementCache(db: var Db) =
   db.statementCacheStats = StatementCacheStats()
 
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
-  ## wasi2ic reserves stable memory under the MGR+version header. Preserve that
-  ## region and give SQLite a logical page-aligned region after it.
-  if backend.sizePages == 0: return backend
-  var magic: array[4, byte]
-  try:
-    backend.read(0, addr magic[0], uint64(magic.len))
-    if magic[0 .. 2] == [byte('M'), byte('G'), byte('R')]:
-      return newOffsetStableBackend(backend, Wasi2icReservedStablePages * StablePageSize)
-  except CatchableError:
-    discard
-  backend
+  ## When the process boots through wasi2ic, the WASI polyfill owns a fixed
+  ## `MGR` prefix.  Preserve that region and give SQLite a logical page-aligned
+  ## view after it.  Applications that instead drive a SQLite-owned
+  ## `MemoryManager` should pass `manager.getMemory(id)` here, whose offset 0
+  ## is not `MGR` and is therefore used verbatim.
+  stableBackendAfterForeignManager(backend)
 
 proc sqliteError(raw: ptr Sqlite3; code: cint): DbError =
   DbError(code: code, message: if raw.isNil: "SQLite open failed" else: $sqlite3_errmsg(raw))

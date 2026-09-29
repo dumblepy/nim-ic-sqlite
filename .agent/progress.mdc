@@ -1,8 +1,10 @@
-# 9-update-vsf 自律実装進捗
+# 11-update-memory-management 自律実装進捗
 
-対象ブランチ: `9-update-vsf`
-基準設計: `.agent/rules/branch/9-update-vsf.mdc`
+対象ブランチ: `11-update-memory-management`
+基準設計: `.agent/rules/branch/11-update-memory-management.mdc`
 更新日: 2026-09-29
+
+> 分岐点 `b236b5c` は `9-update-vsf`（PR #10）のマージコミットであり、本設計書（設計 A〜F）の必須実装はすでに同一リポジトリへ取り込まれている。本ブランチでは設計の再実装ではなく、`9-update-vsf` で完了した実装が本設計の不変条件・完了条件（14 節 DoD）を満たすことを検証し、その証跡を固定する。
 
 ## 最終ゴール
 
@@ -24,21 +26,21 @@
 4. 各まとまりの完了条件を満たした証跡（実行コマンド、結果、未実行理由）を「実行記録」に追記してからチェックする。
 5. 依存する全タスクと回帰ゲートが通るまで次段階へ進まない。計測値は測定せずに推測で記入しない。
 
-設計との相違または新たな事実が判明した場合は、`.agent/rules/branch/9-update-vsf.mdc` の「調査結果・設計まとめ」に根拠とともに追記し、このファイルの該当タスクを更新する。
+設計との相違または新たな事実が判明した場合は、`.agent/rules/branch/11-update-memory-management.mdc` の「調査結果・設計まとめ」に根拠とともに追記し、このファイルの該当タスクを更新する。
 
 ## 実装バックログと完了ゲート
 
-### 0. 現状固定・回帰基盤
+### 0. 現状固定・回帰基盤（`9-update-vsf` で完了・branch 11 で検証）
 
 - [x] 現在の `ic-sqlite` HEAD、dirty-tree 状態、Nim/Rust 比較 SHA、ツールチェーン、SQLite compile flags、ページサイズ、cache size を manifest に記録する。comparison runner が各 run で `nim_source_sha` / `nim_source_dirty` / `nim_wasm_sha256` / Rust pinned SHA・Wasm hash・ツールチェーンを `manifest.json` に書いていることを確認。
-- [x] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。変更前 HEAD(`bd5763b` 系)でも 16/16 PASS・exit 0（`/tmp/test_sh_run1.log`）。本ブランチの変更後は 17→18/18 PASS・exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。
+- [x] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。変更前 HEAD(`bd5763b` 系)でも 16/16 PASS・exit 0（`/tmp/test_sh_run1.log`）。
 - [x] EOF、0-byte I/O、負値／オーバーフロー／nil pointer の扱いを現行 VFS と SQLite callback 境界で調査し、テスト可能な期待結果を確定する。`test_vfs.nim`（short-read tail 全ゼロ、0-byte nil 許容、unsigned 範囲超は `SQLITE_IOERR`）と `test_overlay.nim` の direct I/O 境界値で固定済み。
 - [x] 既存 `test_vfs.nim` / `test_overlay.nim` を拡張し、short-read tail 全ゼロ、境界・複数ページ・overlapping write の回帰を追加する。
 - [x] failure atomicity、zero extent persistence、cross upgrade、memory region の既存比較テストを実行対象として確認する。
 
 完了条件: baseline の実行可否・既知失敗・比較条件が証跡付きで固定され、以後の最適化を判定できる。
 
-### 1. VFS / temp file の直接 I/O
+### 1. VFS / temp file の直接 I/O（`9-update-vsf` で完了）
 
 - [x] `overlay.nim` に内部 `readInto` / `writeFrom` を追加し、C callback の `dst` / `src` を呼び出し中だけ直接利用する。
 - [x] `temp_file.nim` に同等の直接 I/O API を追加する。既存 `readAt` / `writeAt` は互換ラッパーとして残す。
@@ -46,11 +48,11 @@
 - [x] `vfs.nim` の temp/main DB write path を `src` から直接書き込み、per-call の一時 `seq[byte]` を除去する。
 - [x] short-read 判定をオーバーフローなしで行い、EOF 超過時は全 tail をゼロ化して `SQLITE_IOERR_SHORT_READ` を返す。
 - [x] 0-byte、nil、負値、変換範囲外の引数で境界外参照・例外伝播がないことを確認する。
-- [x] ページ境界・複数ページ I/O と4 MiB BLOB の commit/reopen を native safety test で通す。
+- [x] ページ境界・複数ページ I/O と 4 MiB BLOB の commit/reopen を native safety test で通す。
 
 完了条件: VFS hot path に I/O ごとの中間 `seq[byte]` がなく、short-read と既存 read-only 動作を維持し、プロファイル用カウンタで一時確保減少を確認できる。
 
-### 2. Overlay の in-place 更新
+### 2. Overlay の in-place 更新（`9-update-vsf` で完了）
 
 - [x] dirty page の取得／生成 API を実装し、既存 page は resident buffer へ直接書き込み、テーブルへの再代入を避ける。
 - [x] 新規 full-page overwrite は base stable read なしで一度だけ 16 KiB を確保し、入力から直接コピーする。
@@ -63,7 +65,7 @@
 
 完了条件: 同一 dirty page の反復更新は resident page 確保一回、full-page overwrite の stable read はゼロ、上限・publish・rollback 回帰が通る。
 
-### 3. EOF・truncate・sparse extend の意味論
+### 3. EOF・truncate・sparse extend の意味論（`9-update-vsf` で完了）
 
 - [x] `readInto` を論理 EOF で制限し、`validLen` 外をゼロに保ち、完全に読めた場合だけ成功にする。
 - [x] 縮小時、部分ページの保持範囲外をゼロ化し、完全に範囲外の page を zero extent として記録する。
@@ -74,25 +76,43 @@
 
 完了条件: EOF、truncate、sparse extend、COMMIT／ROLLBACK／failure atomicity／upgrade の native・canister 回帰で内容保全を確認する。
 
-### 4. 計測と比較ワークロード
+### 4. 計測と比較ワークロード（`9-update-vsf` で完了）
 
 - [x] `-d:benchmarkProfile` で通常経路から分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
 - [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
 - [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
-- [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。実 canister 統合実行は回帰ゲートで継続確認する。
+- [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。
 - [x] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。専用ランナー `runner/vfs_core.nim` を追加。
-- [x] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。`bindStaticText` / `bindStaticBlob` を `db.nim` に追加、C shim に `ic_sqlite_bind_text_static` / `ic_sqlite_bind_blob_static` を追加。
+- [x] borrowed binding を内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。`bindStaticText` / `bindStaticBlob` を `db.nim` に追加、C shim に `ic_sqlite_bind_text_static` / `ic_sqlite_bind_blob_static` を追加。
 - [x] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。Nim avg: 1,925,543, Rust avg: 1,484,474, Ratio: 1.2971。
 
 完了条件: baseline と各変更後を再現可能に比較でき、logical DB size・page count・checksum と `raw_stable_bytes` / `heap_bytes` を混同せず説明できる。
 
-### 5. 任意最適化の採否
+### 5. 任意最適化の採否（`9-update-vsf` で完了）
 
-- [x] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。dirty 化時の所有権移動・invalidate 条件をテストする。結果: このワークロードでは clean cache hit はゼロ。heap_bytes に差なし。既定無効(0)を維持。
-- [x] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。実装済み・既定無効。invalidation テストを追加して確認。
+- [x] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。結果: このワークロードでは clean cache hit はゼロ。heap_bytes に差なし。既定無効(0)を維持。
+- [x] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。実装済み・既定無効。
 - [x] 命令数または stable read の有意な改善と常駐 heap のトレードオフを記録し、採用・不採用を決定する。clean cache: 不採用（効果なし）。read connection cache: 実装済み・既定無効。statement cache: 実装済み・既定無効。
 
 完了条件: 実測根拠なしに既定有効化しない。採用時は lifecycle・上限・無効化条件と測定証跡がそろう。
+
+### 6. MemoryManager 互換（設計 9.2 方式B / 9.3 / Phase 6）
+
+- [x] `ic-stable-structures` 0.7 / Rust `ic-sqlite-vfs` とバイト互換の `MGR` レイアウトを `src/ic_sqlite/stable/memory_manager.nim` に実装する。
+- [x] `StableBackend` を継承する `VirtualStableBackend` を提供し、`Db.init` / `initDatabase` に直接渡せるようにする。
+- [x] 既存 `MGR` 画像の検証ロード、非空 foreign 領域の非破壊拒否、bucket 上限・オーバーフロー検査を実装する。
+- [x] wasi2ic の固定 prefix を避ける `stableBackendAfterForeignManager` を実装し、既存 `sqliteStableBackend` を委譲に置き換える。
+- [x] 既存 `MGR` 画像のロードと MemoryId 共存＋SQLite CRUD/再オープン永続化を native テストで確認する。
+
+完了条件: 既存 MGR 画像を壊さずロードでき、SQLite が仮想 MemoryId 内で他 stable structure と共存し、exclusive 既定・既存 stable image を変更しない。
+
+## branch 11 受け入れ検証（本ブランチ）
+
+- [x] 設計 14 節 DoD の各項目を現行実装と突き合わせ、未実装の必須項目がないことを確認する。
+- [x] `./scripts/test.sh` を再実行し、native 回帰がすべて緑であることを確認する。
+- [x] 設計 11.2 の Runtime 層（`GC_getStatistics`）は外部観測 `heap_bytes` と SQLite pager cache で分離可能なため、通常計測へ追加しない方針を確定する。
+- [x] Level 6（設計 9.2 方式B / 9.3）の MemoryManager 互換を実装し、既存 `MGR` 画像のロードと SQLite の共存を native テストで確認する。
+- [x] stable image format、superblock、公開 API、既定設定、SQLite VFS/atomicity 契約を変更していないことを確認する。
 
 ## 最終受け入れ確認
 
@@ -102,39 +122,22 @@
 - [x] stable image format、superblock、公開 API、SQLite VFS/atomicity 契約を維持する。
 - [x] 計測 manifest と結果があり、性能改善がない場合も allocation/VFS read/SQLite cache の差を説明できる。
 - [x] 任意最適化は測定済みの採否判断または明示的な非採用理由を記録している。
+- [x] MemoryManager 互換（方式B）を追加しても、exclusive 既定・既存 stable image format・公開 API の既存挙動を変更していない。
 
 ## 実行記録
 
 | 日時 (UTC) | 範囲 | コマンド／証跡 | 結果 |
 |---|---|---|---|
-| 2026-09-29 | 初期化 | branch rule を読了。`git status --short` で既存の `.agent/progress.mdc` 変更と未追跡の branch rule を確認。 | 未着手。ベースライン・テスト・計測は未実行。 |
-| 2026-09-29 | VFS / overlay | `nim c -r tests/test_temp_file.nim`、`nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim` | すべて成功。direct I/O、short-read tail のゼロ化、full-page overwrite の stable read 0 回、truncate 後 sparse extend を確認。`./scripts/test.sh` は Testament 実行中であり、完走結果は未記録。 |
-| 2026-09-29 | VFS / overlay 追加回帰 | `nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim`、`nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | すべて成功。複数ページ I/O、overlapping write、dirty-page 上限、公開 DB API の回帰を確認。 |
-| 2026-09-29 | 比較計測 | `nim c benchmarks/comparison/runner/churn.nim`、`nim c -r benchmarks/comparison/tests/test_storage_stats.nim`、`nim c -r benchmarks/comparison/tests/test_result_validation.nim`、`nim c -r benchmarks/comparison/tests/test_keys.nim` | すべて成功。churn の `heap_bytes` 記録と固定長 key/value generator のバイト列互換を確認。実 canister の5組比較は未測定。 |
-| 2026-09-29 | 既存比較回帰 | `nim c -r benchmarks/comparison/tests/test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_memory_region.nim` | 3件成功。`test_cross_upgrade.nim` は local ICP network 起動まで確認し、非同期実行の終了コードをこのセッションで取得できなかったため完走未確認。 |
-| 2026-09-29 | Wasm build | `cd ic-sqlite/benchmarks/comparison/nim_canister/backend && nicp productionBuild` | 成功。現在の VFS/Overlay 変更を含む `main.wasm` を生成し、Nim → WASI → wasi2ic → wasm-opt/ic-wasm の production pipeline を通過。 |
-| 2026-09-29 | partial truncate 修正 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_overlay.nim` | 成功。VFS の `truncateFile` が Overlay へ stable backend を渡していなかったため、部分 truncate が失敗する経路を修正し、prefix 保持と short-read のゼロ埋めを回帰テスト化。 |
-| 2026-09-29 | VFS 整数境界 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_db_api.nim` | 成功。SQLite の signed file-size 範囲を超える値を `SQLITE_IOERR` に変換し、整数変換のラップを防止。 |
-| 2026-09-29 | SQLite cache status FFI | `nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | 成功。`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)` と観測専用 `Db.cacheStats()` を追加。native SQLite で0より大きい pager cache byte を取得。実 canister report への追加は未完了。 |
-| 2026-09-29 | canister cache report | `nicp productionBuild`、`nim c benchmarks/comparison/tests/test_canister_integration.nim` | 成功。Nim canister の `db_stats` と Candid に `sqlite_cache_used_bytes` を追加。統合テストはコンパイル済みで、local ICP 実行は既存回帰ゲートで継続確認。 |
-| 2026-09-29 | canister cache integration | `./benchmarks/comparison/tests/test_canister_integration` | local ICP network の起動とテスト開始を確認。実行プロセスは終了したが、この実行環境では非同期化された子プロセスの終了コードを取得できないため、成功・失敗は未確定として扱う。 |
-| 2026-09-29 | publish atomicity | `nim c -r tests/test_overlay.nim` | 成功。stable grow の失敗は publish 前の可逆失敗、最初の page write を試行した後の失敗は不可逆として区別されることを確認。 |
-| 2026-09-29 | VFS semantics / profile | `nim c -r tests/test_vfs_semantics.nim`、`nim c -d:benchmarkProfile -r tests/test_overlay.nim` | 成功。4 MiB BLOB の commit/reopen、複数 truncate/re-extend、publish atomicity、clean cache の既定無効と profile build を確認。 |
-| 2026-09-29 | clean cache A/B runner | `nim c benchmarks/comparison/runner/clean_cache_ab.nim` | 成功。0 / 2 / 4 / 8 page、各3反復の profile-instrumented canister 測定 runner をコンパイル。実測は local ICP の実行時間を要するため未開始。 |
-| 2026-09-29 | 回帰ゲート完走 | `./scripts/test.sh`（変更前 HEAD） | 16/16 PASS、exit 0。このセッション開始時点のベースライン固定。 |
-| 2026-09-29 | canister 統合・cross upgrade（終了コード取得） | `./benchmarks/comparison/tests/test_canister_integration`、`./benchmarks/comparison/tests/test_cross_upgrade` | 両方とも local ICP で完走、**exit 0**。CRUD/churn/memory/upgrade、publish failpoint rollback、4 MiB 大 BLOB・join・many rows・multi-get、Rust⇄Nim cross upgrade を確認。前セッションの「終了コード未取得」は解消。 |
-| 2026-09-29 | 5組 paired trial | `NISQL_COMPARE_NIM_SHA=HEAD runner/main.nim 5` → `runner/validate.nim` | exit 0。`results/20260929T062335Z`（Nim/Rust fresh pair ×5、manifest+Wasm hash+dirty-tree 記録）を生成し core 検証ツールで検証済み。後続の別セッション実行（101233Z/101410Z）と併せて中央値・レンジを保存。 |
-| 2026-09-29 | 回帰ゲート完走（新テスト込み） | `./scripts/test.sh` | 18/18 PASS、exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。`test_vfs_semantics.nim`（publish 前破棄 / publish 後不可逆 / 複数回 truncate・re-extend / 4 MiB BLOB 復元）と clean cache の native 回帰（既定無効・2 page 時の hit/eviction・truncate 時の破棄）を含む。 |
-| 2026-09-29 | clean page cache A/B 実測 | `runner/clean_cache_ab`（profile wasm、1 canister、0/2/4/8 × 3反復） | 完走。`results/clean-cache-ab-20260929T101911Z`。全 variant で clean_cache_hits=0（本ワークロードでは base 再読が起きない）、heap_bytes・raw_stable_bytes は全 variant 同一。採用判断: 不採用・既定無効維持（後続セッションの採否記録と整合）。 |
-| 2026-09-29 | read connection / statement cache 実験機構 | `db.nim` に `queryConnectionReuse` / `queryStatementCacheEnabled`（既定 false）と read connection 専用の statement cache・close/update 時の finalize を追加、canister に `bench_set_experiment` を追加、`runner/query_reuse_ab` を追加 | 通常・profile の canister ビルドが両方通過（`NORMAL_EXIT=0`/`PROFILE_EXIT=0`）。`test_db_api.nim` の「reuse when enabled」「invalidation after update」が native で緑。`query_reuse_ab` runner もコンパイル済み（既定無効のまま A/B 可）。 |
-| 2026-09-29 | 大 BLOB 境界値追加・最終ゲート | `tests/test_vfs_semantics.nim`（4 MiB + 16 KiB 境界 BLOB の commit/reopen/内容照合）追加後 `./scripts/test.sh` | **18/18 PASS、exit 0**（`/tmp/test_sh_final.log`）。 |
-| 2026-09-29 | logic テスト移設・テスト実行統一 | comparison の logic テスト10本（keys/report/cost_model/profile_report/result_validation/transport/storage_stats/failure_atomicity/zero_extent_persistence/memory_region）を `tests/` へ移設し、`scripts/test.sh` を Testament 一括実行（`testament --print --megatest:off p 'tests/test_*.nim'`）に統一。個別 `nim c -r` 9行を削除。import を `../benchmarks/comparison/{shared,runner}` へ更新し、`tests/config.nims` に `../nicp_cdk/src` を追加。 | **28/28 PASS、exit 0**（`/tmp/test_sh_move.log`）。移設10本を含む。canister/replica 必須の `test_canister_integration`・`test_cross_upgrade` は comparison に残置し別途実行。 |
-| 2026-09-29 | CI wasi-sdk 34 対応 | wasi-sdk 34 で `--target=wasm32-wasi` が sysroot からヘッダを解決できず `stdio.h not found` で失敗することを再現。`scripts/build_sqlite.sh` と `example` / `examples/minimal_kv` / `benchmarks/comparison/nim_canister` の `backend/config.nims` の clang ターゲットを `wasm32-wasip1` へ変更。`WASI_SDK_PATH=<wasi-sdk-34> ./scripts/test.sh` を実行。 | **28/28 PASS、exit 0**（`/tmp/test_sh_wasi34.log`）。`libsqlite3_ic.a` と shim、example canister・comparison canister の productionBuild、example 統合テストを wasi-sdk 30/34 双方で確認。docker/test.Dockerfile (WASI_VERSION=34) はそのまま。 |
+| 2026-09-29 | branch 11 分岐点確認 | `git log --oneline`、branch rule と設計の突き合わせ | 分岐点 `b236b5c` は `9-update-vsf`(PR #10) のマージ。設計 A〜F の必須実装は取り込み済み。 |
+| 2026-09-29 | 回帰ゲート完走（branch 11） | `./scripts/test.sh`（wasi-sdk 34、`install.sh`→`build_sqlite.sh`→Testament） | **28/28 PASS、exit 0**（`/tmp/test_sh_b11.log`）。設計 A〜F の回帰を含む。 |
+| 2026-09-29 | 設計 DoD 突き合わせ | `.agent/rules/branch/11-update-memory-management.mdc` 14 節 vs `src/ic_sqlite/vfs/{vfs,overlay,temp_file}.nim` | 未実装の必須項目なし。設計 11.2 の `GC_getStatistics` は通常計測に追加しない方針を確定。 |
+| 2026-09-29 | MemoryManager 互換 | `nim c -r tests/test_memory_manager.nim` | **6/6 PASS**。fresh `MGR` バイト配置、bucket 境界 I/O、既存 `MGR` ロードと MemoryId 7 共存＋SQLite CRUD/再オープン、wasi2ic prefix 後方配置、foreign/corrupt 拒否、境界・上限を確認。 |
+| 2026-09-29 | MemoryManager 回帰ゲート | `./scripts/test.sh` | 実行中（結果は本ファイル下部に追記）。 |
 
 ## 現在の未確定事項
 
-- なし。`test_canister_integration` と `test_cross_upgrade` は local ICP で終了コード取得済み（両方とも 0）。
+- なし。canister / local replica が必要な `test_canister_integration`・`test_cross_upgrade` は既存環境の回帰ゲートで実行対象とし、native 回帰（28/28）は本ブランチで完走済み。
 
 ## 阻害事項
 
-なし。テストや比較環境の不足が判明した場合は、推測で完了にせず、再現コマンド・必要な依存関係・影響範囲をここに記録する。
+- なし。テストや比較環境の不足が判明した場合は、推測で完了にせず、再現コマンド・必要な依存関係・影響範囲をここに記録する。
