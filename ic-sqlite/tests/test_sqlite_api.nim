@@ -6,3 +6,4 @@ suite "SQLite FFI declarations":
     check (SqliteOpenReadWrite or SqliteOpenCreate) == 6
     check SqliteRow == 100
     check SqliteDone == 101
+    check SqliteDbStatusCacheUsed == 1

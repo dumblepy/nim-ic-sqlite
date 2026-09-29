@@ -1,7 +1,7 @@
 import std/[json, unittest]
 import nicp_cdk/ic_types/candid_types
 import nicp_cdk/ic_types/ic_record except `%`, `%*`
-import ../shared/profile_report
+import ../benchmarks/comparison/shared/profile_report
 
 proc record(fields: openArray[(string, uint64)]): CandidRecord =
   result = CandidRecord(kind: ckRecord)

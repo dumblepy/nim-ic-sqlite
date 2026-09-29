@@ -27,6 +27,9 @@ type
     ## It is deliberately distinct from canister-wide raw stable pages.
     dbSize*: uint64
     sqliteVirtualPages*: uint64
+  DbCacheStats* = object
+    ## SQLite pager-cache bytes, distinct from VFS/stable-memory counters.
+    cacheUsedBytes*: uint64
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
     dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
@@ -48,6 +51,16 @@ type
     maxQueryParams*: uint64
     statementCacheEnabled*: bool
     maxCachedStatements*: uint64
+    ## Optional clean base-page cache inside the update overlay. Kept disabled
+    ## (0) by default; non-zero values are only used by benchmark experiments.
+    cleanCachePages*: uint64
+    ## Optional read-only query connection reuse. Kept disabled by default;
+    ## the cached connection is invalidated before every update transaction.
+    queryConnectionReuse*: bool
+    ## Statement cache bound to the reused read connection. Only effective
+    ## while `queryConnectionReuse` is enabled; invalidated together with
+    ## the connection so no dangling statement can survive an update.
+    queryStatementCacheEnabled*: bool
   Db* = object
     raw: ptr Sqlite3
     backend: StableBackend
@@ -57,6 +70,14 @@ type
     currentUpdate: TransactionLease
     statementCache: Table[string, ptr Sqlite3Stmt]
     statementCacheStats: StatementCacheStats
+    ## Experimental read-connection reuse (disabled by default).  The handle
+    ## is invalidated before every update and on close so stale page or
+    ## query state can never survive a published transaction.
+    cachedQueryRaw: ptr Sqlite3
+    ## Statement cache bound to the reused read connection (only effective
+    ## while queryConnectionReuse is enabled); cleared with the connection.
+    queryStatementCache: Table[string, ptr Sqlite3Stmt]
+    queryStatementCacheStats: StatementCacheStats
   UpdateConnection* = object
     db: ptr Db
     lease: TransactionLease
@@ -79,11 +100,14 @@ type
 const Wasi2icReservedStablePages = 1025'u64
 
 proc defaultDbConfig*(): DbConfig =
+  ## `cleanCachePages` stays 0 by default: the optional clean page cache is an
+  ## experiment and must not change resident memory without explicit opt-in.
   DbConfig(maxDirtyPages: 4096, maxDirtyBytes: 64'u64 * 1024 * 1024,
     maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
     maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
     maxQueryParams: 999, statementCacheEnabled: false,
-    maxCachedStatements: 32)
+    maxCachedStatements: 32, cleanCachePages: 0, queryConnectionReuse: false,
+    queryStatementCacheEnabled: false)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
@@ -97,12 +121,63 @@ proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
 
 proc statementCacheStats*(db: Db): StatementCacheStats = db.statementCacheStats
 
+proc dbError(db: Db; code: cint): DbError
+
 proc storageStats*(db: Db): DbStorageStats =
   ## Read-only storage metadata for benchmark and operational observation.
   ## Canister-wide raw stable memory must be sampled separately via ic0.
   result.dbSize = databaseSize
   if not db.backend.isNil:
     result.sqliteVirtualPages = db.backend.sizePages()
+
+proc cacheStats*(db: Db): Result[DbCacheStats, DbError] =
+  ## `SQLITE_DEFAULT_MEMSTATUS=0` does not disable per-connection db status.
+  ## Keep this opt-in observation separate from regular database operations.
+  if db.raw.isNil:
+    return Result[DbCacheStats, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not open"))
+  var current, highwater: cint
+  let code = sqlite3_db_status(db.raw, SqliteDbStatusCacheUsed,
+    addr current, addr highwater, 0)
+  if code != sqlite_api.SqliteOk:
+    return Result[DbCacheStats, DbError](isOk: false, error: db.dbError(code))
+  if current < 0:
+    return Result[DbCacheStats, DbError](isOk: false,
+      error: DbError(code: -1, message: "SQLite returned a negative cache size"))
+  Result[DbCacheStats, DbError](isOk: true,
+    value: DbCacheStats(cacheUsedBytes: uint64(current)))
+
+when defined(benchmarkProfile):
+  type DbProfileStats* = object
+    dirtyPagesCurrent*, dirtyPagesPeak*: uint64
+    dirtyPageNew*, dirtyPageNewBytes*: uint64
+    cleanCacheHits*, cleanCacheMisses*, cleanCacheEvictions*, cleanCacheReadBytes*: uint64
+    tempBufferAllocs*, tempBufferAllocBytes*: uint64
+    vfsReadCalls*, vfsWriteCalls*, vfsShortReads*, vfsTruncateCalls*: uint64
+
+  proc profileStats*(db: Db): Result[DbProfileStats, DbError] =
+    ## Benchmark-only counters separated from normal operations by
+    ## `-d:benchmarkProfile`. VFS/overlay counters reset per `initVfs`
+    ## window; stable I/O call/byte counts come from the canister-level
+    ## counting backend, SQLite pager bytes from `cacheStats()`.
+    if db.raw.isNil:
+      return Result[DbProfileStats, DbError](isOk: false,
+        error: DbError(code: -1, message: "database is not open"))
+    let vfs = benchmarkVfsProfile()
+    let overlay = benchmarkOverlayProfile()
+    Result[DbProfileStats, DbError](isOk: true, value: DbProfileStats(
+      dirtyPagesCurrent: uint64(dirtyPageCount(activeOverlay)),
+      dirtyPagesPeak: overlay.dirtyPagePeak,
+      dirtyPageNew: overlay.dirtyPageNew,
+      dirtyPageNewBytes: overlay.dirtyPageNewBytes,
+      cleanCacheHits: overlay.cleanCacheHits,
+      cleanCacheMisses: overlay.cleanCacheMisses,
+      cleanCacheEvictions: overlay.cleanCacheEvictions,
+      cleanCacheReadBytes: overlay.cleanCacheReadBytes,
+      tempBufferAllocs: vfs.tempBufferAllocs,
+      tempBufferAllocBytes: vfs.tempBufferAllocBytes,
+      vfsReadCalls: vfs.readCalls, vfsWriteCalls: vfs.writeCalls,
+      vfsShortReads: vfs.shortReads, vfsTruncateCalls: vfs.truncateCalls))
 
 proc clearStatementCache(db: var Db) =
   for _, statement in db.statementCache:
@@ -173,7 +248,8 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
   db.config = config
   initVfs(sqliteBackend, if dbSize != 0: dbSize else: restoredSize,
     maxDirtyPages = config.maxDirtyPages, maxDirtyBytes = config.maxDirtyBytes,
-    zeroExtents = restoredZeroExtents, pageSize = restoredPageSize)
+    zeroExtents = restoredZeroExtents, pageSize = restoredPageSize,
+    cleanCachePages = config.cleanCachePages)
   beginOverlay()
   let flags = SqliteOpenReadWrite or SqliteOpenCreate or SqliteOpenNoMutex
   let code = sqlite3_open_v2("/main.db", addr db.raw, flags, "icstable")
@@ -212,16 +288,38 @@ when not defined(wasm32):
     db.config = config
     Result[bool, DbError](isOk: true, value: true)
 
+proc clearQueryStatementCache(db: var Db) =
+  for _, statement in db.queryStatementCache:
+    if not statement.isNil:
+      discard sqlite3_finalize(statement)
+  db.queryStatementCache.clear()
+  db.queryStatementCacheStats = StatementCacheStats()
+
 proc close*(db: var Db) =
   db.clearStatementCache()
+  db.clearQueryStatementCache()
+  if not db.cachedQueryRaw.isNil:
+    discard sqlite3_close(db.cachedQueryRaw)
+    db.cachedQueryRaw = nil
   if not db.raw.isNil:
     discard sqlite3_close(db.raw)
     db.raw = nil
 
-proc beginStableOperation(db: Db): Result[bool, DbError] =
+proc invalidateQueryConnection(db: var Db) =
+  ## Every update (published or rolled back) invalidates the cached reader so
+  ## it can never keep serving stale page or query state.  The query
+  ## statement cache lives on that connection and is torn down with it.
+  if not db.cachedQueryRaw.isNil:
+    db.clearQueryStatementCache()
+    discard sqlite3_close(db.cachedQueryRaw)
+    db.cachedQueryRaw = nil
+
+proc beginStableOperation(db: var Db): Result[bool, DbError] =
   ## A canister message must not expose writes before the SQLite operation has
   ## succeeded.  Native :memory: tests have no VFS overlay.
   if db.backend.isNil: return Result[bool, DbError](isOk: true, value: false)
+  if db.config.queryConnectionReuse:
+    db.invalidateQueryConnection()
   if overlayActive:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "a stable database operation is already active"))
@@ -423,21 +521,30 @@ proc withQuery*[T](db: var Db;
     defer: discard sqlite3_exec(db.raw, "PRAGMA query_only=OFF".cstring, nil, nil, nil)
     var memoryConnection = Connection(db: addr db, raw: db.raw)
     return body(memoryConnection)
-  var queryRaw: ptr Sqlite3
-  let openCode = sqlite3_open_v2("/main.db", addr queryRaw,
-    SqliteOpenReadOnly or SqliteOpenNoMutex, "icstable")
-  if openCode != sqlite_api.SqliteOk:
-    let error = sqliteError(queryRaw, openCode)
-    if not queryRaw.isNil: discard sqlite3_close(queryRaw)
-    return Result[T, DbError](isOk: false, error: error)
-  defer: discard sqlite3_close(queryRaw)
-  let pragmaCode = sqlite3_exec(queryRaw,
-    "PRAGMA cache_size=-32768; PRAGMA query_only=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
-    nil, nil, nil)
-  if pragmaCode != sqlite_api.SqliteOk:
-    return Result[T, DbError](isOk: false, error: sqliteError(queryRaw, pragmaCode))
+  ## Optional read-connection reuse.  The cached handle is dropped on every
+  ## update transaction (published or rolled back) so an update can never
+  ## leave a reader holding stale page state.
+  var queryRaw = if db.config.queryConnectionReuse: db.cachedQueryRaw else: nil
+  if queryRaw.isNil:
+    let openCode = sqlite3_open_v2("/main.db", addr queryRaw,
+      SqliteOpenReadOnly or SqliteOpenNoMutex, "icstable")
+    if openCode != sqlite_api.SqliteOk:
+      let error = sqliteError(queryRaw, openCode)
+      if not queryRaw.isNil: discard sqlite3_close(queryRaw)
+      return Result[T, DbError](isOk: false, error: error)
+    let pragmaCode = sqlite3_exec(queryRaw,
+      "PRAGMA cache_size=-32768; PRAGMA query_only=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
+      nil, nil, nil)
+    if pragmaCode != sqlite_api.SqliteOk:
+      discard sqlite3_close(queryRaw)
+      return Result[T, DbError](isOk: false, error: sqliteError(queryRaw, pragmaCode))
+    if db.config.queryConnectionReuse:
+      db.cachedQueryRaw = queryRaw
   var connection = Connection(db: addr db, raw: queryRaw)
-  body(connection)
+  let queryResult = body(connection)
+  if not db.config.queryConnectionReuse:
+    discard sqlite3_close(queryRaw)
+  queryResult
 
 proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if conn.db.isNil or conn.raw.isNil:
@@ -446,25 +553,49 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "SQL exceeds configured limit"))
-  let cacheable = conn.db[].config.statementCacheEnabled and conn.raw == conn.db[].raw
-  if cacheable and conn.db[].statementCache.hasKey(sql):
-    let raw = conn.db[].statementCache[sql]
-    discard sqlite3_reset(raw)
-    discard sqlite3_clear_bindings(raw)
-    inc conn.db[].statementCacheStats.hits
-    return Result[Statement, DbError](isOk: true,
-      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-        cached: true, cacheKey: sql))
+  ## The statement cache can live on the update connection or on the reused
+  ## read connection.  In both cases the cache is invalidated together with
+  ## its owning connection, so a cached statement can never outlive it;
+  ## `finalize` only resets and clears bindings for cached entries.
+  let ownedByDb = conn.raw != nil and conn.raw == conn.db[].raw
+  let ownedByQuery = conn.db[].config.queryConnectionReuse and
+    not ownedByDb and not conn.db[].cachedQueryRaw.isNil and
+    conn.raw == conn.db[].cachedQueryRaw
+  let inDbCache = ownedByDb and conn.db[].config.statementCacheEnabled
+  let inQueryCache = ownedByQuery and conn.db[].config.queryStatementCacheEnabled
+  let cacheable = inDbCache or inQueryCache
+  if cacheable:
+    let cache: ptr Table[string, ptr Sqlite3Stmt] =
+      if inDbCache: addr conn.db[].statementCache
+      else: addr conn.db[].queryStatementCache
+    let stats: ptr StatementCacheStats =
+      if inDbCache: addr conn.db[].statementCacheStats
+      else: addr conn.db[].queryStatementCacheStats
+    if cache[].hasKey(sql):
+      let raw = cache[][sql]
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
+      inc stats[].hits
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+          cached: true, cacheKey: sql))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.raw, code))
-  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
-    conn.db[].statementCache[sql] = raw
-    inc conn.db[].statementCacheStats.misses
-    return Result[Statement, DbError](isOk: true,
-      value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-        cached: true, cacheKey: sql))
+  if cacheable:
+    let cache: ptr Table[string, ptr Sqlite3Stmt] =
+      if inDbCache: addr conn.db[].statementCache
+      else: addr conn.db[].queryStatementCache
+    let stats: ptr StatementCacheStats =
+      if inDbCache: addr conn.db[].statementCacheStats
+      else: addr conn.db[].queryStatementCacheStats
+    if uint64(cache[].len) < conn.db[].config.maxCachedStatements:
+      cache[][sql] = raw
+      inc stats[].misses
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
+          cached: true, cacheKey: sql))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
@@ -528,6 +659,41 @@ proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool
       return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
     let data = if value.blobValue.len == 0: nil else: unsafeAddr value.blobValue[0]
     code = ic_sqlite_bind_blob(statement.raw, index.cint, data, value.blobValue.len.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+## Internal-only borrowed (SQLITE_STATIC) binding helpers. These are NOT part
+## of the public API: the caller MUST guarantee that the pointer remains valid
+## until the next reset/clear_bindings/finalize, and MUST call reset (which
+## clears bindings) on every path — success, error, and early return.
+##
+## These are used exclusively in benchmark/internal paths where the data
+## lifetime is bounded by the statement's step/reset cycle and the caller
+## controls the full execution flow.
+
+proc bindStaticText*(statement: var Statement; index: int; data: cstring; length: int): Result[bool, DbError] =
+  ## Binds a TEXT value with SQLITE_STATIC (zero-copy, caller retains lifetime).
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if index <= 0:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
+  if uint64(length) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+  let code = ic_sqlite_bind_text_static(statement.raw, index.cint, data, length.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc bindStaticBlob*(statement: var Statement; index: int; data: pointer; length: int): Result[bool, DbError] =
+  ## Binds a BLOB value with SQLITE_STATIC (zero-copy, caller retains lifetime).
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if index <= 0:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
+  if uint64(length) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+  let code = ic_sqlite_bind_blob_static(statement.raw, index.cint, data, length.cint)
   if code != sqlite_api.SqliteOk:
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)

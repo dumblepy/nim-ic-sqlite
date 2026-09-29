@@ -20,6 +20,7 @@ const
   SqliteOpenCreate* = 0x00000004.cint
   SqliteOpenUri* = 0x00000040.cint
   SqliteOpenNoMutex* = 0x00008000.cint
+  SqliteDbStatusCacheUsed* = 1.cint
 
 proc sqlite3_open_v2*(filename: cstring; db: ptr ptr Sqlite3; flags: cint; vfs: cstring): cint
   {.importc, cdecl, header: "sqlite3.h".}
@@ -36,6 +37,8 @@ proc sqlite3_bind_double*(stmt: ptr Sqlite3Stmt; index: cint; value: cdouble): c
 proc sqlite3_bind_parameter_count*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc ic_sqlite_bind_text*(stmt: ptr Sqlite3Stmt; index: cint; value: cstring; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
 proc ic_sqlite_bind_blob*(stmt: ptr Sqlite3Stmt; index: cint; value: pointer; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
+proc ic_sqlite_bind_text_static*(stmt: ptr Sqlite3Stmt; index: cint; value: cstring; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
+proc ic_sqlite_bind_blob_static*(stmt: ptr Sqlite3Stmt; index: cint; value: pointer; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
 proc sqlite3_column_count*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_column_name*(stmt: ptr Sqlite3Stmt; index: cint): cstring {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_column_type*(stmt: ptr Sqlite3Stmt; index: cint): cint {.importc, cdecl, header: "sqlite3.h".}
@@ -50,6 +53,8 @@ proc sqlite3_extended_errcode*(db: ptr Sqlite3): cint {.importc, cdecl, header: 
 proc sqlite3_stmt_readonly*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_changes*(db: ptr Sqlite3): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_last_insert_rowid*(db: ptr Sqlite3): int64 {.importc, cdecl, header: "sqlite3.h".}
+proc sqlite3_db_status*(db: ptr Sqlite3; op: cint; current, highwater: ptr cint;
+                        resetFlag: cint): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_exec*(db: ptr Sqlite3; sql: cstring; callback: pointer; argument: pointer; errorMessage: ptr cstring): cint
   {.importc, cdecl, header: "sqlite3.h".}
 proc ic_sqlite_register_vfs*(): cint {.importc, cdecl, header: "ic_sqlite_vfs_shim.h".}

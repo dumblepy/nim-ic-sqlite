@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the pinned SQLite amalgamation for the ICP wasm32-wasi target.
+# Build the pinned SQLite amalgamation for the ICP wasm32-wasip1 (WASI
+# preview 1) target. wasi-sdk >= 30 deprecates the old `wasm32-wasi` triple.
 set -euo pipefail
 
 readonly SQLITE_VERSION="3.53.4"
@@ -27,7 +28,7 @@ grep -Fq "#define SQLITE_VERSION        \"${SQLITE_VERSION}\"" "$SQLITE_HEADER" 
 
 mkdir -p "$ARTIFACT_DIR"
 "$CC" \
-  --target=wasm32-wasi \
+  --target=wasm32-wasip1 \
   -Os \
   -std=c99 \
   -c "$SQLITE_SOURCE" \
@@ -50,10 +51,10 @@ mkdir -p "$ARTIFACT_DIR"
 "$AR" rcs "$ARTIFACT_DIR/libsqlite3_ic.a" "$ARTIFACT_DIR/sqlite3.o"
 
 # Canister config.nims links these objects from ARTIFACT_DIR next to the SQLite
-# archive. They must use the same wasm32-wasi target; host-compiled objects
+# archive. They must use the same wasm32-wasip1 target; host-compiled objects
 # cannot be linked into a canister wasm module.
 "$CC" \
-  --target=wasm32-wasi \
+  --target=wasm32-wasip1 \
   -Os \
   -std=c99 \
   -Ivendor/sqlite \
@@ -62,7 +63,7 @@ mkdir -p "$ARTIFACT_DIR"
   -o "$ARTIFACT_DIR/ic_sqlite_vfs_shim.o"
 
 "$CC" \
-  --target=wasm32-wasi \
+  --target=wasm32-wasip1 \
   -Os \
   -std=c99 \
   -Ivendor/sqlite \
@@ -70,4 +71,4 @@ mkdir -p "$ARTIFACT_DIR"
   -c c/sqlite_helpers.c \
   -o "$ARTIFACT_DIR/sqlite_helpers.o"
 
-echo "built $ARTIFACT_DIR/libsqlite3_ic.a and C shims (SQLite ${SQLITE_VERSION}, wasm32-wasi)"
+echo "built $ARTIFACT_DIR/libsqlite3_ic.a and C shims (SQLite ${SQLITE_VERSION}, wasm32-wasip1)"

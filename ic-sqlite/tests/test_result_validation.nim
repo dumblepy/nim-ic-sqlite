@@ -1,5 +1,5 @@
 import std/[json, os, strutils, unittest]
-import ../runner/validate
+import ../benchmarks/comparison/runner/validate
 import std/strformat
 
 const ValidRows = """{"implementation":"nim","phase":"reset","trial":1,"success":true,"instructions_update":1,"instructions_query":null,"raw_stable_pages":1,"raw_stable_bytes":65536,"heap_bytes":2}

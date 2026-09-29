@@ -13,6 +13,7 @@ type
     rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
   DbStatsReport = object
     db_size, stable_pages, stable_bytes, sqlite_page_size, sqlite_page_count, sqlite_freelist_count: uint64
+    sqlite_cache_used_bytes: uint64
   BenchChurnStepReport = object
     cycle, rows, instructions, row_count, db_size, stable_pages, stable_bytes: uint64
     sqlite_page_size, sqlite_page_count, sqlite_freelist_count: uint64
@@ -43,6 +44,38 @@ type
     rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
     sql_build, key_build, prepare, bind_total, row_scan: uint64
     stable_read_calls, stable_read_bytes: uint64
+  ## -d:benchmarkProfile 版の overlay / clean-page cache / VFS counters.
+  ## raw_stable_bytes / heap_bytes / pager cache bytes are kept as separate
+  ## fields so a report never mixes physical stable memory with heap.
+  NimCleanCacheProfileReport = object
+    rows, writes, instructions, checksum: uint64
+    clean_cache_pages: uint64
+    dirty_pages_current, dirty_pages_peak: uint64
+    dirty_pages_new, dirty_pages_new_bytes: uint64
+    clean_cache_hits, clean_cache_misses, clean_cache_evictions, clean_cache_bytes: uint64
+    temp_buffer_allocs, temp_buffer_alloc_bytes: uint64
+    vfs_read_calls, vfs_write_calls, vfs_short_reads, vfs_truncate_calls: uint64
+    stable_read_calls, stable_read_bytes: uint64
+    stable_write_calls, stable_write_bytes: uint64
+    stable_grow_calls, stable_grow_pages: uint64
+    db_size, sqlite_virtual_pages, sqlite_page_count, sqlite_cache_used_bytes: uint64
+    raw_stable_pages, raw_stable_bytes: uint64
+  ## Isolated VFS/core comparison series: fixed allocation-free buffers, same
+  ## SQL / transaction / prepare / step / reset counts. Deliberately kept
+  ## separate from the public API series.
+  NimVfsCoreProfileReport = object
+    rows, instructions, checksum: uint64
+    clean_cache_pages: uint64
+    dirty_pages_current, dirty_pages_peak: uint64
+    dirty_pages_new, dirty_pages_new_bytes: uint64
+    clean_cache_hits, clean_cache_misses, clean_cache_evictions, clean_cache_bytes: uint64
+    temp_buffer_allocs, temp_buffer_alloc_bytes: uint64
+    vfs_read_calls, vfs_write_calls, vfs_short_reads, vfs_truncate_calls: uint64
+    stable_read_calls, stable_read_bytes: uint64
+    stable_write_calls, stable_write_bytes: uint64
+    stable_grow_calls, stable_grow_pages: uint64
+    db_size, sqlite_virtual_pages, sqlite_page_count, sqlite_cache_used_bytes: uint64
+    raw_stable_pages, raw_stable_bytes: uint64
   StableIoMetrics = object
     readCalls, readBytes, writeCalls, writeBytes, growCalls, growPages: uint64
   MetricsBackend = ref object of stable_backend.StableBackend
@@ -75,6 +108,9 @@ method write(backend: MetricsBackend; offset: uint64; src: pointer; size: uint64
 var database: Db
 var databaseReady = false
 var useMetricsBackend = false
+var dbCleanCachePages = 0'u64
+var dbQueryReuse = false
+var dbStatementCache = false
 
 when defined(benchmarkFailpoint):
   type FaultInjectingBackend = ref object of stable_backend.StableBackend
@@ -110,10 +146,14 @@ proc replyErr(message: string) =
 proc ensureDatabase(): string =
   if databaseReady: return ""
   database.close()
+  var config = defaultDbConfig()
+  config.cleanCachePages = dbCleanCachePages
+  config.queryConnectionReuse = dbQueryReuse
+  config.statementCacheEnabled = dbStatementCache
   when defined(benchmarkFailpoint):
-    let opened = database.init(newFaultInjectingBackend())
+    let opened = database.init(newFaultInjectingBackend(), config = config)
   else:
-    let opened = database.init(if useMetricsBackend: newMetricsBackend() else: newIcStableBackend())
+    let opened = database.init(if useMetricsBackend: newMetricsBackend() else: newIcStableBackend(), config = config)
   if not opened.isOk: return opened.error.message
   let schema = database.exec("CREATE TABLE IF NOT EXISTS bench (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID")
   if not schema.isOk: return schema.error.message
@@ -776,13 +816,267 @@ proc db_stats() {.query.} =
   if not pageCount.isOk: replyErr(pageCount.error.message); return
   let freeCount = scalar("PRAGMA freelist_count")
   if not freeCount.isOk: replyErr(freeCount.error.message); return
+  let cache = database.cacheStats()
+  if not cache.isOk: replyErr(cache.error.message); return
   replyOk(DbStatsReport(db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
     stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize, sqlite_page_size: pageSize.value,
-    sqlite_page_count: pageCount.value, sqlite_freelist_count: freeCount.value))
+    sqlite_page_count: pageCount.value, sqlite_freelist_count: freeCount.value,
+    sqlite_cache_used_bytes: cache.value.cacheUsedBytes))
+
+proc bench_host_stats_internal(): HostStatsReport =
+  let rawPages = newIcStableBackend().sizePages()
+  HostStatsReport(raw_stable_pages: rawPages, raw_stable_bytes: rawPages * bench_spec.StablePageSize)
 
 proc bench_host_stats() {.query.} =
-  let rawPages = newIcStableBackend().sizePages()
-  replyOk(HostStatsReport(raw_stable_pages: rawPages, raw_stable_bytes: rawPages * bench_spec.StablePageSize))
+  replyOk(bench_host_stats_internal())
+
+when defined(benchmarkProfile):
+  proc cleanCacheUpsert(rows: uint32; cycles: uint32): Result[uint64, DbError] =
+    ## Re-applies deterministic upserts against the seeded `bench` table.
+    ## Each call runs inside one withUpdate transaction, so the update
+    ## overlay (and the optional clean page cache) are active for every page
+    ## touched by the write.
+    var steps = 0'u64
+    for cycleIndex in 0 ..< cycles:
+      discard cycleIndex
+      let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+        let prepared = conn.prepare("INSERT INTO bench(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        if not prepared.isOk: return Result[bool, DbError](isOk: false, error: prepared.error)
+        var statement = prepared.value
+        defer: statement.finalize()
+        for index in 0'u32 ..< rows:
+          let key = prefixedKey('w', index)
+          let value = "cc-" & key
+          let boundKey = statement.bind(1, sqlText(key))
+          if not boundKey.isOk: return Result[bool, DbError](isOk: false, error: boundKey.error)
+          let boundValue = statement.bind(2, sqlText(value))
+          if not boundValue.isOk: return Result[bool, DbError](isOk: false, error: boundValue.error)
+          let stepped = statement.step()
+          if not stepped.isOk: return Result[bool, DbError](isOk: false, error: stepped.error)
+          let resetResult = statement.reset()
+          if not resetResult.isOk: return Result[bool, DbError](isOk: false, error: resetResult.error)
+        Result[bool, DbError](isOk: true, value: true)
+      )
+      if not updated.isOk: return Result[uint64, DbError](isOk: false, error: updated.error)
+      inc steps, uint64(rows)
+    Result[uint64, DbError](isOk: true, value: steps)
+
+  proc collectCleanCacheProfile(rows: uint32; cycles: uint32; start: uint64;
+                                stableReads: var StableIoMetrics): Result[NimCleanCacheProfileReport, DbError] =
+    ## Runs the clean-cache upsert workload while the counting backend and
+    ## the -d:benchmarkProfile counters run, then samples db/host stats in a
+    ## fixed order (counters -> db stats -> host) so the per-variant numbers
+    ## stay comparable. `sqlite_cache_used_bytes` is the SQLite pager cache and
+    ## is never summed into raw stable or heap totals.
+    let upserted = cleanCacheUpsert(rows, cycles)
+    if not upserted.isOk: return Result[NimCleanCacheProfileReport, DbError](isOk: false, error: upserted.error)
+    let profile = database.profileStats()
+    if not profile.isOk: return Result[NimCleanCacheProfileReport, DbError](isOk: false, error: profile.error)
+    let stats = database.storageStats()
+    let pageCount = scalar("PRAGMA page_count")
+    if not pageCount.isOk: return Result[NimCleanCacheProfileReport, DbError](isOk: false, error: pageCount.error)
+    let cache = database.cacheStats()
+    if not cache.isOk: return Result[NimCleanCacheProfileReport, DbError](isOk: false, error: cache.error)
+    result.isOk = true
+    result.value = NimCleanCacheProfileReport(
+      rows: uint64(rows), writes: upserted.value,
+      instructions: ic0_performance_counter(0'u32) - start,
+      checksum: upserted.value, clean_cache_pages: dbCleanCachePages,
+      dirty_pages_current: profile.value.dirtyPagesCurrent,
+      dirty_pages_peak: profile.value.dirtyPagesPeak,
+      dirty_pages_new: profile.value.dirtyPageNew,
+      dirty_pages_new_bytes: profile.value.dirtyPageNewBytes,
+      clean_cache_hits: profile.value.cleanCacheHits,
+      clean_cache_misses: profile.value.cleanCacheMisses,
+      clean_cache_evictions: profile.value.cleanCacheEvictions,
+      clean_cache_bytes: profile.value.cleanCacheReadBytes,
+      temp_buffer_allocs: profile.value.tempBufferAllocs,
+      temp_buffer_alloc_bytes: profile.value.tempBufferAllocBytes,
+      vfs_read_calls: profile.value.vfsReadCalls,
+      vfs_write_calls: profile.value.vfsWriteCalls,
+      vfs_short_reads: profile.value.vfsShortReads,
+      vfs_truncate_calls: profile.value.vfsTruncateCalls,
+      stable_read_calls: stableReads.readCalls, stable_read_bytes: stableReads.readBytes,
+      stable_write_calls: stableReads.writeCalls, stable_write_bytes: stableReads.writeBytes,
+      stable_grow_calls: stableReads.growCalls, stable_grow_pages: stableReads.growPages,
+      db_size: stats.dbSize, sqlite_virtual_pages: stats.sqliteVirtualPages,
+      sqlite_page_count: pageCount.value, sqlite_cache_used_bytes: cache.value.cacheUsedBytes)
+    # Fixed observation order (counters -> db stats -> host memory) so the
+    # per-A/B numbers stay comparable. Heap bytes are derived host-side the
+    # same way as the core runner: canister status memory_size minus raw
+    # stable bytes. `sqlite_cache_used_bytes` is the SQLite pager cache and
+    # must never be summed into stable or heap totals.
+    let host = bench_host_stats_internal()
+    result.value.raw_stable_pages = host.raw_stable_pages
+    result.value.raw_stable_bytes = host.raw_stable_bytes
+
+  proc bench_set_experiment() {.update.} =
+    ## Toggles the optional query-connection reuse and statement cache
+    ## experiments (both disabled by default) and re-initializes the
+    ## database so the new config takes effect. Existing stable data is
+    ## reopened; the cached reader is invalidated per the update rule.
+    let reuse = Request.new().getNat32(0)
+    let stmtCache = Request.new().getNat32(1)
+    if reuse > 1'u32 or stmtCache > 1'u32: replyErr("flags must be 0..1"); return
+    databaseReady = false
+    database.close()
+    useMetricsBackend = false
+    dbQueryReuse = reuse == 1'u32
+    dbStatementCache = stmtCache == 1'u32
+    let failure = ensureDatabase()
+    if failure.len > 0: replyErr(failure); return
+    replyOk(NimCapacityGrowthReport(rows: 0, writes: 0, instructions: 0,
+      checksum: uint64(reuse) * 2 + uint64(stmtCache), db_size_before: 0,
+      db_size_after: 0, sqlite_virtual_pages_before: 0, sqlite_virtual_pages_after: 0,
+      raw_stable_pages_before: 0, raw_stable_pages_after: 0,
+      raw_stable_bytes_before: 0, raw_stable_bytes_after: 0))
+
+  proc bench_set_clean_cache() {.update.} =
+    ## Switches the experimental clean page cache size and re-initializes the
+    ## database so the change takes effect. Existing stable data is reopened.
+    let pages = Request.new().getNat32(0)
+    if pages > 8'u32: replyErr("clean cache pages must be 0..8"); return
+    databaseReady = false
+    database.close()
+    useMetricsBackend = false
+    dbCleanCachePages = uint64(pages)
+    let failure = ensureDatabase()
+    if failure.len > 0: replyErr(failure); return
+    replyOk(NimCapacityGrowthReport(rows: 0, writes: 0, instructions: 0,
+      checksum: uint64(pages), db_size_before: 0, db_size_after: 0,
+      sqlite_virtual_pages_before: 0, sqlite_virtual_pages_after: 0,
+      raw_stable_pages_before: 0, raw_stable_pages_after: 0,
+      raw_stable_bytes_before: 0, raw_stable_bytes_after: 0))
+
+  ## VFS/core workload: allocation-free fixed-length key/value buffers from
+  ## `bench_spec` (benchKeyBuffer / benchValueBuffer), one prepared statement,
+  ## `rows` step / reset cycles, and a read-back checksum, all in a single
+  ## transaction. This is the isolated VFS/core comparison series, deliberately
+  ## separate from the public API series that formats strings.
+  proc bench_vfs_core_profile() {.update.} =
+    let rows = Request.new().getNat32(0)
+    if rows == 0 or not validateFixedBenchKeyRows(rows) or rows > 10_000'u32:
+      replyErr("vfs core rows must be 1..10000"); return
+    database.close()
+    databaseReady = false
+    useMetricsBackend = true
+    defer:
+      stableIoMetricsEnabled = false
+      useMetricsBackend = false
+      database.close()
+      databaseReady = false
+    let failure = ensureDatabase()
+    if failure.len > 0: replyErr(failure); return
+    resetStableIoMetrics()
+    stableIoMetricsEnabled = true
+    let start = ic0_performance_counter(0'u32)
+    let updated = database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+      let prepared = conn.prepare("INSERT INTO bench(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+      var statement = prepared.value
+      defer: statement.finalize()
+      for index in 0'u32 ..< rows:
+        let keyBuffer = benchKeyBuffer(index)
+        let valueBuffer = benchValueBuffer(index)
+        # `benchKeyBuffer` / `benchValueBuffer` already encode the digits
+        # into a fixed-width array; converting to string here is a
+        # single bounded copy (not a format pass), which isolates the
+        # VFS/core I/O from the public API's format-then-copy path.
+        var keyStr = newString(keyBuffer.len)
+        for p in 0 .. keyBuffer.high: keyStr[p] = keyBuffer[p]
+        var valueStr = newString(valueBuffer.len)
+        for p in 0 .. valueBuffer.high: valueStr[p] = valueBuffer[p]
+        let boundKey = statement.bind(1, sqlText(keyStr))
+        if not boundKey.isOk: return Result[uint64, DbError](isOk: false, error: boundKey.error)
+        let boundValue = statement.bind(2, sqlText(valueStr))
+        if not boundValue.isOk: return Result[uint64, DbError](isOk: false, error: boundValue.error)
+        let stepped = statement.step()
+        if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+        let resetResult = statement.reset()
+        if not resetResult.isOk: return Result[uint64, DbError](isOk: false, error: resetResult.error)
+      ## Content-derived checksum read back through the same open transaction.
+      let reread = withUpdateQueryRead(conn.transactionLease(),
+        proc(rconn: var Connection): Result[uint64, DbError] =
+          let prepared = rconn.prepare("SELECT value FROM bench WHERE key = ?")
+          if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+          var rstmt = prepared.value
+          defer: rstmt.finalize()
+          var sum = 0'u64
+          for index in 0'u32 ..< rows:
+            let bound = rstmt.bind(1, sqlText(benchKey(index)))
+            if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+            let stepped = rstmt.step()
+            if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+            if stepped.value == srRow: sum += uint64(rstmt.columnBytes(0))
+            let resetResult = rstmt.reset()
+            if not resetResult.isOk: return Result[uint64, DbError](isOk: false, error: resetResult.error)
+          Result[uint64, DbError](isOk: true, value: sum)
+      )
+      if not reread.isOk: return Result[uint64, DbError](isOk: false, error: reread.error)
+      Result[uint64, DbError](isOk: true, value: reread.value)
+    )
+    if not updated.isOk: replyErr(updated.error.message); return
+    let stats = database.storageStats()
+    let pageCount = scalar("PRAGMA page_count")
+    if not pageCount.isOk: replyErr(pageCount.error.message); return
+    let cache = database.cacheStats()
+    if not cache.isOk: replyErr(cache.error.message); return
+    let host = bench_host_stats_internal()
+    let profile = database.profileStats()
+    replyOk(NimVfsCoreProfileReport(
+      rows: uint64(rows), instructions: ic0_performance_counter(0'u32) - start,
+      checksum: updated.value, clean_cache_pages: dbCleanCachePages,
+      dirty_pages_current: profile.value.dirtyPagesCurrent,
+      dirty_pages_peak: profile.value.dirtyPagesPeak,
+      dirty_pages_new: profile.value.dirtyPageNew,
+      dirty_pages_new_bytes: profile.value.dirtyPageNewBytes,
+      clean_cache_hits: profile.value.cleanCacheHits,
+      clean_cache_misses: profile.value.cleanCacheMisses,
+      clean_cache_evictions: profile.value.cleanCacheEvictions,
+      clean_cache_bytes: profile.value.cleanCacheReadBytes,
+      temp_buffer_allocs: profile.value.tempBufferAllocs,
+      temp_buffer_alloc_bytes: profile.value.tempBufferAllocBytes,
+      vfs_read_calls: profile.value.vfsReadCalls,
+      vfs_write_calls: profile.value.vfsWriteCalls,
+      vfs_short_reads: profile.value.vfsShortReads,
+      vfs_truncate_calls: profile.value.vfsTruncateCalls,
+      stable_read_calls: stableIoMetrics.readCalls,
+      stable_read_bytes: stableIoMetrics.readBytes,
+      stable_write_calls: stableIoMetrics.writeCalls,
+      stable_write_bytes: stableIoMetrics.writeBytes,
+      stable_grow_calls: stableIoMetrics.growCalls,
+      stable_grow_pages: stableIoMetrics.growPages,
+      db_size: stats.dbSize, sqlite_virtual_pages: stats.sqliteVirtualPages,
+      sqlite_page_count: pageCount.value,
+      sqlite_cache_used_bytes: cache.value.cacheUsedBytes,
+      raw_stable_pages: host.raw_stable_pages, raw_stable_bytes: host.raw_stable_bytes))
+
+  proc bench_clean_cache_write_profile() {.update.} =
+    ## Update-transaction upsert workload with the overlay/VFS/profile
+    ## counters active. Runs with the current `dbCleanCachePages` setting so
+    ## the host can compare 0 / 2 / 4 / 8 clean-cache pages back to back on
+    ## the same canister and stable image.
+    let request = Request.new()
+    let rows = request.getNat32(0)
+    let cycles = request.getNat32(1)
+    if rows == 0 or cycles == 0 or not validateFixedBenchKeyRows(rows) or cycles > 100'u32:
+      replyErr("clean cache rows/cycles must be 1..max; cycles <= 100"); return
+    database.close()
+    databaseReady = false
+    useMetricsBackend = true
+    defer:
+      stableIoMetricsEnabled = false
+      useMetricsBackend = false
+      database.close()
+      databaseReady = false
+    let failure = ensureDatabase()
+    if failure.len > 0: replyErr(failure); return
+    resetStableIoMetrics()
+    stableIoMetricsEnabled = true
+    let start = ic0_performance_counter(0'u32)
+    let profiled = collectCleanCacheProfile(rows, cycles, start, stableIoMetrics)
+    if not profiled.isOk: replyErr(profiled.error.message); return
+    replyOk(profiled.value)
 
 when defined(benchmarkFailpoint):
   proc bench_failpoint_update() {.update.} =

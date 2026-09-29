@@ -1,5 +1,5 @@
 import std/[json, unittest]
-import ../runner/transport
+import ../benchmarks/comparison/runner/transport
 
 suite "icp CLI transport":
   test "adds an explicit network only when configured":

@@ -105,14 +105,14 @@ SQLiteはtransaction途中でもDBファイルにdirty pageを書こうとする
 
 ## 4. `nicp_cdk` との適合性
 
-`nicp_cdk` はNimコードをCへ変換し、Clangで `wasm32-wasi` 向けにコンパイルする。
+`nicp_cdk` はNimコードをCへ変換し、Clangで `wasm32-wasip1`（WASI preview 1）向けにコンパイルする。wasi-sdk 30 以降は旧 `wasm32-wasi` トリプルが非推奨であり、sysroot に `wasm32-wasi` 向けヘッダが含まれないため `wasm32-wasip1` を使う。
 
 標準プロジェクトのビルドは概ね次の構成を持つ。
 
 ```text
 Nim
   -> generated C
-  -> clang -target wasm32-wasi
+  -> clang -target wasm32-wasip1
   -> static WASM
   -> ic-wasi-polyfill / wasi2ic
   -> ICP canister WASM
@@ -367,7 +367,7 @@ int sqlite3_os_init(void) {
 
 ### 7.3 WASIを完全排除する必要はない
 
-`nicp_cdk` 自体は `wasm32-wasi` と `ic-wasi-polyfill` を利用する。
+`nicp_cdk` 自体は `wasm32-wasip1` と `ic-wasi-polyfill` を利用する。
 
 このライブラリの目的は、canister全体からWASIをなくすことではない。
 
@@ -404,7 +404,7 @@ AR="${WASI_SDK_PATH}/bin/llvm-ar"
 mkdir -p build
 
 "$CC" \
-  --target=wasm32-wasi \
+  --target=wasm32-wasip1 \
   -Os \
   -c vendor/sqlite/sqlite3.c \
   -o build/sqlite3.o \

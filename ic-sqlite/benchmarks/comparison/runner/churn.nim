@@ -30,6 +30,11 @@ proc observe(transport: CliTransport; runId, implementation, repoSha, wasmSha,
     raise newException(ValueError, fmt"{implementation} cycle {cycle} {phase}: expected {expectedCount} rows, got {count}")
   let host = transport.call(canister, didPath, "bench_host_stats", "()", query = true)
   let raw = host["raw_stable_pages"].getNat64()
+  let rawBytes = host["raw_stable_bytes"].getNat64()
+  let totalMemory = transport.canisterMemoryBytes(canister)
+  if totalMemory < rawBytes:
+    raise newException(ValueError,
+      "canister status memory_size is smaller than raw stable memory")
   Measurement(runId: runId, implementation: implementation, repoSha: repoSha,
     wasmSha256: wasmSha, scenario: "churn_5000x100", phase: phase,
     trial: 1, cycle: cycle, rows: uint64(rows), success: true,
@@ -39,8 +44,9 @@ proc observe(transport: CliTransport; runId, implementation, repoSha, wasmSha,
     sqlitePageSize: response["sqlite_page_size"].getNat64(),
     sqlitePageCount: response["sqlite_page_count"].getNat64(),
     sqliteFreelistCount: response["sqlite_freelist_count"].getNat64(),
-    rawStablePages: some(raw), rawStableBytes: some(raw * StablePageSize),
-    rawGrowthPages: some(rawGrowthPages(baseline, raw)), rowCount: count)
+    rawStablePages: some(raw), rawStableBytes: some(rawBytes),
+    rawGrowthPages: some(rawGrowthPages(baseline, raw)),
+    heapBytes: some(totalMemory - rawBytes), rowCount: count)
 
 proc main() =
   if not fileExists(RustWasm):
