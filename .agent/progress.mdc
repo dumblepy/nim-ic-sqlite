@@ -128,6 +128,7 @@
 | 2026-09-29 | clean page cache A/B 実測 | `runner/clean_cache_ab`（profile wasm、1 canister、0/2/4/8 × 3反復） | 完走。`results/clean-cache-ab-20260929T101911Z`。全 variant で clean_cache_hits=0（本ワークロードでは base 再読が起きない）、heap_bytes・raw_stable_bytes は全 variant 同一。採用判断: 不採用・既定無効維持（後続セッションの採否記録と整合）。 |
 | 2026-09-29 | read connection / statement cache 実験機構 | `db.nim` に `queryConnectionReuse` / `queryStatementCacheEnabled`（既定 false）と read connection 専用の statement cache・close/update 時の finalize を追加、canister に `bench_set_experiment` を追加、`runner/query_reuse_ab` を追加 | 通常・profile の canister ビルドが両方通過（`NORMAL_EXIT=0`/`PROFILE_EXIT=0`）。`test_db_api.nim` の「reuse when enabled」「invalidation after update」が native で緑。`query_reuse_ab` runner もコンパイル済み（既定無効のまま A/B 可）。 |
 | 2026-09-29 | 大 BLOB 境界値追加・最終ゲート | `tests/test_vfs_semantics.nim`（4 MiB + 16 KiB 境界 BLOB の commit/reopen/内容照合）追加後 `./scripts/test.sh` | **18/18 PASS、exit 0**（`/tmp/test_sh_final.log`）。 |
+| 2026-09-29 | logic テスト移設・テスト実行統一 | comparison の logic テスト10本（keys/report/cost_model/profile_report/result_validation/transport/storage_stats/failure_atomicity/zero_extent_persistence/memory_region）を `tests/` へ移設し、`scripts/test.sh` を Testament 一括実行（`testament --print --megatest:off p 'tests/test_*.nim'`）に統一。個別 `nim c -r` 9行を削除。import を `../benchmarks/comparison/{shared,runner}` へ更新し、`tests/config.nims` に `../nicp_cdk/src` を追加。 | **28/28 PASS、exit 0**（`/tmp/test_sh_move.log`）。移設10本を含む。canister/replica 必須の `test_canister_integration`・`test_cross_upgrade` は comparison に残置し別途実行。 |
 
 ## 現在の未確定事項
 

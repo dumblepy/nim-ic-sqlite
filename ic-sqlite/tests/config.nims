@@ -8,3 +8,6 @@ switch("passC", "-I" & (icSqliteRoot / "vendor/sqlite") & " -I" & (icSqliteRoot 
 switch("passL", icSqliteRoot / "c/sqlite_helpers.c")
 switch("passL", icSqliteRoot / "c/ic_sqlite_vfs_shim.c")
 switch("passL", "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0")
+# Tests of the comparison tooling (profile_report, transport) use nicp_cdk.
+# Prefer the checked-out CDK over whatever `nimble install` last placed.
+switch("path", icSqliteRoot.parentDir / "nicp_cdk" / "src")

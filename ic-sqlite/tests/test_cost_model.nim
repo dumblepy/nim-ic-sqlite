@@ -1,5 +1,5 @@
 import std/unittest
-import ../shared/cost_model
+import ../benchmarks/comparison/shared/cost_model
 
 suite "cost estimate arithmetic":
   let rates = CycleRates(subnetNodes: 13, updateBaseCyclesPerMessage: 5_000_000,

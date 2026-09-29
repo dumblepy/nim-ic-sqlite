@@ -1,5 +1,5 @@
 import std/[json, options, strutils, unittest]
-import ../shared/bench_report
+import ../benchmarks/comparison/shared/bench_report
 
 suite "comparison measurement format":
   test "CSV has all required columns and quotes text safely":

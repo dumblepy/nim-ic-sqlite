@@ -317,7 +317,7 @@ SQLite の `SQLITE_DEFAULT_MEMSTATUS=0` は両実装の現行 compile flags に�
 | 統合 | canister upgrade / 既存 DB 復元 | superblock と既存データ互換性 |
 | Benchmark | 固定 key/value と従来 generator の全件一致 | 比較 workload の意味論維持 |
 
-**既存回帰の実行**：`ic-sqlite/scripts/test.sh` を利用し、comparison の `test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_cross_upgrade.nim`、`test_memory_region.nim` を含める。Canister が必要なテストは Docker / WASI SDK / nicp_cdk / icp CLI の既存環境で実施する。
+**既存回帰の実行**：`ic-sqlite/scripts/test.sh` を利用する。計測を伴わない logic テストは `tests/test_*.nim` に集約し、Testament（`testament --print --megatest:off p 'tests/test_*.nim'`）で実行する。旧 comparison ディレクトリの logic テスト（`test_failure_atomicity` / `test_zero_extent_persistence` / `test_memory_region` / `test_storage_stats` / `test_keys` / `test_report` / `test_cost_model` / `test_profile_report` / `test_result_validation` / `test_transport`）は `tests/` へ移設済み。Canister / local replica が必要な `benchmarks/comparison/tests/test_canister_integration.nim` と `test_cross_upgrade.nim` のみ Docker / WASI SDK / nicp_cdk / icp CLI の既存環境で別途実施する。
 
 ## 13. PR 分割・レビューゲート
 
@@ -393,3 +393,4 @@ nim c -r runner/validate.nim results/<run-id>
 - `-d:benchmarkProfile` に分離した Overlay 統計は 1 トランザクションの `Overlay` ごとなので、VFS グローバルで `endOverlay` 時に累計へ `addFrom` して集計する（`initVfs` でリセット）。
 - read connection / statement cache の実験機構は「キャッシュは必ず所有 connection と同一のタイミングで無効化される」制約で実装した: `db.update` 開始時（`beginStableOperation`）に `cachedQueryRaw` と query statement cache をまとめて close/finalize する。read connection を跨いで statement を残す経路は存在しない。
 - clean page cache は update overlay の base read 専用（read-only query connection は overlay を経由しないため影響しない）ため、A/B は `withUpdate` 中の upsert ワークロードで測る必要がある。実測（`results/clean-cache-ab-20260929T101911Z`）では 100 行 upsert × 20 反復のワークロードで dirty 化対象は 2 ページ止まりのため hits が 0 で差分なし。既定無効(0)を維持。
+- ベンチマーク計測を実行しない logic テストを `benchmarks/comparison/tests/` に置くのは不適切なため、canister / local replica を必要とする `test_canister_integration.nim`・`test_cross_upgrade.nim` を除いて `tests/` へ移設し、`scripts/test.sh` は Testament 一括実行（`tests/test_*.nim`）に統一した。移設したテストは comparison の `shared/`・`runner/` を `../benchmarks/comparison/...` の相対 import で参照し、`tests/config.nims` でリポジトリ内 `../nicp_cdk/src` を優先する。

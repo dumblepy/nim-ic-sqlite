@@ -1,5 +1,5 @@
 import std/unittest
-import ../shared/bench_spec
+import ../benchmarks/comparison/shared/bench_spec
 
 proc asString(buffer: openArray[char]): string =
   result = newString(buffer.len)
