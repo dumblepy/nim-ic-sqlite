@@ -74,6 +74,10 @@ type
     ## is invalidated before every update and on close so stale page or
     ## query state can never survive a published transaction.
     cachedQueryRaw: ptr Sqlite3
+    ## Statement cache bound to the reused read connection (only effective
+    ## while queryConnectionReuse is enabled); cleared with the connection.
+    queryStatementCache: Table[string, ptr Sqlite3Stmt]
+    queryStatementCacheStats: StatementCacheStats
   UpdateConnection* = object
     db: ptr Db
     lease: TransactionLease
@@ -102,7 +106,8 @@ proc defaultDbConfig*(): DbConfig =
     maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
     maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
     maxQueryParams: 999, statementCacheEnabled: false,
-    maxCachedStatements: 32, cleanCachePages: 0, queryConnectionReuse: false)
+    maxCachedStatements: 32, cleanCachePages: 0, queryConnectionReuse: false,
+    queryStatementCacheEnabled: false)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
@@ -283,8 +288,16 @@ when not defined(wasm32):
     db.config = config
     Result[bool, DbError](isOk: true, value: true)
 
+proc clearQueryStatementCache(db: var Db) =
+  for _, statement in db.queryStatementCache:
+    if not statement.isNil:
+      discard sqlite3_finalize(statement)
+  db.queryStatementCache.clear()
+  db.queryStatementCacheStats = StatementCacheStats()
+
 proc close*(db: var Db) =
   db.clearStatementCache()
+  db.clearQueryStatementCache()
   if not db.cachedQueryRaw.isNil:
     discard sqlite3_close(db.cachedQueryRaw)
     db.cachedQueryRaw = nil
@@ -293,9 +306,11 @@ proc close*(db: var Db) =
     db.raw = nil
 
 proc invalidateQueryConnection(db: var Db) =
-  ## Any published (or rolled back) invalidates the cached reader so it can
-  ## never keep serving stale page or query state.
+  ## Every update (published or rolled back) invalidates the cached reader so
+  ## it can never keep serving stale page or query state.  The query
+  ## statement cache lives on that connection and is torn down with it.
   if not db.cachedQueryRaw.isNil:
+    db.clearQueryStatementCache()
     discard sqlite3_close(db.cachedQueryRaw)
     db.cachedQueryRaw = nil
 
@@ -620,6 +635,41 @@ proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool
       return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
     let data = if value.blobValue.len == 0: nil else: unsafeAddr value.blobValue[0]
     code = ic_sqlite_bind_blob(statement.raw, index.cint, data, value.blobValue.len.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+## Internal-only borrowed (SQLITE_STATIC) binding helpers. These are NOT part
+## of the public API: the caller MUST guarantee that the pointer remains valid
+## until the next reset/clear_bindings/finalize, and MUST call reset (which
+## clears bindings) on every path — success, error, and early return.
+##
+## These are used exclusively in benchmark/internal paths where the data
+## lifetime is bounded by the statement's step/reset cycle and the caller
+## controls the full execution flow.
+
+proc bindStaticText*(statement: var Statement; index: int; data: cstring; length: int): Result[bool, DbError] =
+  ## Binds a TEXT value with SQLITE_STATIC (zero-copy, caller retains lifetime).
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if index <= 0:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
+  if uint64(length) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+  let code = ic_sqlite_bind_text_static(statement.raw, index.cint, data, length.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc bindStaticBlob*(statement: var Statement; index: int; data: pointer; length: int): Result[bool, DbError] =
+  ## Binds a BLOB value with SQLITE_STATIC (zero-copy, caller retains lifetime).
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if index <= 0:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
+  if uint64(length) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
+  let code = ic_sqlite_bind_blob_static(statement.raw, index.cint, data, length.cint)
   if code != sqlite_api.SqliteOk:
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)

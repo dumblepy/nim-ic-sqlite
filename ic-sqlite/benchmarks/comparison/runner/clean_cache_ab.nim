@@ -81,12 +81,12 @@ proc main() =
   defer: transport.stopNetwork()
   let canister = transport.createCanister()
   transport.install(canister, NimWasm)
-  discard transport.call(canister, NimDid, "bench_reset", $(SeedRows))
+  discard transport.call(canister, NimDid, "bench_reset", fmt"({SeedRows})")
 
   var jsonl = ""
   var variantSummary = newJArray()
   for variant in [0'u32, 2'u32, 4'u32, 8'u32]:
-    discard transport.call(canister, NimDid, "bench_set_clean_cache", $(variant))
+    discard transport.call(canister, NimDid, "bench_set_clean_cache", fmt"({variant})")
     var samples = newSeq[JsonNode]()
     for rep in 1 .. Repeats:
       let report = transport.call(canister, NimDid, "bench_clean_cache_write_profile",

@@ -153,3 +153,35 @@ suite "Db facade API":
     check stats.isOk
     check stats.value.cacheUsedBytes > 0
     db.close()
+
+  test "reuses the read connection across queries when enabled":
+    var config = defaultDbConfig()
+    config.queryConnectionReuse = true
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    check db.exec("CREATE TABLE reuse_test (value TEXT)").isOk
+    check db.execText("INSERT INTO reuse_test VALUES (?)", ["first"]).isOk
+    let first = db.queryOneText("SELECT value FROM reuse_test", [])
+    check first.isOk
+    check first.value.get == "first"
+    let second = db.queryOneText("SELECT value FROM reuse_test", [])
+    check second.isOk
+    check second.value.get == "first"
+    db.close()
+
+  test "invalidates the cached read connection after an update":
+    var config = defaultDbConfig()
+    config.queryConnectionReuse = true
+    var db: Db
+    check db.initMemoryForTest(config).isOk
+    check db.exec("CREATE TABLE inval_test (value TEXT)").isOk
+    check db.execText("INSERT INTO inval_test VALUES (?)", ["before"]).isOk
+    let before = db.queryOneText("SELECT value FROM inval_test", [])
+    check before.isOk
+    check before.value.get == "before"
+    let updated = db.execText("UPDATE inval_test SET value = ?", ["after"])
+    check updated.isOk
+    let after = db.queryOneText("SELECT value FROM inval_test", [])
+    check after.isOk
+    check after.value.get == "after"
+    db.close()

@@ -37,6 +37,8 @@ proc sqlite3_bind_double*(stmt: ptr Sqlite3Stmt; index: cint; value: cdouble): c
 proc sqlite3_bind_parameter_count*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc ic_sqlite_bind_text*(stmt: ptr Sqlite3Stmt; index: cint; value: cstring; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
 proc ic_sqlite_bind_blob*(stmt: ptr Sqlite3Stmt; index: cint; value: pointer; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
+proc ic_sqlite_bind_text_static*(stmt: ptr Sqlite3Stmt; index: cint; value: cstring; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
+proc ic_sqlite_bind_blob_static*(stmt: ptr Sqlite3Stmt; index: cint; value: pointer; length: cint): cint {.importc, cdecl, header: "sqlite_helpers.h".}
 proc sqlite3_column_count*(stmt: ptr Sqlite3Stmt): cint {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_column_name*(stmt: ptr Sqlite3Stmt; index: cint): cstring {.importc, cdecl, header: "sqlite3.h".}
 proc sqlite3_column_type*(stmt: ptr Sqlite3Stmt; index: cint): cint {.importc, cdecl, header: "sqlite3.h".}

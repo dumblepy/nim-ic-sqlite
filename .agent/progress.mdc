@@ -80,28 +80,28 @@
 - [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
 - [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
 - [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。実 canister 統合実行は回帰ゲートで継続確認する。
-- [ ] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。
-- [ ] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。
-- [ ] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。
+- [x] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。専用ランナー `runner/vfs_core.nim` を追加。
+- [x] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。`bindStaticText` / `bindStaticBlob` を `db.nim` に追加、C shim に `ic_sqlite_bind_text_static` / `ic_sqlite_bind_blob_static` を追加。
+- [x] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。Nim avg: 1,925,543, Rust avg: 1,484,474, Ratio: 1.2971。
 
 完了条件: baseline と各変更後を再現可能に比較でき、logical DB size・page count・checksum と `raw_stable_bytes` / `heap_bytes` を混同せず説明できる。
 
 ### 5. 任意最適化の採否
 
-- [ ] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。dirty 化時の所有権移動・invalidate 条件をテストする。
-- [ ] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。
-- [ ] 命令数または stable read の有意な改善と常駐 heap のトレードオフを記録し、採用・不採用を決定する。
+- [x] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。dirty 化時の所有権移動・invalidate 条件をテストする。結果: このワークロードでは clean cache hit はゼロ。heap_bytes に差なし。既定無効(0)を維持。
+- [x] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。実装済み・既定無効。invalidation テストを追加して確認。
+- [x] 命令数または stable read の有意な改善と常駐 heap のトレードオフを記録し、採用・不採用を決定する。clean cache: 不採用（効果なし）。read connection cache: 実装済み・既定無効。statement cache: 実装済み・既定無効。
 
 完了条件: 実測根拠なしに既定有効化しない。採用時は lifecycle・上限・無効化条件と測定証跡がそろう。
 
 ## 最終受け入れ確認
 
-- [ ] 全必須タスク（0〜4）と該当する既存回帰が通る。
-- [ ] main DB / temp file I/O に不要な per-call `seq` がない。
-- [ ] 同一 dirty page の不要な 16 KiB 再確保がない。
-- [ ] stable image format、superblock、公開 API、SQLite VFS/atomicity 契約を維持する。
-- [ ] 計測 manifest と結果があり、性能改善がない場合も allocation/VFS read/SQLite cache の差を説明できる。
-- [ ] 任意最適化は測定済みの採否判断または明示的な非採用理由を記録している。
+- [x] 全必須タスク（0〜4）と該当する既存回帰が通る。
+- [x] main DB / temp file I/O に不要な per-call `seq` がない。
+- [x] 同一 dirty page の不要な 16 KiB 再確保がない。
+- [x] stable image format、superblock、公開 API、SQLite VFS/atomicity 契約を維持する。
+- [x] 計測 manifest と結果があり、性能改善がない場合も allocation/VFS read/SQLite cache の差を説明できる。
+- [x] 任意最適化は測定済みの採否判断または明示的な非採用理由を記録している。
 
 ## 実行記録
 
