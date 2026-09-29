@@ -51,6 +51,16 @@ type
     maxQueryParams*: uint64
     statementCacheEnabled*: bool
     maxCachedStatements*: uint64
+    ## Optional clean base-page cache inside the update overlay. Kept disabled
+    ## (0) by default; non-zero values are only used by benchmark experiments.
+    cleanCachePages*: uint64
+    ## Optional read-only query connection reuse. Kept disabled by default;
+    ## the cached connection is invalidated before every update transaction.
+    queryConnectionReuse*: bool
+    ## Statement cache bound to the reused read connection. Only effective
+    ## while `queryConnectionReuse` is enabled; invalidated together with
+    ## the connection so no dangling statement can survive an update.
+    queryStatementCacheEnabled*: bool
   Db* = object
     raw: ptr Sqlite3
     backend: StableBackend
@@ -60,6 +70,10 @@ type
     currentUpdate: TransactionLease
     statementCache: Table[string, ptr Sqlite3Stmt]
     statementCacheStats: StatementCacheStats
+    ## Experimental read-connection reuse (disabled by default).  The handle
+    ## is invalidated before every update and on close so stale page or
+    ## query state can never survive a published transaction.
+    cachedQueryRaw: ptr Sqlite3
   UpdateConnection* = object
     db: ptr Db
     lease: TransactionLease
@@ -82,11 +96,13 @@ type
 const Wasi2icReservedStablePages = 1025'u64
 
 proc defaultDbConfig*(): DbConfig =
+  ## `cleanCachePages` stays 0 by default: the optional clean page cache is an
+  ## experiment and must not change resident memory without explicit opt-in.
   DbConfig(maxDirtyPages: 4096, maxDirtyBytes: 64'u64 * 1024 * 1024,
     maxSqlBytes: 1024'u64 * 1024, maxBlobBytes: 16'u64 * 1024 * 1024,
     maxResultRows: 1000, maxResultBytes: 8'u64 * 1024 * 1024,
     maxQueryParams: 999, statementCacheEnabled: false,
-    maxCachedStatements: 32)
+    maxCachedStatements: 32, cleanCachePages: 0, queryConnectionReuse: false)
 
 proc configIsValid(config: DbConfig): bool =
   config.maxDirtyPages > 0 and config.maxDirtyBytes >= 16384 and
@@ -125,6 +141,38 @@ proc cacheStats*(db: Db): Result[DbCacheStats, DbError] =
       error: DbError(code: -1, message: "SQLite returned a negative cache size"))
   Result[DbCacheStats, DbError](isOk: true,
     value: DbCacheStats(cacheUsedBytes: uint64(current)))
+
+when defined(benchmarkProfile):
+  type DbProfileStats* = object
+    dirtyPagesCurrent*, dirtyPagesPeak*: uint64
+    dirtyPageNew*, dirtyPageNewBytes*: uint64
+    cleanCacheHits*, cleanCacheMisses*, cleanCacheEvictions*, cleanCacheReadBytes*: uint64
+    tempBufferAllocs*, tempBufferAllocBytes*: uint64
+    vfsReadCalls*, vfsWriteCalls*, vfsShortReads*, vfsTruncateCalls*: uint64
+
+  proc profileStats*(db: Db): Result[DbProfileStats, DbError] =
+    ## Benchmark-only counters separated from normal operations by
+    ## `-d:benchmarkProfile`. VFS/overlay counters reset per `initVfs`
+    ## window; stable I/O call/byte counts come from the canister-level
+    ## counting backend, SQLite pager bytes from `cacheStats()`.
+    if db.raw.isNil:
+      return Result[DbProfileStats, DbError](isOk: false,
+        error: DbError(code: -1, message: "database is not open"))
+    let vfs = benchmarkVfsProfile()
+    let overlay = benchmarkOverlayProfile()
+    Result[DbProfileStats, DbError](isOk: true, value: DbProfileStats(
+      dirtyPagesCurrent: uint64(dirtyPageCount(activeOverlay)),
+      dirtyPagesPeak: overlay.dirtyPagePeak,
+      dirtyPageNew: overlay.dirtyPageNew,
+      dirtyPageNewBytes: overlay.dirtyPageNewBytes,
+      cleanCacheHits: overlay.cleanCacheHits,
+      cleanCacheMisses: overlay.cleanCacheMisses,
+      cleanCacheEvictions: overlay.cleanCacheEvictions,
+      cleanCacheReadBytes: overlay.cleanCacheReadBytes,
+      tempBufferAllocs: vfs.tempBufferAllocs,
+      tempBufferAllocBytes: vfs.tempBufferAllocBytes,
+      vfsReadCalls: vfs.readCalls, vfsWriteCalls: vfs.writeCalls,
+      vfsShortReads: vfs.shortReads, vfsTruncateCalls: vfs.truncateCalls))
 
 proc clearStatementCache(db: var Db) =
   for _, statement in db.statementCache:
@@ -195,7 +243,8 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
   db.config = config
   initVfs(sqliteBackend, if dbSize != 0: dbSize else: restoredSize,
     maxDirtyPages = config.maxDirtyPages, maxDirtyBytes = config.maxDirtyBytes,
-    zeroExtents = restoredZeroExtents, pageSize = restoredPageSize)
+    zeroExtents = restoredZeroExtents, pageSize = restoredPageSize,
+    cleanCachePages = config.cleanCachePages)
   beginOverlay()
   let flags = SqliteOpenReadWrite or SqliteOpenCreate or SqliteOpenNoMutex
   let code = sqlite3_open_v2("/main.db", addr db.raw, flags, "icstable")
@@ -236,14 +285,26 @@ when not defined(wasm32):
 
 proc close*(db: var Db) =
   db.clearStatementCache()
+  if not db.cachedQueryRaw.isNil:
+    discard sqlite3_close(db.cachedQueryRaw)
+    db.cachedQueryRaw = nil
   if not db.raw.isNil:
     discard sqlite3_close(db.raw)
     db.raw = nil
 
-proc beginStableOperation(db: Db): Result[bool, DbError] =
+proc invalidateQueryConnection(db: var Db) =
+  ## Any published (or rolled back) invalidates the cached reader so it can
+  ## never keep serving stale page or query state.
+  if not db.cachedQueryRaw.isNil:
+    discard sqlite3_close(db.cachedQueryRaw)
+    db.cachedQueryRaw = nil
+
+proc beginStableOperation(db: var Db): Result[bool, DbError] =
   ## A canister message must not expose writes before the SQLite operation has
   ## succeeded.  Native :memory: tests have no VFS overlay.
   if db.backend.isNil: return Result[bool, DbError](isOk: true, value: false)
+  if db.config.queryConnectionReuse:
+    db.invalidateQueryConnection()
   if overlayActive:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "a stable database operation is already active"))
@@ -445,21 +506,30 @@ proc withQuery*[T](db: var Db;
     defer: discard sqlite3_exec(db.raw, "PRAGMA query_only=OFF".cstring, nil, nil, nil)
     var memoryConnection = Connection(db: addr db, raw: db.raw)
     return body(memoryConnection)
-  var queryRaw: ptr Sqlite3
-  let openCode = sqlite3_open_v2("/main.db", addr queryRaw,
-    SqliteOpenReadOnly or SqliteOpenNoMutex, "icstable")
-  if openCode != sqlite_api.SqliteOk:
-    let error = sqliteError(queryRaw, openCode)
-    if not queryRaw.isNil: discard sqlite3_close(queryRaw)
-    return Result[T, DbError](isOk: false, error: error)
-  defer: discard sqlite3_close(queryRaw)
-  let pragmaCode = sqlite3_exec(queryRaw,
-    "PRAGMA cache_size=-32768; PRAGMA query_only=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
-    nil, nil, nil)
-  if pragmaCode != sqlite_api.SqliteOk:
-    return Result[T, DbError](isOk: false, error: sqliteError(queryRaw, pragmaCode))
+  ## Optional read-connection reuse.  The cached handle is dropped on every
+  ## update transaction (published or rolled back) so an update can never
+  ## leave a reader holding stale page state.
+  var queryRaw = if db.config.queryConnectionReuse: db.cachedQueryRaw else: nil
+  if queryRaw.isNil:
+    let openCode = sqlite3_open_v2("/main.db", addr queryRaw,
+      SqliteOpenReadOnly or SqliteOpenNoMutex, "icstable")
+    if openCode != sqlite_api.SqliteOk:
+      let error = sqliteError(queryRaw, openCode)
+      if not queryRaw.isNil: discard sqlite3_close(queryRaw)
+      return Result[T, DbError](isOk: false, error: error)
+    let pragmaCode = sqlite3_exec(queryRaw,
+      "PRAGMA cache_size=-32768; PRAGMA query_only=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
+      nil, nil, nil)
+    if pragmaCode != sqlite_api.SqliteOk:
+      discard sqlite3_close(queryRaw)
+      return Result[T, DbError](isOk: false, error: sqliteError(queryRaw, pragmaCode))
+    if db.config.queryConnectionReuse:
+      db.cachedQueryRaw = queryRaw
   var connection = Connection(db: addr db, raw: queryRaw)
-  body(connection)
+  let queryResult = body(connection)
+  if not db.config.queryConnectionReuse:
+    discard sqlite3_close(queryRaw)
+  queryResult
 
 proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
   if conn.db.isNil or conn.raw.isNil:

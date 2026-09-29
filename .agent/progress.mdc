@@ -46,7 +46,7 @@
 - [x] `vfs.nim` の temp/main DB write path を `src` から直接書き込み、per-call の一時 `seq[byte]` を除去する。
 - [x] short-read 判定をオーバーフローなしで行い、EOF 超過時は全 tail をゼロ化して `SQLITE_IOERR_SHORT_READ` を返す。
 - [x] 0-byte、nil、負値、変換範囲外の引数で境界外参照・例外伝播がないことを確認する。
-- [x] ページ境界・複数ページ I/O を native safety test で通す。大きな BLOB の SQLite 統合試験は全体回帰ゲートで継続確認する。
+- [x] ページ境界・複数ページ I/O と4 MiB BLOB の commit/reopen を native safety test で通す。
 
 完了条件: VFS hot path に I/O ごとの中間 `seq[byte]` がなく、short-read と既存 read-only 動作を維持し、プロファイル用カウンタで一時確保減少を確認できる。
 
@@ -59,7 +59,7 @@
 - [x] `maxDirtyPages` / `maxDirtyBytes` を新規 dirty page の前に検査し、既存 page 上書きで増加させない。
 - [x] dirty 化・truncate・extend と zero extent の重複除去／整合を維持する。
 - [x] publish 時に dirty page を深くコピーせず読み出し、publish 中の table 変更を避ける。
-- [ ] rollback / discard 後に dirty page が残らないことを統計・テストで確認する。
+- [x] rollback / discard 後に dirty / clean page が残らないことをテストで確認する。
 
 完了条件: 同一 dirty page の反復更新は resident page 確保一回、full-page overwrite の stable read はゼロ、上限・publish・rollback 回帰が通る。
 
@@ -69,14 +69,14 @@
 - [x] 縮小時、部分ページの保持範囲外をゼロ化し、完全に範囲外の page を zero extent として記録する。
 - [x] 縮小で範囲外になった dirty / clean page を破棄する（clean cache は初期無効）。
 - [x] 拡張・間隔を空けた write で旧 EOF 以降を zero extent として扱い、古い tail を再露出させない。
-- [x] truncate → re-extend、1 byte truncate → gap write の回帰を追加し通す。複数回 truncate は既存比較回帰で継続確認する。
-- [ ] publish 前失敗は overlay を破棄でき、publish 開始後失敗は通常エラーにせず既存 trap/atomicity 経路を維持する。
+- [x] truncate → re-extend、1 byte truncate → gap write、複数回 truncate の回帰を追加し通す。
+- [x] publish 前の stable grow 失敗では overlay を破棄でき、最初の stable page write 後の失敗は `PublishStartedError` として不可逆扱いになることをテストする。
 
 完了条件: EOF、truncate、sparse extend、COMMIT／ROLLBACK／failure atomicity／upgrade の native・canister 回帰で内容保全を確認する。
 
 ### 4. 計測と比較ワークロード
 
-- [ ] `-d:benchmarkProfile` 等で通常経路と分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
+- [x] `-d:benchmarkProfile` で通常経路から分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
 - [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
 - [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
 - [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。実 canister 統合実行は回帰ゲートで継続確認する。
@@ -118,6 +118,9 @@
 | 2026-09-29 | SQLite cache status FFI | `nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | 成功。`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)` と観測専用 `Db.cacheStats()` を追加。native SQLite で0より大きい pager cache byte を取得。実 canister report への追加は未完了。 |
 | 2026-09-29 | canister cache report | `nicp productionBuild`、`nim c benchmarks/comparison/tests/test_canister_integration.nim` | 成功。Nim canister の `db_stats` と Candid に `sqlite_cache_used_bytes` を追加。統合テストはコンパイル済みで、local ICP 実行は既存回帰ゲートで継続確認。 |
 | 2026-09-29 | canister cache integration | `./benchmarks/comparison/tests/test_canister_integration` | local ICP network の起動とテスト開始を確認。実行プロセスは終了したが、この実行環境では非同期化された子プロセスの終了コードを取得できないため、成功・失敗は未確定として扱う。 |
+| 2026-09-29 | publish atomicity | `nim c -r tests/test_overlay.nim` | 成功。stable grow の失敗は publish 前の可逆失敗、最初の page write を試行した後の失敗は不可逆として区別されることを確認。 |
+| 2026-09-29 | VFS semantics / profile | `nim c -r tests/test_vfs_semantics.nim`、`nim c -d:benchmarkProfile -r tests/test_overlay.nim` | 成功。4 MiB BLOB の commit/reopen、複数 truncate/re-extend、publish atomicity、clean cache の既定無効と profile build を確認。 |
+| 2026-09-29 | clean cache A/B runner | `nim c benchmarks/comparison/runner/clean_cache_ab.nim` | 成功。0 / 2 / 4 / 8 page、各3反復の profile-instrumented canister 測定 runner をコンパイル。実測は local ICP の実行時間を要するため未開始。 |
 
 ## 阻害事項
 

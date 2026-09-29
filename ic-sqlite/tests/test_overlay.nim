@@ -35,6 +35,16 @@ method read(backend: CountingReadBackend; offset: uint64; dst: pointer; size: ui
 method write(backend: CountingReadBackend; offset: uint64; src: pointer; size: uint64) =
   backend.delegate.write(offset, src, size)
 
+type FailingGrowBackend = ref object of StableBackend
+  delegate: StableBackend
+
+method sizePages(backend: FailingGrowBackend): uint64 = backend.delegate.sizePages()
+method grow(backend: FailingGrowBackend; pages: uint64): bool = false
+method read(backend: FailingGrowBackend; offset: uint64; dst: pointer; size: uint64) =
+  backend.delegate.read(offset, dst, size)
+method write(backend: FailingGrowBackend; offset: uint64; src: pointer; size: uint64) =
+  backend.delegate.write(offset, src, size)
+
 suite "Overlay":
   test "keeps writes off stable memory until publish":
     let storage: StableBackend = newVecStableBackend()
@@ -82,6 +92,18 @@ suite "Overlay":
     overlay.writeAt(storage, 16, [byte 2])
     expect PublishStartedError:
       overlay.publishDirtyPages(storage)
+
+  test "allows discard after a publish failure before the first page write":
+    let raw: StableBackend = newVecStableBackend()
+    let storage: StableBackend = FailingGrowBackend(delegate: raw)
+    var overlay = initOverlay(0, pageSize = 16, dbBaseOffset = 64)
+    var value = [byte 1]
+    overlay.writeFrom(storage, 0, addr value[0], 1)
+    expect ValueError:
+      overlay.publishDirtyPages(storage)
+    overlay.discardOverlay()
+    check overlay.dirtyPageCount == 0
+    check overlay.size == 0
 
   test "direct I/O keeps EOF tails zero and full page writes avoid base reads":
     let raw: StableBackend = newVecStableBackend()
@@ -143,3 +165,101 @@ suite "Overlay":
     check overlay.dirtyPageCount == 1
     expect ValueError:
       overlay.writeFrom(storage, 16, addr replacement[0], 1)
+
+  test "rollback and discard leave no resident dirty or clean pages":
+    let storage: StableBackend = newVecStableBackend()
+    check storage.grow(4)
+    var old = newSeq[byte](64)
+    for index in 0 ..< old.len: old[index] = byte(index + 1)
+    storage.write(64, addr old[0], uint64(old.len))
+    var overlay = initOverlay(64, pageSize = 16, dbBaseOffset = 64,
+      cleanCachePages = 4)
+    # Read whole clean pages so they enter the cache on the second pass.
+    var buffer = newSeq[byte](16)
+    for page in 0 ..< 4:
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+    check overlay.cleanCacheCount == 4
+    # Dirty the same pages plus an extra one, then discard everything.
+    var one = [byte 9]
+    for page in 0 ..< 5:
+      overlay.writeFrom(storage, uint64(page) * 16'u64 + 1, addr one[0], 1)
+    check overlay.dirtyPageCount == 5
+    overlay.discardOverlay()
+    check overlay.dirtyPageCount == 0
+    check overlay.cleanCacheCount == 0
+    check overlay.size == 64
+    check overlay.zeroExtents.len == 0
+
+  test "repeated truncate and re-extension keep zero extents and bytes correct":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(4)
+    var old = newSeq[byte](80)
+    for index in 0 ..< old.len: old[index] = byte((index + 1) mod 251)
+    raw.write(64, addr old[0], uint64(old.len))
+    var overlay = initOverlay(80, pageSize = 16, dbBaseOffset = 64)
+    overlay.truncate(33, raw)          # partial page
+    overlay.truncate(96, raw)          # grow beyond the old size
+    var buffer = newSeq[byte](96)
+    check overlay.readInto(raw, 0, addr buffer[0], 96)
+    check buffer[0 .. 32] == old[0 .. 32]
+    check buffer[33 .. 95] == newSeq[byte](63)
+    overlay.truncate(1, raw)
+    var marker = [byte 9]
+    overlay.writeFrom(raw, 12, addr marker[0], 1)
+    overlay.truncate(8, raw)
+    overlay.truncate(70, raw)
+    buffer = newSeq[byte](70)
+    check overlay.readInto(raw, 0, addr buffer[0], 70)
+    # The marker at offset 12 was removed by truncate(8); the re-extension
+    # must therefore expose only zeros beyond the retained byte 0.
+    check buffer[0] == 1
+    check buffer[1 .. 69] == newSeq[byte](69)
+
+  test "clean base-page cache avoids re-reading stable pages when enabled":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(4)
+    let storage: StableBackend = CountingReadBackend(delegate: raw)
+    var old = newSeq[byte](32)
+    for index in 0 ..< old.len: old[index] = byte(index + 10)
+    raw.write(64, addr old[0], uint64(old.len))
+    var overlay = initOverlay(32, pageSize = 16, dbBaseOffset = 64,
+      cleanCachePages = 2)
+    check overlay.cleanCacheMaxPages == 2
+    var buffer = newSeq[byte](16)
+    # First pass loads both cached pages from stable memory exactly once.
+    for page in 0 ..< 2:
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+    check overlay.cleanCacheCount == 2
+    # Exactly two whole-page reads reached stable memory.
+    check CountingReadBackend(storage).readCount == 2
+    let readsAfterFill = CountingReadBackend(storage).readCount
+    for page in 0 ..< 2:
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+      check buffer == old[page * 16 ..< (page + 1) * 16]
+    # Second pass must be served entirely from the clean cache.
+    check CountingReadBackend(storage).readCount == readsAfterFill
+    # Dirtying a cached page must evict its clean copy.
+    var one = [byte 9]
+    overlay.writeFrom(storage, 4, addr one[0], 1)
+    check overlay.cleanCacheCount == 1
+    check CountingReadBackend(storage).readCount == readsAfterFill
+
+  test "clean page cache is disabled by default and holds no pages":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(4)
+    let storage: StableBackend = CountingReadBackend(delegate: raw)
+    var old = newSeq[byte](48)
+    for index in 0 ..< old.len: old[index] = byte(index + 20)
+    raw.write(64, addr old[0], uint64(old.len))
+    var overlay = initOverlay(48, pageSize = 16, dbBaseOffset = 64)
+    check overlay.cleanCacheMaxPages == 0
+    var buffer = newSeq[byte](16)
+    for page in 0 ..< 3:
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+    check overlay.cleanCacheCount == 0
+    let readsAfterFill = CountingReadBackend(storage).readCount
+    for page in 0 ..< 3:
+      check overlay.readInto(storage, uint64(page) * 16'u64, addr buffer[0], 16)
+    # No cache -> every whole-page read goes back to stable memory.
+    check CountingReadBackend(storage).readCount == readsAfterFill + 3

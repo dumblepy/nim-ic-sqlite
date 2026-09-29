@@ -17,6 +17,18 @@ type FileState* = ref object
   temp: TempFile
   lock: LockState
 
+when defined(benchmarkProfile):
+  ## Benchmark-only VFS counters. They are compiled out of normal builds; a
+  ## zero temp-buffer count after the direct-I/O refactor is the expected
+  ## regression guard for this hot path.
+  type VfsProfileStats* = object
+    tempBufferAllocs*: uint64     ## heap staging buffers created during one I/O
+    tempBufferAllocBytes*: uint64
+    readCalls*: uint64
+    writeCalls*: uint64
+    shortReads*: uint64
+    truncateCalls*: uint64
+
 var storage*: StableBackend
 var databaseSize*: uint64
 var activeOverlay*: Overlay
@@ -28,8 +40,28 @@ var randomState = 1'u64
 var currentTimeNanoseconds*: uint64
 var configuredMaxDirtyPages = high(uint64)
 var configuredMaxDirtyBytes = high(uint64)
+var configuredCleanCachePages = 0'u64
 var persistedZeroExtents: seq[ZeroExtent]
 var persistedZeroExtentPageSize = 16_384'u64
+
+when defined(benchmarkProfile):
+  var vfsProfile: VfsProfileStats
+  var overlayProfile: OverlayProfileStats
+    ## Accumulated over every overlay lifetime since the last reset; each
+    ## SQLite transaction gets a fresh `Overlay`, so the per-overlay stats
+    ## alone would miss all but the current operation.
+
+  proc benchmarkVfsProfile*(): VfsProfileStats = vfsProfile
+  proc benchmarkOverlayProfile*(): OverlayProfileStats = overlayProfile
+  proc resetBenchmarkProfile*() =
+    vfsProfile = VfsProfileStats()
+    overlayProfile = OverlayProfileStats()
+  proc countTempBuffer*(bytes: uint64) =
+    ## Call site for every heap buffer that a single VFS I/O creates besides
+    ## the dirty page itself. Direct I/O must keep this at zero on the main
+    ## DB read/write hot path.
+    inc vfsProfile.tempBufferAllocs
+    vfsProfile.tempBufferAllocBytes += bytes
 
 proc zeroPersistedRange(dst: pointer; length, offset: uint64) =
   ## Query connections read without an active overlay. Apply the logical
@@ -57,17 +89,27 @@ proc setLastError*(message: string) = lastError = message
 proc lastErrorMessage*(): string = lastError
 proc initVfs*(backend: StableBackend; dbSize = 0'u64; seed = 1'u64;
               maxDirtyPages = high(uint64); maxDirtyBytes = high(uint64);
-              zeroExtents: openArray[ZeroExtent] = []; pageSize = 16_384'u32) =
+              zeroExtents: openArray[ZeroExtent] = []; pageSize = 16_384'u32;
+              cleanCachePages = 0'u64) =
   if pageSize == 0: raise newException(ValueError, "VFS page size must not be zero")
   storage = backend; databaseSize = dbSize; randomState = seed; files.clear(); nextHandleId = 1
   configuredMaxDirtyPages = maxDirtyPages; configuredMaxDirtyBytes = maxDirtyBytes
+  configuredCleanCachePages = cleanCachePages
+  when defined(benchmarkProfile):
+    vfsProfile = VfsProfileStats()
+    overlayProfile = OverlayProfileStats()
   persistedZeroExtents = @zeroExtents
   persistedZeroExtentPageSize = uint64(pageSize)
   overlayActive = false
+proc setCleanCachePages*(pages: uint64) =
+  ## Experimental knob. 0 keeps the clean page cache disabled (default);
+  ## non-zero values only matter under the benchmark A/B experiments.
+  configuredCleanCachePages = pages
 proc beginOverlay*(pageSize = 16384'u32) =
   if storage.isNil: raise newException(ValueError, "VFS backend is not configured")
   activeOverlay = initOverlay(databaseSize, pageSize,
-    maxDirtyPages = configuredMaxDirtyPages, maxDirtyBytes = configuredMaxDirtyBytes)
+    maxDirtyPages = configuredMaxDirtyPages, maxDirtyBytes = configuredMaxDirtyBytes,
+    cleanCachePages = int(configuredCleanCachePages))
   activeOverlay.zeroExtents = persistedZeroExtents
   persistedZeroExtentPageSize = uint64(pageSize)
   overlayActive = true
@@ -76,6 +118,9 @@ proc endOverlay*(publish = false) =
     activeOverlay.publishDirtyPages(storage)
     databaseSize = activeOverlay.size
     persistedZeroExtents = activeOverlay.zeroExtents
+  when defined(benchmarkProfile):
+    ## Merge before discard so the accumulator survives overlay teardown.
+    overlayProfile.addFrom(activeOverlay.benchmarkProfile)
   activeOverlay.discardOverlay(); overlayActive = false
 proc currentZeroExtents*(): seq[ZeroExtent] = persistedZeroExtents
 proc openFile*(name: string; flags: cint; handleId: var uint32; outFlags: var cint): cint =
@@ -106,12 +151,16 @@ proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cin
       let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
       if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), dst, readable)
       zeroPersistedRange(dst, uint64(size), uint64(offset))
+    when defined(benchmarkProfile):
+      inc vfsProfile.readCalls
+      if short: inc vfsProfile.shortReads
     if short: SqliteIoErrShortRead else: SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErrRead
 proc writeFile*(handleId: uint32; src: pointer; amount: cint; offset: int64): cint =
   if amount < 0 or offset < 0 or (amount > 0 and src.isNil): return SqliteIoErrWrite
   try:
     let state = stateFor(handleId); let size = int(amount)
+    when defined(benchmarkProfile): inc vfsProfile.writeCalls
     if state.kind == fkTemp:
       if offset > int64(high(int)): return SqliteIoErrWrite
       state.temp.writeFrom(int(offset), src, size)
@@ -123,6 +172,7 @@ proc truncateFile*(handleId: uint32; size: int64): cint =
   if size < 0: return SqliteIoErr
   try:
     let state = stateFor(handleId)
+    when defined(benchmarkProfile): inc vfsProfile.truncateCalls
     if state.kind == fkTemp:
       if uint64(size) > uint64(high(int)): return SqliteIoErr
       state.temp.truncate(int(size))
