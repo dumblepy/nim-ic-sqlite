@@ -79,6 +79,7 @@
 - [ ] `-d:benchmarkProfile` 等で通常経路と分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
 - [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
 - [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
+- [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。実 canister 統合実行は回帰ゲートで継続確認する。
 - [ ] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。
 - [ ] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。
 - [ ] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。
@@ -111,6 +112,12 @@
 | 2026-09-29 | VFS / overlay 追加回帰 | `nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim`、`nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | すべて成功。複数ページ I/O、overlapping write、dirty-page 上限、公開 DB API の回帰を確認。 |
 | 2026-09-29 | 比較計測 | `nim c benchmarks/comparison/runner/churn.nim`、`nim c -r benchmarks/comparison/tests/test_storage_stats.nim`、`nim c -r benchmarks/comparison/tests/test_result_validation.nim`、`nim c -r benchmarks/comparison/tests/test_keys.nim` | すべて成功。churn の `heap_bytes` 記録と固定長 key/value generator のバイト列互換を確認。実 canister の5組比較は未測定。 |
 | 2026-09-29 | 既存比較回帰 | `nim c -r benchmarks/comparison/tests/test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_memory_region.nim` | 3件成功。`test_cross_upgrade.nim` は local ICP network 起動まで確認し、非同期実行の終了コードをこのセッションで取得できなかったため完走未確認。 |
+| 2026-09-29 | Wasm build | `cd ic-sqlite/benchmarks/comparison/nim_canister/backend && nicp productionBuild` | 成功。現在の VFS/Overlay 変更を含む `main.wasm` を生成し、Nim → WASI → wasi2ic → wasm-opt/ic-wasm の production pipeline を通過。 |
+| 2026-09-29 | partial truncate 修正 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_overlay.nim` | 成功。VFS の `truncateFile` が Overlay へ stable backend を渡していなかったため、部分 truncate が失敗する経路を修正し、prefix 保持と short-read のゼロ埋めを回帰テスト化。 |
+| 2026-09-29 | VFS 整数境界 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_db_api.nim` | 成功。SQLite の signed file-size 範囲を超える値を `SQLITE_IOERR` に変換し、整数変換のラップを防止。 |
+| 2026-09-29 | SQLite cache status FFI | `nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | 成功。`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)` と観測専用 `Db.cacheStats()` を追加。native SQLite で0より大きい pager cache byte を取得。実 canister report への追加は未完了。 |
+| 2026-09-29 | canister cache report | `nicp productionBuild`、`nim c benchmarks/comparison/tests/test_canister_integration.nim` | 成功。Nim canister の `db_stats` と Candid に `sqlite_cache_used_bytes` を追加。統合テストはコンパイル済みで、local ICP 実行は既存回帰ゲートで継続確認。 |
+| 2026-09-29 | canister cache integration | `./benchmarks/comparison/tests/test_canister_integration` | local ICP network の起動とテスト開始を確認。実行プロセスは終了したが、この実行環境では非同期化された子プロセスの終了コードを取得できないため、成功・失敗は未確定として扱う。 |
 
 ## 阻害事項
 

@@ -74,3 +74,27 @@ suite "VFS registry":
     output = newSeq[byte](48)
     check readFile(id, addr output[0], cint(output.len), 0) == SqliteOk
     check output == input
+
+  test "partial main DB truncate keeps the retained prefix and zeroes re-extension":
+    let backend: StableBackend = newVecStableBackend()
+    check backend.grow(2)
+    initVfs(backend)
+    var id: uint32
+    var flags: cint
+    check openFile("/main.db", 0, id, flags) == SqliteOk
+    beginOverlay(pageSize = 16)
+    var input = [byte 1, 2, 3, 4]
+    check writeFile(id, addr input[0], 4, 0) == SqliteOk
+    check truncateFile(id, 1) == SqliteOk
+    var output = [byte 99, 99, 99, 99]
+    check readFile(id, addr output[0], 4, 0) == SqliteIoErrShortRead
+    check output == [byte 1, 0, 0, 0]
+
+  test "file sizes outside SQLite's signed range return an I/O error":
+    let backend: StableBackend = newVecStableBackend()
+    initVfs(backend, dbSize = uint64(high(int64)) + 1)
+    var id: uint32
+    var flags: cint
+    var size: int64
+    check openFile("/main.db", 0, id, flags) == SqliteOk
+    check fileSize(id, size) == SqliteIoErr

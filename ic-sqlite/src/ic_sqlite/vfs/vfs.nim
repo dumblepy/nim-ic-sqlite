@@ -123,16 +123,20 @@ proc truncateFile*(handleId: uint32; size: int64): cint =
   if size < 0: return SqliteIoErr
   try:
     let state = stateFor(handleId)
-    if state.kind == fkTemp: state.temp.truncate(int(size))
-    elif overlayActive: activeOverlay.truncate(uint64(size))
+    if state.kind == fkTemp:
+      if uint64(size) > uint64(high(int)): return SqliteIoErr
+      state.temp.truncate(int(size))
+    elif overlayActive: activeOverlay.truncate(uint64(size), storage)
     else: return SqliteReadOnly
     SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErr
 proc fileSize*(handleId: uint32; size: var int64): cint =
   try:
     let state = stateFor(handleId)
-    size = if state.kind == fkTemp: state.temp.len.int64
-      elif overlayActive: activeOverlay.size.int64 else: databaseSize.int64
+    let fileLen = if state.kind == fkTemp: uint64(state.temp.len)
+      elif overlayActive: activeOverlay.size else: databaseSize
+    if fileLen > uint64(high(int64)): return SqliteIoErr
+    size = int64(fileLen)
     SqliteOk
   except CatchableError as error: setLastError(error.msg); SqliteIoErr
 proc lockFile*(handleId: uint32; level: cint): cint =

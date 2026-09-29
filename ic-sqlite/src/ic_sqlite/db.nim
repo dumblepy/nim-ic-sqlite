@@ -27,6 +27,9 @@ type
     ## It is deliberately distinct from canister-wide raw stable pages.
     dbSize*: uint64
     sqliteVirtualPages*: uint64
+  DbCacheStats* = object
+    ## SQLite pager-cache bytes, distinct from VFS/stable-memory counters.
+    cacheUsedBytes*: uint64
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
     dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
@@ -97,12 +100,31 @@ proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
 
 proc statementCacheStats*(db: Db): StatementCacheStats = db.statementCacheStats
 
+proc dbError(db: Db; code: cint): DbError
+
 proc storageStats*(db: Db): DbStorageStats =
   ## Read-only storage metadata for benchmark and operational observation.
   ## Canister-wide raw stable memory must be sampled separately via ic0.
   result.dbSize = databaseSize
   if not db.backend.isNil:
     result.sqliteVirtualPages = db.backend.sizePages()
+
+proc cacheStats*(db: Db): Result[DbCacheStats, DbError] =
+  ## `SQLITE_DEFAULT_MEMSTATUS=0` does not disable per-connection db status.
+  ## Keep this opt-in observation separate from regular database operations.
+  if db.raw.isNil:
+    return Result[DbCacheStats, DbError](isOk: false,
+      error: DbError(code: -1, message: "database is not open"))
+  var current, highwater: cint
+  let code = sqlite3_db_status(db.raw, SqliteDbStatusCacheUsed,
+    addr current, addr highwater, 0)
+  if code != sqlite_api.SqliteOk:
+    return Result[DbCacheStats, DbError](isOk: false, error: db.dbError(code))
+  if current < 0:
+    return Result[DbCacheStats, DbError](isOk: false,
+      error: DbError(code: -1, message: "SQLite returned a negative cache size"))
+  Result[DbCacheStats, DbError](isOk: true,
+    value: DbCacheStats(cacheUsedBytes: uint64(current)))
 
 proc clearStatementCache(db: var Db) =
   for _, statement in db.statementCache:

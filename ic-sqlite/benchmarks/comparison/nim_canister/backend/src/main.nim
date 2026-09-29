@@ -13,6 +13,7 @@ type
     rows, instructions, checksum, db_size, stable_pages, stable_bytes: uint64
   DbStatsReport = object
     db_size, stable_pages, stable_bytes, sqlite_page_size, sqlite_page_count, sqlite_freelist_count: uint64
+    sqlite_cache_used_bytes: uint64
   BenchChurnStepReport = object
     cycle, rows, instructions, row_count, db_size, stable_pages, stable_bytes: uint64
     sqlite_page_size, sqlite_page_count, sqlite_freelist_count: uint64
@@ -776,9 +777,12 @@ proc db_stats() {.query.} =
   if not pageCount.isOk: replyErr(pageCount.error.message); return
   let freeCount = scalar("PRAGMA freelist_count")
   if not freeCount.isOk: replyErr(freeCount.error.message); return
+  let cache = database.cacheStats()
+  if not cache.isOk: replyErr(cache.error.message); return
   replyOk(DbStatsReport(db_size: stats.dbSize, stable_pages: stats.sqliteVirtualPages,
     stable_bytes: stats.sqliteVirtualPages * bench_spec.StablePageSize, sqlite_page_size: pageSize.value,
-    sqlite_page_count: pageCount.value, sqlite_freelist_count: freeCount.value))
+    sqlite_page_count: pageCount.value, sqlite_freelist_count: freeCount.value,
+    sqlite_cache_used_bytes: cache.value.cacheUsedBytes))
 
 proc bench_host_stats() {.query.} =
   let rawPages = newIcStableBackend().sizePages()

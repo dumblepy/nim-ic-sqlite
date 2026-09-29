@@ -84,6 +84,7 @@ suite "Nim benchmark canister":
     check stats["sqlite_page_count"].getNat64() > 0
     let raw = decodedReply("bench_host_stats", "()", query = true)
     check raw["raw_stable_pages"].getNat64() >= stats["stable_pages"].getNat64()
+    check stats["sqlite_cache_used_bytes"].getNat64() > 0
     check decodedReply("bench_large_blob", "(65536)")["checksum"].getNat64() == 65_536
     check decodedReply("bench_join", "(100)")["checksum"].getNat64() == 100
     check decodedReply("bench_many_rows", "(3)", query = true)["checksum"].getNat64() == 81

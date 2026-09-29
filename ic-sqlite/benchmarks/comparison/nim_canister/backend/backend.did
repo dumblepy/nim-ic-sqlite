@@ -1,5 +1,5 @@
 type BenchReport = record { rows : nat64; instructions : nat64; checksum : nat64; db_size : nat64; stable_pages : nat64; stable_bytes : nat64 };
-type DbStatsReport = record { db_size : nat64; stable_pages : nat64; stable_bytes : nat64; sqlite_page_size : nat64; sqlite_page_count : nat64; sqlite_freelist_count : nat64 };
+type DbStatsReport = record { db_size : nat64; stable_pages : nat64; stable_bytes : nat64; sqlite_page_size : nat64; sqlite_page_count : nat64; sqlite_freelist_count : nat64; sqlite_cache_used_bytes : nat64 };
 type BenchChurnStepReport = record { cycle : nat64; phase : text; rows : nat64; instructions : nat64; row_count : nat64; db_size : nat64; stable_pages : nat64; stable_bytes : nat64; sqlite_page_size : nat64; sqlite_page_count : nat64; sqlite_freelist_count : nat64 };
 type HostStatsReport = record { raw_stable_pages : nat64; raw_stable_bytes : nat64 };
 type NimCapacityGrowthReport = record { rows : nat64; writes : nat64; instructions : nat64; checksum : nat64; db_size_before : nat64; db_size_after : nat64; sqlite_virtual_pages_before : nat64; sqlite_virtual_pages_after : nat64; raw_stable_pages_before : nat64; raw_stable_pages_after : nat64; raw_stable_bytes_before : nat64; raw_stable_bytes_after : nat64 };

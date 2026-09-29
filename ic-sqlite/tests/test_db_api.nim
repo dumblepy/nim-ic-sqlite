@@ -144,3 +144,12 @@ suite "Db facade API":
     let invalid = db.migrate([Migration(version: 2, sql: "SELECT 1"), Migration(version: 1, sql: "SELECT 1")])
     check not invalid.isOk
     db.close()
+
+  test "reports SQLite pager cache bytes independently of stable storage":
+    var db: Db
+    check db.initMemoryForTest().isOk
+    check db.exec("CREATE TABLE cache_status_test (value TEXT)").isOk
+    let stats = db.cacheStats()
+    check stats.isOk
+    check stats.value.cacheUsedBytes > 0
+    db.close()
