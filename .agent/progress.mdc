@@ -131,8 +131,10 @@
 | 2026-09-29 | branch 11 分岐点確認 | `git log --oneline`、branch rule と設計の突き合わせ | 分岐点 `b236b5c` は `9-update-vsf`(PR #10) のマージ。設計 A〜F の必須実装は取り込み済み。 |
 | 2026-09-29 | 回帰ゲート完走（branch 11） | `./scripts/test.sh`（wasi-sdk 34、`install.sh`→`build_sqlite.sh`→Testament） | **28/28 PASS、exit 0**（`/tmp/test_sh_b11.log`）。設計 A〜F の回帰を含む。 |
 | 2026-09-29 | 設計 DoD 突き合わせ | `.agent/rules/branch/11-update-memory-management.mdc` 14 節 vs `src/ic_sqlite/vfs/{vfs,overlay,temp_file}.nim` | 未実装の必須項目なし。設計 11.2 の `GC_getStatistics` は通常計測に追加しない方針を確定。 |
-| 2026-09-29 | MemoryManager 互換 | `nim c -r tests/test_memory_manager.nim` | **6/6 PASS**。fresh `MGR` バイト配置、bucket 境界 I/O、既存 `MGR` ロードと MemoryId 7 共存＋SQLite CRUD/再オープン、wasi2ic prefix 後方配置、foreign/corrupt 拒否、境界・上限を確認。 |
-| 2026-09-29 | MemoryManager 回帰ゲート | `./scripts/test.sh` | 実行中（結果は本ファイル下部に追記）。 |
+| 2026-09-29 | MemoryManager 互換 | `nim c -r tests/test_memory_manager.nim` | **7/7 PASS**。fresh `MGR` バイト配置、bucket 境界 I/O、既存 `MGR` ロードと MemoryId 7 共存＋SQLite CRUD/再オープン、wasi2ic prefix 後方配置、MemoryId 間の物理 bucket 非重複（interleaved）、foreign/corrupt 拒否、境界・上限を確認。 |
+| 2026-09-29 | MemoryManager 回帰ゲート | `./scripts/test.sh` | **29/29 PASS、exit 0**（`/tmp/test_sh_mm.log`）。`test_memory_manager` / `test_memory_region` / example canister productionBuild を含む。 |
+| 2026-09-29 | 使い方ドキュメント | ルート `README.md`（英語）に MemoryManager の使い方・`MGR` レイアウト・wasi2ic 共存・foreign 検出・制約を追記 | 実装 API（`initMemoryManager` / `newMemoryId` / `getMemory` / `stableBackendAfterForeignManager`）と物理レイアウト、`test_memory_manager.nim` の検証内容を反映。 |
+| 2026-09-29 | README 統合 | `ic-sqlite/README.md` を削除し、内容（比較ベンチマーク節を含む）を英語化してルート `README.md` に統合 | ベンチマーク節（Core KV / Churn / Profile / 解釈上の注意）、stable memory 互換性節、MemoryManager の `MGR` レイアウト図を追加。`ic-sqlite/README.md` は削除（`project.mdc` 38 節の推奨構成からの明示的な逸脱。テスト・CI からの参照は無し）。 |
 
 ## 現在の未確定事項
 

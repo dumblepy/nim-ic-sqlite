@@ -145,6 +145,47 @@ suite "MemoryManager virtual stable memory":
     let ownedMagic = readBytes(raw, Wasi2icReservedStablePages * StablePageSize, 3)
     check ownedMagic == @[byte('M'), byte('G'), byte('R')]
 
+  test "interleaved memories keep disjoint physical bucket ranges":
+    let raw: StableBackend = newVecStableBackend()
+    let manager = initMemoryManager(raw)
+    let a = manager.getMemory(newMemoryId(0))
+    let b = manager.getMemory(newMemoryId(1))
+
+    ## Grow A, B, A so A's buckets are non-contiguous (0 and 2) while B owns 1.
+    check a.grow(MgrBucketSizePages)
+    check b.grow(MgrBucketSizePages)
+    check a.grow(MgrBucketSizePages)
+    check manager.memoryBucketCount(newMemoryId(0)) == 2
+    check manager.memoryBucketCount(newMemoryId(1)) == 1
+
+    ## The allocation table assigns each bucket to exactly one owner.
+    let owners = readBytes(raw, uint64(MgrHeaderSize), 3)
+    check owners == @[byte(0), byte(1), byte(0)]
+
+    ## Write the second logical bucket of A and confirm it lands in bucket 2,
+    ## not in B's bucket 1.  Distinct fill bytes make cross-talk obvious.
+    let secondBucket = MgrBucketSizePages * StablePageSize
+    var aSecond = newSeq[byte](32)
+    for index in 0 ..< aSecond.len: aSecond[index] = 0xA5
+    a.write(secondBucket, addr aSecond[0], uint64(aSecond.len))
+    var bFirst = newSeq[byte](32)
+    for index in 0 ..< bFirst.len: bFirst[index] = 0x5A
+    b.write(0, addr bFirst[0], uint64(bFirst.len))
+
+    let bucket2Physical = StablePageSize + 2 * MgrBucketSizePages * StablePageSize
+    check readBytes(raw, bucket2Physical, aSecond.len) == aSecond
+    let bucket1Physical = StablePageSize + 1 * MgrBucketSizePages * StablePageSize
+    check readBytes(raw, bucket1Physical, bFirst.len) == bFirst
+    ## Bucket 0 belongs to A and was never written past its logical range.
+    check readBytes(raw, StablePageSize, 1) == @[byte(0)]
+
+    var aBack = newSeq[byte](aSecond.len)
+    a.read(secondBucket, addr aBack[0], uint64(aBack.len))
+    check aBack == aSecond
+    var bBack = newSeq[byte](bFirst.len)
+    b.read(0, addr bBack[0], uint64(bBack.len))
+    check bBack == bFirst
+
   test "rejects foreign and corrupt images without modifying them":
     let foreign: StableBackend = newVecStableBackend()
     check foreign.grow(1)
