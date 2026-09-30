@@ -24,6 +24,13 @@ suite "comparison benchmark fixtures":
     for index in [0'u32, 42'u32, 99_999_999'u32]:
       check asString(benchKeyBuffer(index)) == benchKey(index)
       check asString(benchValueBuffer(index)) == benchValue(index)
+      check asString(updatedValueBuffer(index)) == updatedValue(index)
+
+  test "updated value buffer matches the Rust fixed-length fixture":
+    check updatedValueBuffer(42).len == 27
+    check updatedValue(42) == "updated-00000042-stable-vfs"
+    for index in [0'u32, 1'u32, 42'u32, 9_999'u32, 99_999_999'u32]:
+      check asString(updatedValueBuffer(index)) == updatedValue(index)
 
   test "key limits prevent eight-digit truncation":
     check validateFixedBenchKeyRows(100_000_000)

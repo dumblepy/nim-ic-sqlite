@@ -133,8 +133,12 @@ proc closeFile*(handleId: uint32): cint =
   if not files.hasKey(handleId): return SqliteIoErr
   files.del(handleId); SqliteOk
 proc stateFor(handleId: uint32): FileState =
-  if not files.hasKey(handleId): raise newException(ValueError, "unknown VFS handle")
-  files[handleId]
+  ## Single hash lookup for the hot VFS path: `withValue` uses one `rawGet`
+  ## instead of a `hasKey` lookup followed by a second `[]` lookup.
+  files.withValue(handleId, state):
+    result = state[]
+  do:
+    raise newException(ValueError, "unknown VFS handle")
 proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cint =
   if amount < 0 or offset < 0 or (amount > 0 and dst.isNil): return SqliteIoErrRead
   try:
@@ -146,10 +150,14 @@ proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cin
     elif overlayActive:
       short = not activeOverlay.readInto(storage, uint64(offset), dst, uint64(size))
     else:
-      if size > 0: zeroMem(dst, size)
       short = uint64(offset) >= databaseSize or uint64(size) > databaseSize - uint64(offset)
       let readable = if uint64(offset) >= databaseSize: 0'u64 else: min(uint64(size), databaseSize - uint64(offset))
       if readable > 0: storage.read(SuperblockReservedBytes + uint64(offset), dst, readable)
+      ## Only the bytes past the logical EOF need an explicit zero fill; the
+      ## persisted truncation map is applied on top and covers its own ranges.
+      if readable < uint64(size):
+        let target = cast[ptr UncheckedArray[byte]](dst)
+        zeroMem(addr target[int(readable)], int(uint64(size) - readable))
       zeroPersistedRange(dst, uint64(size), uint64(offset))
     when defined(benchmarkProfile):
       inc vfsProfile.readCalls

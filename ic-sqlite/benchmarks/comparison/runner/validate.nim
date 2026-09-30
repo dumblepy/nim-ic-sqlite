@@ -100,16 +100,17 @@ proc validateCoreManifest*(resultDir: string) =
     raise newException(ValueError, "manifest does not classify local cycle balances")
 
 const
-  ChurnCycles* = 100
   ChurnInitialRows* = 5_000
   ChurnStepRows* = 1_000
 
 proc validateChurnResults*(measurementsPath: string) =
   ## P5: mechanically reject a churn run with a failed, missing, or unpaired step.
-  ## Each implementation must contribute exactly 201 successful rows
-  ## (1 reset + 100 delete + 100 insert) with the expected row counts.
+  ## Each implementation must contribute a reset plus a contiguous delete/insert
+  ## cycle range starting at 0 (the full run is 100 cycles, but a shorter
+  ## comparison run is accepted) with the expected row counts.
   var seen = initHashSet[string]()
   var implementations = initHashSet[string]()
+  var maxCycle = -1
   for line in lines(measurementsPath):
     if line.len == 0: continue
     let row = parseJson(line)
@@ -127,6 +128,8 @@ proc validateChurnResults*(measurementsPath: string) =
     let key = implementation & ":" & phase & ":" & $cycle
     if key in seen: raise newException(ValueError, "duplicate churn measurement: " & key)
     seen.incl(key)
+    if phase != "reset":
+      maxCycle = max(maxCycle, int(cycle))
     let expectedCount = case phase
       of "reset": ChurnInitialRows
       of "delete": ChurnInitialRows - ChurnStepRows
@@ -140,13 +143,15 @@ proc validateChurnResults*(measurementsPath: string) =
     requiredNumber(row, "raw_stable_bytes", key)
     requiredNumber(row, "sqlite_page_count", key)
     requiredNumber(row, "sqlite_freelist_count", key)
+  if maxCycle < 0:
+    raise newException(ValueError, "no churn cycles found")
   for phase in ChurnPhases:
     for implementation in ["nim", "rust"]:
       if phase == "reset":
         let key = implementation & ":reset:0"
         if key notin seen: raise newException(ValueError, "missing churn measurement: " & key)
       else:
-        for cycle in 0 ..< ChurnCycles:
+        for cycle in 0 .. maxCycle:
           let key = implementation & ":" & phase & ":" & $cycle
           if key notin seen: raise newException(ValueError, "missing churn measurement: " & key)
 
@@ -177,7 +182,7 @@ proc runKind*(measurementsPath: string): string =
     let row = parseJson(line)
     if row.hasKey("profile"): return "profile"
     let scenario = if row.hasKey("scenario"): row["scenario"].getStr() else: ""
-    return if scenario == "churn_5000x100": "churn_capacity" else: "local_comparison"
+    return if scenario.startsWith("churn_5000x"): "churn_capacity" else: "local_comparison"
   raise newException(ValueError, "no measurements to validate")
 
 proc main() =

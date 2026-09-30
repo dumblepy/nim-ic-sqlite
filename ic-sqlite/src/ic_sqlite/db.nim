@@ -3,6 +3,7 @@ import std/[options, tables]
 import ./ffi/sqlite_api
 import ./ffi/vfs_exports
 import ./stable/[backend, superblock]
+import ./stable/memory_manager
 import ./vfs/vfs
 import ./vfs/overlay
 import ./value
@@ -90,14 +91,16 @@ type
     errorSource: ptr Sqlite3
     cached: bool
     cacheKey: string
+    ## Set for cached update statements so a handle leaked past `withUpdate`
+    ## cannot be executed after its transaction lease ends.
+    lease: TransactionLease
+    cachedInDb: bool
   StepResult* = enum
     srRow, srDone
   Migration* = object
     version*: uint64
     sql*: string
   IcSqliteDb* = Db
-
-const Wasi2icReservedStablePages = 1025'u64
 
 proc defaultDbConfig*(): DbConfig =
   ## `cleanCachePages` stays 0 by default: the optional clean page cache is an
@@ -186,18 +189,23 @@ proc clearStatementCache(db: var Db) =
   db.statementCache.clear()
   db.statementCacheStats = StatementCacheStats()
 
+proc resetCachedUpdateStatements(db: var Db) =
+  ## Called at the end of every update transaction. Cached update statements
+  ## stay resident on the persistent write connection but are reset and their
+  ## bindings cleared, so no statement state can leak into the next transaction.
+  if not db.config.statementCacheEnabled: return
+  for _, raw in db.statementCache:
+    if not raw.isNil:
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
+
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
-  ## wasi2ic reserves stable memory under the MGR+version header. Preserve that
-  ## region and give SQLite a logical page-aligned region after it.
-  if backend.sizePages == 0: return backend
-  var magic: array[4, byte]
-  try:
-    backend.read(0, addr magic[0], uint64(magic.len))
-    if magic[0 .. 2] == [byte('M'), byte('G'), byte('R')]:
-      return newOffsetStableBackend(backend, Wasi2icReservedStablePages * StablePageSize)
-  except CatchableError:
-    discard
-  backend
+  ## When the process boots through wasi2ic, the WASI polyfill owns a fixed
+  ## `MGR` prefix.  Preserve that region and give SQLite a logical page-aligned
+  ## view after it.  Applications that instead drive a SQLite-owned
+  ## `MemoryManager` should pass `manager.getMemory(id)` here, whose offset 0
+  ## is not `MGR` and is therefore used verbatim.
+  stableBackendAfterForeignManager(backend)
 
 proc sqliteError(raw: ptr Sqlite3; code: cint): DbError =
   DbError(code: code, message: if raw.isNil: "SQLite open failed" else: $sqlite3_errmsg(raw))
@@ -350,14 +358,20 @@ proc execRaw(db: var Db; sql: string): Result[int, DbError] =
   Result[int, DbError](isOk: true, value: int(sqlite3_changes(db.raw)))
 
 proc execTextRaw(db: var Db; sql: string; values: openArray[string]): Result[int, DbError] =
+  ## The `values` argument stays alive for the whole call, so the TEXT
+  ## parameters are bound with SQLITE_STATIC (zero copy) and finalized before
+  ## this proc returns: no borrowed pointer can outlive the caller's buffers.
   for value in values:
     if uint64(value.len) > db.config.maxBlobBytes:
       return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
   var statement: ptr Sqlite3Stmt
   var code = sqlite3_prepare_v2(db.raw, sql.cstring, sql.len.cint, addr statement, nil)
   if code == sqlite_api.SqliteOk:
-    for index, value in values:
-      code = ic_sqlite_bind_text(statement, cint(index + 1), value.cstring, value.len.cint)
+    for index in 0 ..< values.len:
+      let textLen = values[index].len
+      let data = if textLen == 0: cstring("")
+                 else: cast[cstring](unsafeAddr values[index][0])
+      code = ic_sqlite_bind_text_static(statement, cint(index + 1), data, textLen.cint)
       if code != sqlite_api.SqliteOk: break
   if code == sqlite_api.SqliteOk: code = sqlite3_step(statement)
   if not statement.isNil: discard sqlite3_finalize(statement)
@@ -399,6 +413,9 @@ proc execText*(db: var Db; sql: string; values: openArray[string]): Result[int, 
 
 proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError]
 proc finalize*(statement: var Statement)
+proc executeBorrowed*(statement: var Statement;
+                      values: openArray[SqlValue]): Result[bool, DbError]
+proc invalidateCachedStatement(statement: var Statement)
 
 proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
   ## Typed prepared execution using the same overlay/publish path as execText.
@@ -411,17 +428,14 @@ proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[i
     code = -1
   if code == sqlite_api.SqliteOk:
     var statement = Statement(raw: raw, db: addr db, errorSource: db.raw)
-    for index, value in values:
-      let bound = statement.bind(index + 1, value)
-      if not bound.isOk:
-        statement.finalize()
-        discard db.finishStableOperation(begun.value, false)
-        return Result[int, DbError](isOk: false, error: bound.error)
-    code = sqlite3_step(raw)
+    let executed = statement.executeBorrowed(values)
     statement.finalize()
+    if not executed.isOk:
+      discard db.finishStableOperation(begun.value, false)
+      return Result[int, DbError](isOk: false, error: executed.error)
   elif not raw.isNil:
     discard sqlite3_finalize(raw)
-  if code != SqliteDone:
+  if code != sqlite_api.SqliteOk:
     discard db.finishStableOperation(begun.value, false)
     return Result[int, DbError](isOk: false, error: db.dbError(code))
   let finished = db.finishStableOperation(begun.value, true)
@@ -452,16 +466,13 @@ proc execValues*(conn: var UpdateConnection; sql: string; values: openArray[SqlV
   if code == sqlite_api.SqliteOk and int(sqlite3_bind_parameter_count(raw)) != values.len: code = -1
   if code == sqlite_api.SqliteOk:
     var statement = Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw)
-    for index, value in values:
-      let bound = statement.bind(index + 1, value)
-      if not bound.isOk:
-        statement.finalize()
-        return Result[int, DbError](isOk: false, error: bound.error)
-    code = sqlite3_step(raw)
+    let executed = statement.executeBorrowed(values)
     statement.finalize()
+    if not executed.isOk:
+      return Result[int, DbError](isOk: false, error: executed.error)
   elif not raw.isNil:
     discard sqlite3_finalize(raw)
-  if code != sqlite_api.SqliteDone:
+  if code != sqlite_api.SqliteOk:
     return Result[int, DbError](isOk: false, error: conn.db[].dbError(code))
   Result[int, DbError](isOk: true, value: int(sqlite3_changes(conn.db[].raw)))
 
@@ -578,7 +589,7 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
       inc stats[].hits
       return Result[Statement, DbError](isOk: true,
         value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-          cached: true, cacheKey: sql))
+          cached: true, cacheKey: sql, cachedInDb: inDbCache))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
@@ -595,20 +606,48 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
       inc stats[].misses
       return Result[Statement, DbError](isOk: true,
         value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-          cached: true, cacheKey: sql))
+          cached: true, cacheKey: sql, cachedInDb: inDbCache))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
 proc prepare*(conn: var UpdateConnection; sql: string): Result[Statement, DbError] =
-  ## A prepared statement used only inside the current update transaction.
+  ## A prepared statement used inside the current update transaction.
+  ##
+  ## When `config.statementCacheEnabled` is set, the statement is cached on the
+  ## persistent write connection (`db.statementCache`) so repeated update
+  ## messages with the same SQL skip re-preparation. Cached handles carry the
+  ## transaction lease and are rejected by `step`/`bind` once the lease ends, so
+  ## a handle leaked past `withUpdate` cannot run outside its transaction. The
+  ## cache is reset (not finalized) at the end of every transaction and an entry
+  ## is evicted if SQLite reports an error for it.
   if conn.db.isNil or conn.db[].raw.isNil or conn.lease.isNil or not conn.lease.active:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "update connection is not active", kind: dekInvalidState))
+  if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
+    return Result[Statement, DbError](isOk: false,
+      error: DbError(code: -1, message: "SQL exceeds configured limit", kind: dekInvalidState))
+  let cacheable = conn.db[].config.statementCacheEnabled
+  if cacheable:
+    let cache = addr conn.db[].statementCache
+    if cache[].hasKey(sql):
+      let raw = cache[][sql]
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
+      inc conn.db[].statementCacheStats.hits
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw,
+          cached: true, cacheKey: sql, lease: conn.lease, cachedInDb: true))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.db[].raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     if not raw.isNil: discard sqlite3_finalize(raw)
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.db[].raw, code))
+  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
+    conn.db[].statementCache[sql] = raw
+    inc conn.db[].statementCacheStats.misses
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw,
+        cached: true, cacheKey: sql, lease: conn.lease, cachedInDb: true))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw))
 
@@ -640,9 +679,18 @@ proc queryLimits*(statement: Statement): tuple[maxRows, maxBytes, maxParams: uin
 proc isReadonly*(statement: Statement): bool =
   not statement.raw.isNil and sqlite3_stmt_readonly(statement.raw) != 0
 
+## A non-NULL pointer used to bind a zero-length BLOB. SQLite binds a NULL
+## value when the blob pointer is NULL, so an empty `seq[byte]` must be bound
+## with a valid pointer and length 0 to stay a zero-length BLOB.
+var emptyBlobByte: byte
+
 proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError] =
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   if index <= 0:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
   var code: cint
@@ -657,7 +705,8 @@ proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool
   of svBlob:
     if uint64(value.blobValue.len) > statement.db[].config.maxBlobBytes:
       return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bound value exceeds maxBlobBytes"))
-    let data = if value.blobValue.len == 0: nil else: unsafeAddr value.blobValue[0]
+    let data = if value.blobValue.len == 0: cast[pointer](addr emptyBlobByte)
+               else: unsafeAddr value.blobValue[0]
     code = ic_sqlite_bind_blob(statement.raw, index.cint, data, value.blobValue.len.cint)
   if code != sqlite_api.SqliteOk:
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
@@ -698,14 +747,210 @@ proc bindStaticBlob*(statement: var Statement; index: int; data: pointer; length
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)
 
+proc executeTextTextBorrowed*(statement: var Statement;
+                              first, second: openArray[char]): Result[bool, DbError] =
+  ## Internal-only, allocation-free execution of a statement that binds exactly
+  ## two TEXT parameters. Uses SQLITE_STATIC, so `first` and `second` MUST stay
+  ## alive and unmodified until this call returns; no binding survives it.
+  ##
+  ## This is deliberately not a public binding API: it always clears bindings
+  ## before returning, on success and on every error path, so callers can reuse
+  ## or discard the source buffers immediately afterwards. The generic
+  ## `bind(SqlValue)` path keeps its own copy via SQLITE_TRANSIENT and is
+  ## unchanged.
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
+  if int(sqlite3_bind_parameter_count(statement.raw)) != 2:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement must have exactly two parameters",
+        kind: dekInvalidState))
+  if uint64(first.len) > statement.db[].config.maxBlobBytes or
+      uint64(second.len) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+        kind: dekResourceLimit))
+  ## Discard any stale step error code: the next statement state is established
+  ## by the bind below, so reset here is only for clearing prior execution.
+  discard sqlite3_reset(statement.raw)
+  let firstData =
+    if first.len == 0: cstring("") else: cast[cstring](unsafeAddr first[0])
+  let secondData =
+    if second.len == 0: cstring("") else: cast[cstring](unsafeAddr second[0])
+  let firstBound = ic_sqlite_bind_text_static(
+    statement.raw, 1.cint, firstData, first.len.cint)
+  if firstBound != sqlite_api.SqliteOk:
+    discard sqlite3_clear_bindings(statement.raw)
+    return Result[bool, DbError](isOk: false,
+      error: sqliteError(statement.errorSource, firstBound))
+  let secondBound = ic_sqlite_bind_text_static(
+    statement.raw, 2.cint, secondData, second.len.cint)
+  if secondBound != sqlite_api.SqliteOk:
+    discard sqlite3_clear_bindings(statement.raw)
+    return Result[bool, DbError](isOk: false,
+      error: sqliteError(statement.errorSource, secondBound))
+  let code = sqlite3_step(statement.raw)
+  ## Clear borrowed bindings before inspecting the result so the source buffers
+  ## never outlive this call, even when step failed.
+  discard sqlite3_clear_bindings(statement.raw)
+  if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc executeTextBorrowed*(statement: var Statement;
+                           value: openArray[char]): Result[bool, DbError] =
+  ## Internal-only, allocation-free execution of a statement that binds exactly
+  ## one TEXT parameter. Same scoped contract as `executeTextTextBorrowed`:
+  ## `value` must stay alive until this call returns and bindings are always
+  ## cleared before returning, on success and on every error path.
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
+  if int(sqlite3_bind_parameter_count(statement.raw)) != 1:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement must have exactly one parameter",
+        kind: dekInvalidState))
+  if uint64(value.len) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+        kind: dekResourceLimit))
+  discard sqlite3_reset(statement.raw)
+  let data = if value.len == 0: cstring("") else: cast[cstring](unsafeAddr value[0])
+  let bound = ic_sqlite_bind_text_static(statement.raw, 1.cint, data, value.len.cint)
+  if bound != sqlite_api.SqliteOk:
+    discard sqlite3_clear_bindings(statement.raw)
+    return Result[bool, DbError](isOk: false,
+      error: sqliteError(statement.errorSource, bound))
+  let code = sqlite3_step(statement.raw)
+  discard sqlite3_clear_bindings(statement.raw)
+  if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc bindStaticValue(statement: var Statement; values: openArray[SqlValue];
+                     index: int): Result[bool, DbError] =
+  ## STATIC bind of one element of `values` for a scoped execution. It indexes
+  ## the caller's storage directly (no `SqlValue` copy), so the backing
+  ## string/seq MUST stay alive until `executeBorrowed` clears the binding.
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  let parameter = index + 1
+  if parameter <= 0:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "bind index must be positive", kind: dekInvalidState))
+  var code: cint
+  case values[index].kind
+  of svNull:
+    code = sqlite3_bind_null(statement.raw, parameter.cint)
+  of svInt:
+    code = sqlite3_bind_int64(statement.raw, parameter.cint, values[index].intValue)
+  of svFloat:
+    code = sqlite3_bind_double(statement.raw, parameter.cint, values[index].floatValue.cdouble)
+  of svText:
+    if uint64(values[index].textValue.len) > statement.db[].config.maxBlobBytes:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+          kind: dekResourceLimit))
+    let data = if values[index].textValue.len == 0: cstring("")
+               else: cast[cstring](unsafeAddr values[index].textValue[0])
+    code = ic_sqlite_bind_text_static(
+      statement.raw, parameter.cint, data, values[index].textValue.len.cint)
+  of svBlob:
+    if uint64(values[index].blobValue.len) > statement.db[].config.maxBlobBytes:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+          kind: dekResourceLimit))
+    let data = if values[index].blobValue.len == 0: cast[pointer](addr emptyBlobByte)
+               else: cast[pointer](unsafeAddr values[index].blobValue[0])
+    code = ic_sqlite_bind_blob_static(
+      statement.raw, parameter.cint, data, values[index].blobValue.len.cint)
+  if code != sqlite_api.SqliteOk:
+    return Result[bool, DbError](isOk: false,
+      error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc executeBorrowed*(statement: var Statement;
+                      values: openArray[SqlValue]): Result[bool, DbError] =
+  ## Scoped, general borrowed execution of a non-row statement.
+  ##
+  ## Binds every value with SQLITE_STATIC, so the backing buffers inside
+  ## `values` MUST stay alive until this call returns. That is automatic for
+  ## `values` passed as an argument; the bindings never outlive the call because
+  ## they are cleared on success and on every error path. The statement must
+  ## finish with SQLITE_DONE (INSERT / UPDATE / DELETE): a row result is reported
+  ## as an error so a borrowed pointer can never escape into a caller read loop.
+  ##
+  ## This is the general scoped replacement for the A2 fast path; the public
+  ## `bind(SqlValue)` API keeps its own SQLITE_TRANSIENT copy.
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
+  if int(sqlite3_bind_parameter_count(statement.raw)) != values.len:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "parameter count does not match bound values",
+        kind: dekInvalidState))
+  for index in 0 ..< values.len:
+    let size = case values[index].kind
+      of svText: values[index].textValue.len
+      of svBlob: values[index].blobValue.len
+      else: 0
+    if uint64(size) > statement.db[].config.maxBlobBytes:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+          kind: dekResourceLimit))
+  discard sqlite3_reset(statement.raw)
+  for index in 0 ..< values.len:
+    let bound = statement.bindStaticValue(values, index)
+    if not bound.isOk:
+      discard sqlite3_clear_bindings(statement.raw)
+      return bound
+  let code = sqlite3_step(statement.raw)
+  ## Clear before inspecting the result: no borrowed buffer may outlive the call.
+  discard sqlite3_clear_bindings(statement.raw)
+  if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
+proc invalidateCachedStatement(statement: var Statement) =
+  ## Evicts a cached update statement after SQLite reports an error for it so a
+  ## failed or expired plan is never reused. The entry is removed from the cache
+  ## but the raw handle is kept alive for the caller, which may reset and retry
+  ## within the same transaction; `finalize` now really finalizes it.
+  if not statement.cachedInDb or statement.cacheKey.len == 0: return
+  if not statement.db.isNil:
+    statement.db[].statementCache.del(statement.cacheKey)
+  statement.cached = false
+  statement.cachedInDb = false
+
 proc step*(statement: var Statement): Result[StepResult, DbError] =
   if statement.raw.isNil or statement.db.isNil:
     return Result[StepResult, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[StepResult, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   let code = sqlite3_step(statement.raw)
   if code == sqlite_api.SqliteRow:
     return Result[StepResult, DbError](isOk: true, value: srRow)
   if code == sqlite_api.SqliteDone:
     return Result[StepResult, DbError](isOk: true, value: srDone)
+  statement.invalidateCachedStatement()
   Result[StepResult, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
 
 proc columnIsNull*(statement: Statement; index: int): bool =
@@ -761,6 +1006,7 @@ proc withUpdate*[T](db: var Db;
   let lease = TransactionLease(active: true, db: addr db)
   db.currentUpdate = lease
   defer:
+    db.resetCachedUpdateStatements()
     lease.active = false
     lease.db = nil
     if db.currentUpdate == lease: db.currentUpdate = nil
@@ -803,8 +1049,13 @@ proc queryOneText*(db: var Db; sql: string; values: openArray[string]): Result[O
       return Result[Option[string], DbError](isOk: false, error: prepared.error)
     var statement = prepared.value
     defer: statement.finalize()
-    for index, item in queryValues:
-      let bound = statement.bind(index + 1, sqlText(item))
+    for index in 0 ..< queryValues.len:
+      ## `queryValues` is a local copy that stays alive until `finalize`, so the
+      ## parameters can be bound with SQLITE_STATIC without a second copy.
+      let itemLen = queryValues[index].len
+      let data = if itemLen == 0: cstring("")
+                 else: cast[cstring](unsafeAddr queryValues[index][0])
+      let bound = statement.bindStaticText(index + 1, data, itemLen)
       if not bound.isOk:
         return Result[Option[string], DbError](isOk: false, error: bound.error)
     let stepped = statement.step()

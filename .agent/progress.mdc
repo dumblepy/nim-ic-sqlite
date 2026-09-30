@@ -1,140 +1,276 @@
-# 9-update-vsf 自律実装進捗
+# 11-update-memory-management 自律実装進捗
 
-対象ブランチ: `9-update-vsf`
-基準設計: `.agent/rules/branch/9-update-vsf.mdc`
+対象ブランチ: `11-update-memory-management`
+基準設計: `.agent/rules/branch/11-update-memory-management.mdc`
 更新日: 2026-09-29
+
+> 本ブランチの設計書は、Core KV 比較（Nim update 中央値 1,925,589 / Rust 1,484,474、比 1.297）を受け、
+> 「Nim 版 MemoryManager の遅さ」「Nim 版 VFS の遅さ」と決め打ちせず、測定条件を可視化・一致させた上で
+> PR-0〜PR-6 の最適化を切り分けて実装・検証する計画である。本書はその進捗と証跡を固定する。
 
 ## 最終ゴール
 
-次をすべて満たすまで本ブランチの実装を完了扱いにしない。
+`11-update-memory-management.mdc` の実装ステップ（PR-0〜PR-6）と採用ゲートを満たし、次を満たすまで完了扱いにしない。
 
-- main DB と temp file の VFS hot path から I/O ごとの中間 `seq[byte]` 確保・コピーを除去する。
-- dirty page を in-place で更新し、同一ページへの反復書き込みで不要な 16 KiB 再確保をしない。
-- EOF、truncate、sparse extend、COMMIT、ROLLBACK、upgrade でデータ保全・SQLite VFS 契約を維持する。
-- 比較ベンチマークが再現可能で、`raw_stable_bytes` と `heap_bytes` を区別して保存・説明できる。
-- 公開 API、stable image format、既定設定を壊さず、キャッシュ／接続再利用を実測なしに既定有効化しない。
+- benchmark parity（入力内容・SQL・prepare/step/reset/txn 回数）を manifest とコードで固定する。
+- A0/A1/A2 を切り分けて比較できる比較 endpoint と runner を用意する。
+- Overlay read の不要 zero-fill を削減し、short-read / EOF / truncate / sparse extend の不変条件を維持する。
+- dirty page 保持・zero extent 処理の高速経路を、上限・公開規則を壊さずに実装する。
+- `VirtualStableBackend` に 1-entry BucketCache を追加し、MGR byte image を変更しない。
+- 公開 API、stable image format、既定設定、SQLite VFS/atomicity 契約を変更しない。
+- 採用判断は同一条件の unprofiled build の実測に限定し、未測定の項目は「未測定」と明記する。
 
 ## 作業ループ
 
 未完了の最上位タスクを依存順に一つ選び、以下を繰り返す。
 
 1. 関連実装・既存テスト・設計上の不変条件を読み、変更範囲と回帰リスクを記録する。
-2. 最小のまとまりで実装し、公開 API と stable image format を変更しない。
-3. 該当する unit/native test を追加または更新して実行する。失敗時は原因を直し、未解決なら「阻害事項」に再現手順とともに残す。
-4. 各まとまりの完了条件を満たした証跡（実行コマンド、結果、未実行理由）を「実行記録」に追記してからチェックする。
+2. 1 つの最適化だけを最小のまとまりで実装する（A/B の変更点は 1 つ）。
+3. 該当する native unit test を追加・更新して実行する。canister/Replica が必要な測定は「阻害事項」に再現コマンドを残す。
+4. 完了条件の証跡（実行コマンド、結果、未実行理由）を「実行記録」に追記してからチェックする。
 5. 依存する全タスクと回帰ゲートが通るまで次段階へ進まない。計測値は測定せずに推測で記入しない。
 
-設計との相違または新たな事実が判明した場合は、`.agent/rules/branch/9-update-vsf.mdc` の「調査結果・設計まとめ」に根拠とともに追記し、このファイルの該当タスクを更新する。
+設計との相違または新たな事実が判明した場合は、`.agent/rules/branch/11-update-memory-management.mdc` の
+「調査結果・設計まとめ」に根拠とともに追記し、このファイルの該当タスクを更新する。
 
 ## 実装バックログと完了ゲート
 
 ### 0. 現状固定・回帰基盤
 
-- [x] 現在の `ic-sqlite` HEAD、dirty-tree 状態、Nim/Rust 比較 SHA、ツールチェーン、SQLite compile flags、ページサイズ、cache size を manifest に記録する。comparison runner が各 run で `nim_source_sha` / `nim_source_dirty` / `nim_wasm_sha256` / Rust pinned SHA・Wasm hash・ツールチェーンを `manifest.json` に書いていることを確認。
-- [x] `./scripts/test.sh` を実行し、既存失敗があれば変更前失敗として再現手順・出力を記録する。変更前 HEAD(`bd5763b` 系)でも 16/16 PASS・exit 0（`/tmp/test_sh_run1.log`）。本ブランチの変更後は 17→18/18 PASS・exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。
-- [x] EOF、0-byte I/O、負値／オーバーフロー／nil pointer の扱いを現行 VFS と SQLite callback 境界で調査し、テスト可能な期待結果を確定する。`test_vfs.nim`（short-read tail 全ゼロ、0-byte nil 許容、unsigned 範囲超は `SQLITE_IOERR`）と `test_overlay.nim` の direct I/O 境界値で固定済み。
-- [x] 既存 `test_vfs.nim` / `test_overlay.nim` を拡張し、short-read tail 全ゼロ、境界・複数ページ・overlapping write の回帰を追加する。
-- [x] failure atomicity、zero extent persistence、cross upgrade、memory region の既存比較テストを実行対象として確認する。
+- [x] `./scripts/test.sh` の変更前 baseline を取り、PASS 数・exit code・既知失敗を記録する。→ **29/29 PASS, exit 0**（`/tmp/test_sh_b11_baseline.log`）。
+- [x] comparison runner が `manifest.json` / `measurements.csv` / `measurements.jsonl` / Wasm SHA / ソース SHA / dirty-tree を書いていることを確認する。
+- [x] `bench_manifest.json` の Nim/Rust 固定 SHA と実ブランチ先端の差を明記し、`NISQL_COMPARE_NIM_SHA=HEAD` を使う条件を固定する。→ runner の `DefaultNimSha` は `4735f0...`、実 HEAD は `c33c47...` のため `HEAD` を使用。
+- [x] EOF・0-byte・負値・overflow・nil pointer の既存 VFS 期待結果を再確認する。
 
 完了条件: baseline の実行可否・既知失敗・比較条件が証跡付きで固定され、以後の最適化を判定できる。
 
-### 1. VFS / temp file の直接 I/O
+### 1. PR-0: benchmark parity と A0/A1/A2 endpoint
 
-- [x] `overlay.nim` に内部 `readInto` / `writeFrom` を追加し、C callback の `dst` / `src` を呼び出し中だけ直接利用する。
-- [x] `temp_file.nim` に同等の直接 I/O API を追加する。既存 `readAt` / `writeAt` は互換ラッパーとして残す。
-- [x] `vfs.nim` の main DB read path を、出力先ゼロ初期化、読める範囲だけ stable backend から直接読み込み、persisted zero extent の再ゼロ化へ変更する。
-- [x] `vfs.nim` の temp/main DB write path を `src` から直接書き込み、per-call の一時 `seq[byte]` を除去する。
-- [x] short-read 判定をオーバーフローなしで行い、EOF 超過時は全 tail をゼロ化して `SQLITE_IOERR_SHORT_READ` を返す。
-- [x] 0-byte、nil、負値、変換範囲外の引数で境界外参照・例外伝播がないことを確認する。
-- [x] ページ境界・複数ページ I/O と4 MiB BLOB の commit/reopen を native safety test で通す。
+- [x] `benchmarks/comparison/shared/bench_spec.nim` に `updatedValueBuffer(index): array[27, char]` を追加し、`updatedValue` と全長・内容が一致することをテストする。
+- [x] 既存 `benchKeyBuffer` / `benchValueBuffer` と文字列版の一致テストを維持する。
+- [x] canister に A0=`bench_update_only`（既存）、A1=`bench_update_only_borrowed_string`、A2=`bench_update_only_borrowed` を用意する。
+- [x] 3 endpoint は seed・SQL・transaction 境界・測定開始位置・checksum・100 rows を同一にし、行ループの format/bind 実装だけを変える。
+- [x] `backend.did` と runner に対応を追加し、manifest に endpoint を記録する（`nim_update_endpoint`）。
+- [x] 計測 window 内で seed を増やさない（warmup を測定に混ぜない）。
 
-完了条件: VFS hot path に I/O ごとの中間 `seq[byte]` がなく、short-read と既存 read-only 動作を維持し、プロファイル用カウンタで一時確保減少を確認できる。
+完了条件: 同じ 100 行・同じ SQL 結果・同じ step/prepare/txn 回数で A0/A1/A2 を比較でき、入力内容 parity がテストで固定される。
 
-### 2. Overlay の in-place 更新
+### 2. PR-1: 安全な borrowed 2 TEXT 一括実行
 
-- [x] dirty page の取得／生成 API を実装し、既存 page は resident buffer へ直接書き込み、テーブルへの再代入を避ける。
-- [x] 新規 full-page overwrite は base stable read なしで一度だけ 16 KiB を確保し、入力から直接コピーする。
-- [x] partial write は必要時だけ base/dirty 内容を一度読み込んで更新する。
-- [x] table rehash をまたいで内部要素へのポインタを保持しない実装にする。
-- [x] `maxDirtyPages` / `maxDirtyBytes` を新規 dirty page の前に検査し、既存 page 上書きで増加させない。
-- [x] dirty 化・truncate・extend と zero extent の重複除去／整合を維持する。
-- [x] publish 時に dirty page を深くコピーせず読み出し、publish 中の table 変更を避ける。
-- [x] rollback / discard 後に dirty / clean page が残らないことをテストで確認する。
+- [x] `db.nim` に内部専用 `executeTextTextBorrowed(stmt; first, second: openArray[char])` を追加する。
+- [x] `sqlite3_reset` → 2 本を長さ指定 `SQLITE_STATIC` bind → `sqlite3_step`（DONE のみ成功）→ 常に `clear_bindings` の順で、全経路で binding を解除する。
+- [x] 空値・最大長・2 パラメータ以外・reset がエラーコードを返す場合・bind 失敗・step 失敗・early return を網羅する（`test_borrowed_binding.nim`）。
+- [x] 参照元ポインタは step〜clear の同期区間でのみ有効であり、return 後は再利用可能であることをテストで示す。
+- [x] 公開汎用 `Statement.bind` / `SqlValue` のコピー安全性を変更しない（`SQLITE_TRANSIENT` のまま）。
 
-完了条件: 同一 dirty page の反復更新は resident page 確保一回、full-page overwrite の stable read はゼロ、上限・publish・rollback 回帰が通る。
+完了条件: success/error/constraint/early-return で dangling pointer を作らず、連続実行で正しい結果を返し、公開 generic bind の意味が不変。
 
-### 3. EOF・truncate・sparse extend の意味論
+### 3. PR-2: Overlay read の部分的 zero fill と zero extent fast path
 
-- [x] `readInto` を論理 EOF で制限し、`validLen` 外をゼロに保ち、完全に読めた場合だけ成功にする。
-- [x] 縮小時、部分ページの保持範囲外をゼロ化し、完全に範囲外の page を zero extent として記録する。
-- [x] 縮小で範囲外になった dirty / clean page を破棄する（clean cache は初期無効）。
-- [x] 拡張・間隔を空けた write で旧 EOF 以降を zero extent として扱い、古い tail を再露出させない。
-- [x] truncate → re-extend、1 byte truncate → gap write、複数回 truncate の回帰を追加し通す。
-- [x] publish 前の stable grow 失敗では overlay を破棄でき、最初の stable page write 後の失敗は `PublishStartedError` として不可逆扱いになることをテストする。
+- [x] `overlay.readInto` の入口全域 `zeroMem` を、有効範囲の segment 処理 + 不足分のみの zero fill に変更する。
+- [x] `offset >= size` は全域ゼロで short-read、`validLen < length` は tail のみゼロ、加算 overflow で誤読しない。
+- [x] `vfs.readFile`（overlay なし）も必要な tail / zero extent 分だけゼロ化する。
+- [x] `removeZeroPage` に `zeroExtents.len == 0` の fast path を追加し、`pageIsZero` を空判定で早期 return する。
+- [x] full/partial/跨ページ/EOF/truncate→extend/zero mask の回帰を追加し、既存の short-read 期待値を維持する（`test_overlay.nim`）。
 
-完了条件: EOF、truncate、sparse extend、COMMIT／ROLLBACK／failure atomicity／upgrade の native・canister 回帰で内容保全を確認する。
+完了条件: 不要な全域 zero-fill が減り、short-read 残余全ゼロ・truncated 後の古い bytes 非露出・sparse gap ゼロを全テストで確認する。
 
-### 4. 計測と比較ワークロード
+### 4. PR-3: dirty-page 保持方式と publish
 
-- [x] `-d:benchmarkProfile` で通常経路から分離した overlay/VFS/stable backend カウンタを追加する（dirty current/peak、page allocation、temp allocation、stable read/write/grow bytes/calls）。
-- [x] canister の `memory_size`、raw stable pages、差分 `heap_bytes` を同じ順序で保存する。churn にも `heap_bytes` を追加する。
-- [x] 固定長 key/value generator を追加し、既存 `benchKey` / `benchValue` とバイト列が一致するテストを作る。
-- [x] SQLite cache status の FFI と `Db.cacheStats()` を追加し、Nim canister の `db_stats` に `sqlite_cache_used_bytes` として report 化した。実 canister 統合実行は回帰ゲートで継続確認する。
-- [x] public API 比較と VFS/core 比較を分離し、SQL、transaction、prepare/step/reset 回数、入力長を manifest 化する。専用ランナー `runner/vfs_core.nim` を追加。
-- [x] borrowed binding を追加する場合は内部専用 helper に限定し、成功・失敗の全経路で reset / clear_bindings されるテストを通す。`bindStaticText` / `bindStaticBlob` を `db.nim` に追加、C shim に `ic_sqlite_bind_text_static` / `ic_sqlite_bind_blob_static` を追加。
-- [x] 最低 5 組の paired trial を実行し、manifest、Wasm hash、dirty-tree 状態、raw 結果、中央値、レンジを保存・検証する。Nim avg: 1,925,543, Rust avg: 1,484,474, Ratio: 1.2971。
+- [x] `removeZeroPage` / `pageIsZero` の空 fast path を追加（本 PR の安全な部分）。
+- [x] C1（small linear `seq[DirtyPageEntry]`）を `-d:overlayDirtySeq` で切替可能に実装。`dirtyHas`/`dirtyPtr`/`dirtyInsert`/`dirtyDel`/`dirtyKeys`/`dirtyClear` の抽象に集約し、既定は C0（`Table`）のまま。上限 `maxDirtyPages` / `maxDirtyBytes`・zero extent の重なり結合/分割・publish の trap 保護を維持。
+- [x] `readInto` の dirty 参照を `dirtyPages[page]` の値取得から `dirtyPtr` に変更し、16 KiB の deep copy の可能性を除去（C0/C1 共通）。
+- [x] C1 は `test_overlay` / `test_vfs_semantics` / `test_zero_extent_persistence` / `test_failure_atomicity` / `test_db_api` / `test_query_stable` / `test_typed_write` / `test_storage_stats` で緑。
+- [x] canister config に `NISQL_ENABLE_DIRTY_SEQ` を追加。旧来コンパイル不能だった `runner/vfs_core.nim` を修正（ic_record/options import、profile+dirty-seq ビルド、dirty_seq を manifest 記録）。
+- [x] C0/C1 の命令数 A/B 計測（rows=1000/10000、同一条件・決定論的）。
+- [ ] canister profile の dirty peak カウンタが 0 を返す事象を切り分け（native では `dirtyNew=4, peak=2` で正常。canister 集計側の調査は別課題）。
+- [x] publish sort 省略は物理 write 順序を変えるため、トラップ時の部分公開保護を維持したまま既定 sort ありを維持（別途計測が必要ならフラグ化）。
 
-完了条件: baseline と各変更後を再現可能に比較でき、logical DB size・page count・checksum と `raw_stable_bytes` / `heap_bytes` を混同せず説明できる。
+完了条件: 既定（C0）の意味論・上限・公開規則が不変で、C1/publish sort は実測に基づく採否判断が記録される。
 
-### 5. 任意最適化の採否
+**C0/C1 判定（再計測）**: 旧計測は seed と同値 upsert の no-op ワークロードで dirty 0 だったため無効だった。`bench_vfs_core_profile` を `updatedValueBuffer`（seed と異なる値）に変更し、実 dirty ページ（1000 rows: 5 ページ、10000 rows: 30 ページ、`vfs_write_calls` も 5/30）で再計測した。
 
-- [x] clean page cache を初期無効のまま 0 / 2 / 4 / 8 pages で A/B 測定する。dirty 化時の所有権移動・invalidate 条件をテストする。結果: このワークロードでは clean cache hit はゼロ。heap_bytes に差なし。既定無効(0)を維持。
-- [x] read connection / statement cache は別実験として、invalidation、active reader と update、upgrade、close 時 finalize を検証する。実装済み・既定無効。invalidation テストを追加して確認。
-- [x] 命令数または stable read の有意な改善と常駐 heap のトレードオフを記録し、採用・不採用を決定する。clean cache: 不採用（効果なし）。read connection cache: 実装済み・既定無効。statement cache: 実装済み・既定無効。
+| workload | C0 命令数 | C1 命令数 | 差 | dirty peak |
+|---|---:|---:|---:|---:|
+| upsert 1000 rows | 32,300,869 | 32,272,826 | −28,043 (−0.087%) | 5 |
+| upsert 10000 rows | 340,092,018 | 339,959,294 | −132,724 (−0.039%) | 30 |
 
-完了条件: 実測根拠なしに既定有効化しない。採用時は lifecycle・上限・無効化条件と測定証跡がそろう。
+→ C1 は僅かに速いが 0.1% 未満で、`10.3 採用ゲート`（有意かつ再現性のある削減）を満たさないため **既定は C0 のまま**。C1 は `-d:overlayDirtySeq` の実験用として保持。`readInto` の `dirtyPtr` 化（deep copy 回避）と zero extent fast path は C0 でも有効なので採用。
 
-## 最終受け入れ確認
+### 5. PR-4: VirtualBackend 1-entry BucketCache
 
-- [x] 全必須タスク（0〜4）と該当する既存回帰が通る。
-- [x] main DB / temp file I/O に不要な per-call `seq` がない。
-- [x] 同一 dirty page の不要な 16 KiB 再確保がない。
-- [x] stable image format、superblock、公開 API、SQLite VFS/atomicity 契約を維持する。
-- [x] 計測 manifest と結果があり、性能改善がない場合も allocation/VFS read/SQLite cache の差を説明できる。
-- [x] 任意最適化は測定済みの採否判断または明示的な非採用理由を記録している。
+- [x] `VirtualStableBackend` にインスタンス単位の 1-entry bucket cache を追加する。
+- [x] `assertVirtualBounds` を先に行い、cache 内に完全に収まる場合のみ物理 base + relative へ直行する。
+- [x] `size=0`・境界ちょうど・跨ぎ・複数 MemoryId interleave・grow 直後を検証する（`test_memory_manager.nim`）。
+- [x] MGR header / alloc table / 保存 byte image を変更しない（既存テストが緑）。
+
+完了条件: 跨 bucket / 複数 MemoryId / overflow / grow の適合テストが通り、既存 MGR 画像・既存テストが不変。
+
+### 6. PR-5: update partial clean cache / readonly per-file cache
+
+- [x] `overlay.readInto` の clean cache を、全ページ読取時のみから **部分読取時にも base page 全体を 1 回ロード**して再利用する方式へ拡張（`cleanCachePages > 0` の opt-in。base EOF 超はゼロ埋め）。
+- [x] 既定は `cleanCachePages = 0`（無効）のまま。dirty 化・truncate・discard での invalidation は既存どおり。
+- [x] native テスト追加: 部分読取の miss→hit（stable read 回数不変）、別ページの miss、dirty による evict、base EOF 超のゼロ埋め。
+- [ ] readonly per-file cache（query-only handle の 8 ページデータキャッシュ）は、SQLite pager cache が既に存在し、canister profile の overlay カウンタが 0 を返す計測不具合のため、効果検証ができず見送り（別課題）。
+- [x] 実測なしに既定有効化しない。
+
+完了条件: stable read bytes / instructions / heap のトレードオフが数値化され、既定設定を変えない。
+
+**PR-5 判定**: partial-read clean cache は実装・native 検証済みだが opt-in（既定無効）を維持。canister の clean-cache counters は機能しており（`clean-cache-ab-20260930T021646Z` で variant 2/4/8 が hits=1 / misses=4）、partial 読取でもキャッシュが使われることを示す。readonly per-file cache は見送り。
+
+**profile カウンタの異常（要調査）**: canister の `dirty_pages_new/peak` と `vfs_write_calls` が 0 のまま（`bench_vfs_core_profile` および `bench_clean_cache_write_profile`）。native 診断では `dirtyNew=4, peak=2` と正常で、`clean_cache_hits/misses`・`vfs_read_calls` は canister でも非 0。コミット済み変更があるのに write/dirty が 0 になるのは計測経路の不整合であり、PR-3/PR-5 の dirty 依存の判定は命令数（`ic0_performance_counter`）で代替している。原因究明は「阻害事項」に記載。
+
+### 7. PR-6: file-handle lookup / update statement cache
+
+- [x] `stateFor` の一回 lookup 化（`withValue`）を実装。`hasKey` + `[]` の二重ハッシュ参照を 1 回の `rawGet` に統合（VFS hot path）。
+- [x] update statement cache を opt-in（`config.statementCacheEnabled`、既定 false）で実装。`UpdateConnection.prepare` が `db.statementCache` を再利用し、`maxCachedStatements` で容量制限。
+- [x] lease 終了後のエスケープ防止: キャッシュ済み update statement は `lease` を保持し、`step`/`bind`/`execute*` が lease inactive を拒否。
+- [x] SQLite error 時の無効化: `step`/`execute*` のエラーで該当エントリを cache から evict（raw は呼出元が finalize）。
+- [x] commit/rollback 時の無効化: `withUpdate` の defer で `resetCachedUpdateStatements` が全キャッシュを reset+clear。
+- [x] schema 変更: `sqlite3_prepare_v2` の自動再コンパイル＋エラー時 evict で対応。
+- [x] テスト `test_statement_cache.nim`: トランザクション跨ぎ再利用（miss 1 / hit 2）、lease 後拒否、エラー evict、schema 変更後再利用、既定無効。
+- [x] 全 native 回帰 **30/30 PASS**。
+- [x] cross-transaction A/B 計測（`runner/update_cache_ab.nim`）: 同一 SQL を 20 トランザクションで prepare する upsert で、cache off 38,356,692 → on 37,813,460（**−543,232 / −1.42%**）。dirty/vfs/stable/heap/page は不変。
+- [x] 採否: 改善は実測で確認できるが modest（−1.4%）かつ statement の寿命をトランザクション跨ぎに変えるため、既定は **false のまま**（opt-in）。`statementCacheEnabled` を明示した利用者に限り有効。
+
+完了条件: 高頻度 multi-message で有意差がある場合のみ採用し、公開 API と不変条件を維持する。
+
+### 8. 追補: A2 のスコープ付き一般化（全体採用方針）
+
+方針: A2 の「単一呼び出しで bind〜step〜clear を完結させる借用バインド」を正とし、寿命契約を守れる範囲へ一般化して採用する。公開 `Statement.bind(SqlValue)` は `SQLITE_TRANSIENT` のまま維持する（bind と step が別呼び出しの汎用 API では STATIC は危険なため）。
+
+- [x] `bindStaticValue(statement, values, index)` を追加（`SqlValue` をコピーせず STATIC bind）。
+- [x] `executeBorrowed(statement, values: openArray[SqlValue])` を追加（N 引数・TEXT/BLOB/INT/FLOAT/NULL、`SQLITE_DONE` 限定、全経路で clear）。
+- [x] one-call ヘルパー `execTextRaw` / `execValues`（`Db` / `UpdateConnection`）を汎用借用へ移行。値は引数として呼び出し中有効なので安全。
+- [x] 空 `seq[byte]` は NULL ではなく長さ 0 の BLOB を bind するよう修正（`bind` / `executeBorrowed`）。SQLite は NULL ポインタで NULL を bind するため。
+- [x] テスト: N 引数・混在型・空 BLOB・制約違反・step=ROW 拒否・引数数不一致・空テキスト（`test_borrowed_binding.nim`）。
+- [x] `executeTextBorrowed`（1 TEXT、A1 と同契約）を追加し、テスト追加。
+- [x] canister に A1 借用の insert/churn endpoint を追加（`bench_insert_only_borrowed` / `bench_churn_reset_borrowed` / `bench_churn_delete_borrowed` / `bench_churn_insert_borrowed`、`insertRowsBorrowed`）。
+- [x] core runner に insert endpoint を追加、churn runner に `NISQL_COMPARE_NIM_CHURN_BORROWED`（Nim を借用版へ切替）と `NISQL_COMPARE_CHURN_CYCLES`（既定 100）を追加。
+- [x] 全 native 回帰 **29/29 PASS**。
+- [ ] query（step=ROW）系への借用適用は、行読み取り中の binding 寿命が別問題のため見送り（`queryOneText` は TRANSIENT 維持）。
+- [x] 他ワークロード計測: update(A1) / insert(A0 vs A1) / churn(A0 vs A1, 10 cycles) を完走。large blob は `execValues` 経由で既に汎用借用を採用済み。すべて同一 Wasm `efb6b37c…` で、raw stable / heap / page count は A0/A1 で不変。
+- [x] query 系: `bench_read_borrowed`（`bindStaticText` + `reset`）を追加し、`NISQL_COMPARE_NIM_READ_ENDPOINT` で A/B 可能にした。`queryOneText` はローカルコピー `queryValues` を STATIC bind（finalize で解除）へ変更。
+- [x] query A0/A1 計測: 同一 Wasm `c4e204bd…` で point read 2,088,872 → 2,015,945（−3.49%）、退行なし。成果物 validated。
+
+完了条件: 汎用 API が専用 A2 と同等の削減を保ち、公開 API の安全性を変えず、全 native 回帰が緑。
+
+## branch 11 受け入れ検証
+
+- [x] `./scripts/test.sh` の native 回帰が全緑（追加テスト含む）。→ 29/29 PASS。
+- [x] A0/A1/A2 endpoint と入力 parity テストが存在する。
+- [x] borrowed bind の全エラー経路テストが存在する。
+- [x] Overlay read/zero extent の回帰テストが存在する。
+- [x] BucketCache の境界・複数 MemoryId テストが存在する。
+- [x] stable image format・superblock・公開 API・既定設定を変更していない（既存テスト緑、`Statement.bind` は TRANSIENT のまま、clean cache 既定 0、MGR byte image 不変）。
+- [x] 未測定の性能項目は「未測定」と明記し、推測を確定値として書かない。
+
+## 測定結果（同一条件 unprofiled build）
+
+同一 Wasm SHA `99f46d1a16e8e340…`、同じ `db.nim` ソースハッシュ、fresh canister ペア、100 rows×5 trials。
+Nim の update 命令数は 5/5 完全に同一値（決定論的）。
+
+| endpoint | Nim 中央値 | Rust 中央値 | Nim/Rust | A0 比削減 |
+|---|---:|---:|---:|---:|
+| A0 `bench_update_only` | 1,927,772 | 1,484,474 | 1.2986 | — |
+| A1 `bench_update_only_borrowed_string` | 1,675,310 | 1,484,474 | 1.1286 | −252,462 (−13.10%) |
+| A2 `bench_update_only_borrowed` | 1,446,843 | 1,484,474 | **0.9747** | −480,929 (−24.95%) |
+
+- `db_size=32768`、`sqlite_page_count=2`、`sqlite_virtual_pages=2`、`raw_stable_bytes=67305472`、`heap_bytes=3396817` は A0/A1/A2 で不変（stable growth・heap・物理ページの退行なし）。
+- A1 の削減は `SQLITE_TRANSIENT` のコピー除去（borrowed bind）による。A2 は追加で行ごとの `string` フォーマットを固定長 `array` に置き換えた分。
+- これにより `3.2 擬似API` の「borrowed bind が主因」という仮説と、`3.3 A1/A2 を分離する`方針が実測で裏付けられた。公開 `Statement.bind` は DESIGN どおり TRANSIENT のまま維持する。
+
+### 追補: 汎用スコープ API の計測（新 Wasm `1a07c0e815577aa8…`）
+
+`executeBorrowed` 追加・one-call ヘルパー移行後の Wasm で A0/A2/汎用を再計測した。
+
+| endpoint | Nim 中央値 | Rust 中央値 | Nim/Rust | A0 比削減 |
+|---|---:|---:|---:|---:|
+| A0 `bench_update_only` | 1,927,772 | 1,484,474 | 1.2986 | — |
+| A2 `bench_update_only_borrowed`（固定長 array） | 1,446,843 | 1,484,474 | **0.9747** | −480,929 (−24.95%) |
+| A2-general `bench_update_only_borrowed_general`（`executeBorrowed` + `SqlValue`） | 1,808,512 | 1,484,474 | 1.2183 | −119,260 (−6.19%) |
+
+- A0/A2 は旧 Wasm と完全に同値で、汎用 API 追加が既存経路へ影響しないことを確認。
+- 汎用 `executeBorrowed(openArray[SqlValue])` は安全だが、行ごとの `SqlValue` 配列構築・`sqlText` コピー・パラメータ検査のオーバーヘッドにより、専用の A1（−13.1%）や A2（−25.0%）には届かない。それでも TRANSIENT よりは −6.2% 改善する。
+- 使い分け方針: N 引数・混在型のスコープ付き書き込みは `executeBorrowed`、ホットな同型 TEXT ループは `executeTextTextBorrowed`（将来は array 入力の一般化を検討）。
+- `heap_bytes` は汎用 3,402,974 と A0/A2 より約 +6 KB（行ごとの一時 `SqlValue`/`string`）。raw stable・page count は不変。
+
+### 追補: A1 をベースにした他ワークロード計測（Wasm `efb6b37c55b921b1…`）
+
+すべて同一 Wasm、fresh canister ペア。命令数は決定論的（5/5 同値）。A1 = 文字列入力の `SQLITE_STATIC` 借用バインド。
+
+| workload | A0（TRANSIENT） | A1（借用） | 削減 | 備考 |
+|---|---:|---:|---:|---|
+| update 100 rows | 1,927,772 | 1,675,310 | −13.10% | 既存値と一致 |
+| insert 100 rows | 1,387,661 | 1,183,392 | **−14.72%** | `bench_insert_only` vs `_borrowed` |
+| churn delete 1000 rows | 18,527,240 | 17,230,399 | −7.00% | 10 cycles の中央値 |
+| churn insert 1000 rows | 22,586,651 | 20,411,594 | −9.63% | 10 cycles の中央値 |
+
+- insert / churn とも `heap_bytes`・`raw_stable_bytes`・`sqlite_page_count` は A0/A1 で完全に不変（churn: heap 3,746,283 / raw 67,567,616 / pc 18）。
+- churn は Rust 比較用の runner（`NISQL_COMPARE_NIM_CHURN_BORROWED` / `NISQL_COMPARE_CHURN_CYCLES`）で計測。A1 は delete/insert 双方で退行なし。
+- large blob は `bench_large_blob` が `execValues` 経由で既に汎用借用（A2-general）を採用しており、追加の A/B は不要と判断。
+
+### 追補: query 借用の計測（Wasm `c4e204bdf7169a7b…`）
+
+`NISQL_COMPARE_NIM_READ_ENDPOINT` で point read の A0/A1 を比較（update は既定、5 trials、決定論的）。
+
+| workload | A0 `bench_read` | A1 `bench_read_borrowed` | 削減 |
+|---|---:|---:|---:|
+| point read 100 rows | 2,088,872 | 2,015,945 | **−3.49%** |
+
+- Rust read 中央値は 858,068（接続 warmup 経路が異なるため記述的のみ）。
+- read は I/O 支配のため binding の寄与は小さく、削減は −3.49%。退行はなし。`queryOneText` もローカルコピーを STATIC bind する 1 コピー経路へ変更した。
+
+### 追補: `stateFor` 単一 lookup（PR-6）
+
+`stateFor` を `hasKey` + `[]` から `withValue` 1 回 lookup に変更（意味論不変）。同一条件で前後比較（Wasm 前 `c4e204bd…` / 後 `80b2f4bb…`、5 trials、決定論的）。
+
+| workload | 前 | 後 | 差 |
+|---|---:|---:|---:|
+| point read 100 rows | 2,088,872 | 2,086,766 | −2,106 (−0.10%) |
+| update 100 rows | 1,926,972 | 1,926,766 | −206 (−0.01%) |
+
+- 効果はごく僅か（VFS の全操作で 1 ハッシュ参照削減）で、有意な最適化とは主張しない。退行はなく、コードも単純化されるため構造的整理として保持する。
+- insert 100 rows = 1,387,455（`80b2f4bb…`）。
 
 ## 実行記録
 
 | 日時 (UTC) | 範囲 | コマンド／証跡 | 結果 |
 |---|---|---|---|
-| 2026-09-29 | 初期化 | branch rule を読了。`git status --short` で既存の `.agent/progress.mdc` 変更と未追跡の branch rule を確認。 | 未着手。ベースライン・テスト・計測は未実行。 |
-| 2026-09-29 | VFS / overlay | `nim c -r tests/test_temp_file.nim`、`nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim` | すべて成功。direct I/O、short-read tail のゼロ化、full-page overwrite の stable read 0 回、truncate 後 sparse extend を確認。`./scripts/test.sh` は Testament 実行中であり、完走結果は未記録。 |
-| 2026-09-29 | VFS / overlay 追加回帰 | `nim c -r tests/test_overlay.nim`、`nim c -r tests/test_vfs.nim`、`nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | すべて成功。複数ページ I/O、overlapping write、dirty-page 上限、公開 DB API の回帰を確認。 |
-| 2026-09-29 | 比較計測 | `nim c benchmarks/comparison/runner/churn.nim`、`nim c -r benchmarks/comparison/tests/test_storage_stats.nim`、`nim c -r benchmarks/comparison/tests/test_result_validation.nim`、`nim c -r benchmarks/comparison/tests/test_keys.nim` | すべて成功。churn の `heap_bytes` 記録と固定長 key/value generator のバイト列互換を確認。実 canister の5組比較は未測定。 |
-| 2026-09-29 | 既存比較回帰 | `nim c -r benchmarks/comparison/tests/test_failure_atomicity.nim`、`test_zero_extent_persistence.nim`、`test_memory_region.nim` | 3件成功。`test_cross_upgrade.nim` は local ICP network 起動まで確認し、非同期実行の終了コードをこのセッションで取得できなかったため完走未確認。 |
-| 2026-09-29 | Wasm build | `cd ic-sqlite/benchmarks/comparison/nim_canister/backend && nicp productionBuild` | 成功。現在の VFS/Overlay 変更を含む `main.wasm` を生成し、Nim → WASI → wasi2ic → wasm-opt/ic-wasm の production pipeline を通過。 |
-| 2026-09-29 | partial truncate 修正 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_overlay.nim` | 成功。VFS の `truncateFile` が Overlay へ stable backend を渡していなかったため、部分 truncate が失敗する経路を修正し、prefix 保持と short-read のゼロ埋めを回帰テスト化。 |
-| 2026-09-29 | VFS 整数境界 | `nim c -r tests/test_vfs.nim`、`nim c -r tests/test_db_api.nim` | 成功。SQLite の signed file-size 範囲を超える値を `SQLITE_IOERR` に変換し、整数変換のラップを防止。 |
-| 2026-09-29 | SQLite cache status FFI | `nim c -r tests/test_sqlite_api.nim`、`nim c -r tests/test_db_api.nim` | 成功。`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)` と観測専用 `Db.cacheStats()` を追加。native SQLite で0より大きい pager cache byte を取得。実 canister report への追加は未完了。 |
-| 2026-09-29 | canister cache report | `nicp productionBuild`、`nim c benchmarks/comparison/tests/test_canister_integration.nim` | 成功。Nim canister の `db_stats` と Candid に `sqlite_cache_used_bytes` を追加。統合テストはコンパイル済みで、local ICP 実行は既存回帰ゲートで継続確認。 |
-| 2026-09-29 | canister cache integration | `./benchmarks/comparison/tests/test_canister_integration` | local ICP network の起動とテスト開始を確認。実行プロセスは終了したが、この実行環境では非同期化された子プロセスの終了コードを取得できないため、成功・失敗は未確定として扱う。 |
-| 2026-09-29 | publish atomicity | `nim c -r tests/test_overlay.nim` | 成功。stable grow の失敗は publish 前の可逆失敗、最初の page write を試行した後の失敗は不可逆として区別されることを確認。 |
-| 2026-09-29 | VFS semantics / profile | `nim c -r tests/test_vfs_semantics.nim`、`nim c -d:benchmarkProfile -r tests/test_overlay.nim` | 成功。4 MiB BLOB の commit/reopen、複数 truncate/re-extend、publish atomicity、clean cache の既定無効と profile build を確認。 |
-| 2026-09-29 | clean cache A/B runner | `nim c benchmarks/comparison/runner/clean_cache_ab.nim` | 成功。0 / 2 / 4 / 8 page、各3反復の profile-instrumented canister 測定 runner をコンパイル。実測は local ICP の実行時間を要するため未開始。 |
-| 2026-09-29 | 回帰ゲート完走 | `./scripts/test.sh`（変更前 HEAD） | 16/16 PASS、exit 0。このセッション開始時点のベースライン固定。 |
-| 2026-09-29 | canister 統合・cross upgrade（終了コード取得） | `./benchmarks/comparison/tests/test_canister_integration`、`./benchmarks/comparison/tests/test_cross_upgrade` | 両方とも local ICP で完走、**exit 0**。CRUD/churn/memory/upgrade、publish failpoint rollback、4 MiB 大 BLOB・join・many rows・multi-get、Rust⇄Nim cross upgrade を確認。前セッションの「終了コード未取得」は解消。 |
-| 2026-09-29 | 5組 paired trial | `NISQL_COMPARE_NIM_SHA=HEAD runner/main.nim 5` → `runner/validate.nim` | exit 0。`results/20260929T062335Z`（Nim/Rust fresh pair ×5、manifest+Wasm hash+dirty-tree 記録）を生成し core 検証ツールで検証済み。後続の別セッション実行（101233Z/101410Z）と併せて中央値・レンジを保存。 |
-| 2026-09-29 | 回帰ゲート完走（新テスト込み） | `./scripts/test.sh` | 18/18 PASS、exit 0（`/tmp/test_sh_run5.log`、`/tmp/test_sh_run6.log`）。`test_vfs_semantics.nim`（publish 前破棄 / publish 後不可逆 / 複数回 truncate・re-extend / 4 MiB BLOB 復元）と clean cache の native 回帰（既定無効・2 page 時の hit/eviction・truncate 時の破棄）を含む。 |
-| 2026-09-29 | clean page cache A/B 実測 | `runner/clean_cache_ab`（profile wasm、1 canister、0/2/4/8 × 3反復） | 完走。`results/clean-cache-ab-20260929T101911Z`。全 variant で clean_cache_hits=0（本ワークロードでは base 再読が起きない）、heap_bytes・raw_stable_bytes は全 variant 同一。採用判断: 不採用・既定無効維持（後続セッションの採否記録と整合）。 |
-| 2026-09-29 | read connection / statement cache 実験機構 | `db.nim` に `queryConnectionReuse` / `queryStatementCacheEnabled`（既定 false）と read connection 専用の statement cache・close/update 時の finalize を追加、canister に `bench_set_experiment` を追加、`runner/query_reuse_ab` を追加 | 通常・profile の canister ビルドが両方通過（`NORMAL_EXIT=0`/`PROFILE_EXIT=0`）。`test_db_api.nim` の「reuse when enabled」「invalidation after update」が native で緑。`query_reuse_ab` runner もコンパイル済み（既定無効のまま A/B 可）。 |
-| 2026-09-29 | 大 BLOB 境界値追加・最終ゲート | `tests/test_vfs_semantics.nim`（4 MiB + 16 KiB 境界 BLOB の commit/reopen/内容照合）追加後 `./scripts/test.sh` | **18/18 PASS、exit 0**（`/tmp/test_sh_final.log`）。 |
-| 2026-09-29 | logic テスト移設・テスト実行統一 | comparison の logic テスト10本（keys/report/cost_model/profile_report/result_validation/transport/storage_stats/failure_atomicity/zero_extent_persistence/memory_region）を `tests/` へ移設し、`scripts/test.sh` を Testament 一括実行（`testament --print --megatest:off p 'tests/test_*.nim'`）に統一。個別 `nim c -r` 9行を削除。import を `../benchmarks/comparison/{shared,runner}` へ更新し、`tests/config.nims` に `../nicp_cdk/src` を追加。 | **28/28 PASS、exit 0**（`/tmp/test_sh_move.log`）。移設10本を含む。canister/replica 必須の `test_canister_integration`・`test_cross_upgrade` は comparison に残置し別途実行。 |
-| 2026-09-29 | CI wasi-sdk 34 対応 | wasi-sdk 34 で `--target=wasm32-wasi` が sysroot からヘッダを解決できず `stdio.h not found` で失敗することを再現。`scripts/build_sqlite.sh` と `example` / `examples/minimal_kv` / `benchmarks/comparison/nim_canister` の `backend/config.nims` の clang ターゲットを `wasm32-wasip1` へ変更。`WASI_SDK_PATH=<wasi-sdk-34> ./scripts/test.sh` を実行。 | **28/28 PASS、exit 0**（`/tmp/test_sh_wasi34.log`）。`libsqlite3_ic.a` と shim、example canister・comparison canister の productionBuild、example 統合テストを wasi-sdk 30/34 双方で確認。docker/test.Dockerfile (WASI_VERSION=34) はそのまま。 |
+| 2026-09-29 | branch 11 設計差し替え確認 | `git diff .agent/rules/branch/11-update-memory-management.mdc` | 設計が性能改善計画（PR-0〜PR-6）へ差し替え。progress を本計画で再構築。 |
+| 2026-09-29 | baseline 回帰 | `./scripts/test.sh` | **29/29 PASS, exit 0**（`/tmp/test_sh_b11_baseline.log`）。 |
+| 2026-09-29 | 既存実装調査 | `grep` / ソース読解 | `bindStaticText`/`bindStaticBlob` は既存。`executeTextTextBorrowed`・`updatedValueBuffer`・A1/A2 endpoint・BucketCache・zero extent fast path は未実装だった。 |
+| 2026-09-29 | PR-0/PR-1/PR-2/PR-4 実装 | `db.nim` / `bench_spec.nim` / `main.nim` / `backend.did` / `overlay.nim` / `vfs.nim` / `memory_manager.nim` | 追加実装。 |
+| 2026-09-29 | 変更後 native 回帰 | `testament --print --megatest:off p 'tests/test_*.nim'` | **29/29 PASS**（`test_borrowed_binding`・`test_keys`・`test_overlay`・`test_memory_manager` に新規テスト含む）。 |
+| 2026-09-29 | benchmark canister ビルド | `nicp productionBuild`（comparison/nim_canister/backend） | A1/A2 endpoint と `executeTextTextBorrowed` を含む Wasm のビルド成功。 |
+| 2026-09-29 | A0 harness スモーク | `NISQL_COMPARE_NIM_SHA=HEAD ./runner/main 1`（A0） | 成功。Nim 1,927,772 / Rust 1,484,474 = 1.2986（`results/20260929T171158Z`）。改修前比を再現。 |
+| 2026-09-29 | A0/A1/A2 5 trials | `NISQL_COMPARE_NIM_SHA=HEAD NISQL_COMPARE_NIM_UPDATE_ENDPOINT=<A0/A1/A2> ./runner/main 5` | A0 `results/20260929T171435Z`: Nim **1,927,772** / Rust 1,484,474（比 1.2986）。A1 `results/20260929T171645Z`: Nim **1,675,310**（−252,462 / −13.10%）。A2 `results/20260929T171853Z`: Nim **1,446,843**（−480,929 / −24.95%、Rust 比 **0.9747**）。3 run とも Nim Wasm SHA `99f46d1a16e8e340…` 一致・db.nim ソースハッシュ一致・5/5 同一値。`db_size=32768` / `sqlite_page_count=2` / `raw_stable_bytes=67305472` / `heap_bytes=3396817` は A0/A1/A2 で不変。 |
+| 2026-09-29 | A2 のスコープ一般化 | `db.nim`（`bindStaticValue` / `executeBorrowed` / `execTextRaw` / `execValues`） | 汎用借用 API を追加し、one-call ヘルパーへ採用。空 BLOB の NULL バインドを長さ0 BLOB に修正。 |
+| 2026-09-29 | 一般化の native 回帰 | `testament --print --megatest:off p 'tests/test_*.nim'` | **29/29 PASS**（`test_borrowed_binding` に N引数/混在型/空BLOB/制約/ROW拒否/引数不一致を追加）。 |
+| 2026-09-29 | 汎用 API の計測 | `bench_update_only_borrowed_general` + `runner/main 5`（A0/A2/general, 再ビルド Wasm `1a07c0e8…`） | A0 `20260929T174152Z`=1,927,772、A2 `20260929T174357Z`=1,446,843（旧 Wasm と同値）、general `20260929T174603Z`=**1,808,512**（A0 比 −6.19%、Rust 比 1.2183）。汎用 API は安全だが専用 A1/A2 には届かない。 |
+| 2026-09-29 | A1 をベースにした insert/churn 計測 | `bench_insert_only(_borrowed)`、`runner/churn`（`NISQL_COMPARE_NIM_CHURN_BORROWED`, `NISQL_COMPARE_CHURN_CYCLES=10`） | Wasm `efb6b37c…`。A1 update=1,675,310（再現）。insert: A0 1,387,661 → A1 **1,183,392**（−14.72%）。churn delete 18,527,240 → 17,230,399（−7.00%）、insert 22,586,651 → 20,411,594（−9.63%）。heap/raw/page は A0/A1 で不変。 |
+| 2026-09-29 | churn validator の可変サイクル対応 | `runner/validate.nim`（`validateChurnResults` が実測の `maxCycle` に追従、`runKind` は `churn_5000x` prefix 判定） | 10 cycles の churn 成果物 2 件を含む全 5 成果物が `validated`。 |
+| 2026-09-29 | query 借用の実装・計測 | `bench_read_borrowed`、`NISQL_COMPARE_NIM_READ_ENDPOINT`、`queryOneText` の STATIC bind | 同一 Wasm `c4e204bd…` で point read 2,088,872 → **2,015,945**（−3.49%）。両成果物 validated、native 29/29。 |
+| 2026-09-30 | `stateFor` 単一 lookup（PR-6） | `vfs.nim`（`withValue`）、`runner/main 5` | Wasm `80b2f4bb…`。read 2,088,872 → 2,086,766（−0.10%）、update 1,926,972 → 1,926,766（−0.01%）。効果は僅少・退行なし。insert=1,387,455。両成果物 validated。 |
+| 2026-09-30 | PR-3 C1 dirty store 実装 | `overlay.nim`（`DirtyStore` 抽象 + `-d:overlayDirtySeq`）、canister config、`runner/vfs_core.nim` 修正 | C1 は overlay/VFS/transaction 系テストで緑。`readInto` の `dirtyPtr` 化も実装。 |
+| 2026-09-30 | PR-3 C0/C1 計測 | `NISQL_ENABLE_DIRTY_SEQ=0/1 ./runner/vfs_core 1000/10000`（profile Wasm） | upsert 1000: C0 30,500,070 vs C1 30,490,136（−0.033%）。upsert 10000: 323,335,710 vs 323,322,097（−0.004%）。有意差なし → **既定 C0 維持**。dirty peak カウンタは canister で 0（native では正常、別課題）。 |
+| 2026-09-30 | PR-3 後の全回帰 | `testament ... p 'tests/test_*.nim'` | **29/29 PASS**。 |
+| 2026-09-30 | PR-5 partial-read clean cache | `overlay.nim`（部分読取で base page をキャッシュ）、`test_overlay.nim` | 部分読取の miss→hit・evict・EOF ゼロ埋めを追加。C0 29/29、C1 overlay も PASS。既定 `cleanCachePages=0` 維持。 |
+| 2026-09-30 | profile カウンタ切り分け | `runner/clean_cache_ab.nim`（強制クリーン）、native 診断 | 原因判明: ワークロードが seed と同値 upsert の no-op で dirty 0。カウンタは正常（native dirtyNew=4、canister clean-cache hits>0）。 |
+| 2026-09-30 | 既定 canister ビルド | `rm nimcache && nicp productionBuild`（backend） | 成功、Wasm `919ffd9cd145…`。 |
+| 2026-09-30 | PR-3 C0/C1 再計測 | `bench_vfs_core_profile` を `updatedValueBuffer` 化、`NISQL_ENABLE_DIRTY_SEQ=0/1 ./runner/vfs_core 1000/10000` | 実 dirty 5/30 ページ。1000 rows: C0 32,300,869 vs C1 32,272,826（−0.087%）。10000 rows: 340,092,018 vs 339,959,294（−0.039%）。有意差なし → 既定 C0 維持。 |
+| 2026-09-30 | PR-6 update statement cache 実装 | `db.nim`（`Statement.lease`/`cachedInDb`、`UpdateConnection.prepare` キャッシュ、lease guard、error evict、`resetCachedUpdateStatements`）、`test_statement_cache.nim` | トランザクション跨ぎ再利用・lease 後拒否・error evict・schema 変更・既定無効を検証。native **30/30 PASS**。 |
+| 2026-09-30 | PR-6 cross-transaction 計測 | `runner/update_cache_ab.nim`（`NISQL_ENABLE_UPDATE_CACHE=0/1`） | cache off 38,356,692 → on 37,813,460（−1.42%）。dirty/vfs/stable/heap/page 不変。modest のため既定 false（opt-in）。 |
 
 ## 現在の未確定事項
 
-- なし。`test_canister_integration` と `test_cross_upgrade` は local ICP で終了コード取得済み（両方とも 0）。
+- PR-6 の update statement cache は、commit/rollback・schema 変更・SQLite error での無効化、lease 終了後の statement エスケープ防止、capacity 制限を満たす設計が必要で、multi-message 系列の実測基盤も未整備なため見送り。既定・公開 API は変更しない。
+- PR-5 の readonly per-file cache は SQLite pager cache が既にあるため見送り。
+- canister の overlay 書き込み系プロファイルカウンタ（dirty/write）が 0 を返す（「阻害事項」参照）。native では正常。
+- 汎用 `executeBorrowed` は安全だが専用 A1/A2 より削減が小さい（update −6.2% vs A1 −13.1% / A2 −25.0%）。N 引数・混在型は汎用、ホットな同型 TEXT ループは専用 `executeTextTextBorrowed` / `executeTextBorrowed`（A1）を使う方針。
+- PR-3 の C1（small seq dirty store）は命令数で有意差なしのため既定 C0 を維持。
+- cycle cost は両実装とも取得不可のまま（設計 10.2 のとおり「未取得」と明示）。
 
 ## 阻害事項
 
-なし。テストや比較環境の不足が判明した場合は、推測で完了にせず、再現コマンド・必要な依存関係・影響範囲をここに記録する。
+- なし（旧記載の「canister カウンタ 0」は原因判明・解消）。原因: `bench_vfs_core_profile` が seed と同じ `benchValue` を upsert していたため SQLite がページを書かず（差分なし）、`dirty_pages_new/peak`・`vfs_write_calls` が 0 になっていた。`bench_clean_cache_write_profile` も rep1 のみ実書き込みで median が 0。カウンタ計測自体は native（`dirtyNew=4, peak=2`）・canister（clean-cache hits 等）とも正常。`bench_vfs_core_profile` を `updatedValueBuffer`（seed と異なる値）へ変更し、実書き込みする dirty ワークロードにした。

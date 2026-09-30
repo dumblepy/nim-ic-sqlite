@@ -8,12 +8,14 @@ import ic_sqlite/lifecycle
 import ic_sqlite/value
 import ic_sqlite/typed
 import ic_sqlite/query_builder
+import ic_sqlite/stable/memory_manager
 from ic_sqlite/stable/superblock import Result
 export db
 export lifecycle
 export value
 export typed
 export query_builder
+export memory_manager
 export Result
 
 const IcSqliteVersion* = "0.1.0"

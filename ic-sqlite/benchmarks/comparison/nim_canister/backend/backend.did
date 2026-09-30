@@ -12,11 +12,16 @@ type NimCleanCacheProfileReport = record { rows : nat64; writes : nat64; instruc
 service : {
   bench_reset : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_insert_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_insert_only_borrowed : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_update_only : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed_string : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed : (nat32) -> (variant { Ok : BenchReport; Err : text });
+  bench_update_only_borrowed_general : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_append_insert : (nat32, nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_large_blob : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_join : (nat32) -> (variant { Ok : BenchReport; Err : text });
   bench_read : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
+  bench_read_borrowed : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
   bench_read_public_helper : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
   bench_read_prepare_each : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
   bench_get_many_in : (nat32) -> (variant { Ok : BenchReport; Err : text }) query;
@@ -29,8 +34,11 @@ service : {
   bench_write_profile : (nat32) -> (variant { Ok : NimWriteProfileReport; Err : text });
   bench_get_many_in_profile : (nat32) -> (variant { Ok : NimGetManyProfileReport; Err : text }) query;
   bench_churn_reset : (nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  bench_churn_reset_borrowed : (nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
   bench_churn_delete : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  bench_churn_delete_borrowed : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
   bench_churn_insert : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
+  bench_churn_insert_borrowed : (nat32, nat32, nat32) -> (variant { Ok : BenchChurnStepReport; Err : text });
   db_stats : () -> (variant { Ok : DbStatsReport; Err : text }) query;
   bench_host_stats : () -> (variant { Ok : HostStatsReport; Err : text }) query;
   bench_set_clean_cache : (nat32) -> (variant { Ok : NimCapacityGrowthReport; Err : text });
