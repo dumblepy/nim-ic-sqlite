@@ -123,8 +123,15 @@
 ### 7. PR-6: file-handle lookup / update statement cache
 
 - [x] `stateFor` の一回 lookup 化（`withValue`）を実装。`hasKey` + `[]` の二重ハッシュ参照を 1 回の `rawGet` に統合（VFS hot path）。
-- [ ] update statement cache は multi-message 系列でのみ評価する。→ 実測不能のため見送り。
-- [x] 実測で差が出る根拠が無いため既定・公開 API は変更しない（`stateFor` は意味論不変の内部最適化）。
+- [x] update statement cache を opt-in（`config.statementCacheEnabled`、既定 false）で実装。`UpdateConnection.prepare` が `db.statementCache` を再利用し、`maxCachedStatements` で容量制限。
+- [x] lease 終了後のエスケープ防止: キャッシュ済み update statement は `lease` を保持し、`step`/`bind`/`execute*` が lease inactive を拒否。
+- [x] SQLite error 時の無効化: `step`/`execute*` のエラーで該当エントリを cache から evict（raw は呼出元が finalize）。
+- [x] commit/rollback 時の無効化: `withUpdate` の defer で `resetCachedUpdateStatements` が全キャッシュを reset+clear。
+- [x] schema 変更: `sqlite3_prepare_v2` の自動再コンパイル＋エラー時 evict で対応。
+- [x] テスト `test_statement_cache.nim`: トランザクション跨ぎ再利用（miss 1 / hit 2）、lease 後拒否、エラー evict、schema 変更後再利用、既定無効。
+- [x] 全 native 回帰 **30/30 PASS**。
+- [x] cross-transaction A/B 計測（`runner/update_cache_ab.nim`）: 同一 SQL を 20 トランザクションで prepare する upsert で、cache off 38,356,692 → on 37,813,460（**−543,232 / −1.42%**）。dirty/vfs/stable/heap/page は不変。
+- [x] 採否: 改善は実測で確認できるが modest（−1.4%）かつ statement の寿命をトランザクション跨ぎに変えるため、既定は **false のまま**（opt-in）。`statementCacheEnabled` を明示した利用者に限り有効。
 
 完了条件: 高頻度 multi-message で有意差がある場合のみ採用し、公開 API と不変条件を維持する。
 
@@ -252,6 +259,8 @@ Nim の update 命令数は 5/5 完全に同一値（決定論的）。
 | 2026-09-30 | profile カウンタ切り分け | `runner/clean_cache_ab.nim`（強制クリーン）、native 診断 | 原因判明: ワークロードが seed と同値 upsert の no-op で dirty 0。カウンタは正常（native dirtyNew=4、canister clean-cache hits>0）。 |
 | 2026-09-30 | 既定 canister ビルド | `rm nimcache && nicp productionBuild`（backend） | 成功、Wasm `919ffd9cd145…`。 |
 | 2026-09-30 | PR-3 C0/C1 再計測 | `bench_vfs_core_profile` を `updatedValueBuffer` 化、`NISQL_ENABLE_DIRTY_SEQ=0/1 ./runner/vfs_core 1000/10000` | 実 dirty 5/30 ページ。1000 rows: C0 32,300,869 vs C1 32,272,826（−0.087%）。10000 rows: 340,092,018 vs 339,959,294（−0.039%）。有意差なし → 既定 C0 維持。 |
+| 2026-09-30 | PR-6 update statement cache 実装 | `db.nim`（`Statement.lease`/`cachedInDb`、`UpdateConnection.prepare` キャッシュ、lease guard、error evict、`resetCachedUpdateStatements`）、`test_statement_cache.nim` | トランザクション跨ぎ再利用・lease 後拒否・error evict・schema 変更・既定無効を検証。native **30/30 PASS**。 |
+| 2026-09-30 | PR-6 cross-transaction 計測 | `runner/update_cache_ab.nim`（`NISQL_ENABLE_UPDATE_CACHE=0/1`） | cache off 38,356,692 → on 37,813,460（−1.42%）。dirty/vfs/stable/heap/page 不変。modest のため既定 false（opt-in）。 |
 
 ## 現在の未確定事項
 

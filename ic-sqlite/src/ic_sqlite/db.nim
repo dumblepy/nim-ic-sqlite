@@ -91,6 +91,10 @@ type
     errorSource: ptr Sqlite3
     cached: bool
     cacheKey: string
+    ## Set for cached update statements so a handle leaked past `withUpdate`
+    ## cannot be executed after its transaction lease ends.
+    lease: TransactionLease
+    cachedInDb: bool
   StepResult* = enum
     srRow, srDone
   Migration* = object
@@ -184,6 +188,16 @@ proc clearStatementCache(db: var Db) =
       discard sqlite3_finalize(statement)
   db.statementCache.clear()
   db.statementCacheStats = StatementCacheStats()
+
+proc resetCachedUpdateStatements(db: var Db) =
+  ## Called at the end of every update transaction. Cached update statements
+  ## stay resident on the persistent write connection but are reset and their
+  ## bindings cleared, so no statement state can leak into the next transaction.
+  if not db.config.statementCacheEnabled: return
+  for _, raw in db.statementCache:
+    if not raw.isNil:
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
 
 proc sqliteStableBackend(backend: StableBackend): StableBackend =
   ## When the process boots through wasi2ic, the WASI polyfill owns a fixed
@@ -401,6 +415,7 @@ proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool
 proc finalize*(statement: var Statement)
 proc executeBorrowed*(statement: var Statement;
                       values: openArray[SqlValue]): Result[bool, DbError]
+proc invalidateCachedStatement(statement: var Statement)
 
 proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
   ## Typed prepared execution using the same overlay/publish path as execText.
@@ -574,7 +589,7 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
       inc stats[].hits
       return Result[Statement, DbError](isOk: true,
         value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-          cached: true, cacheKey: sql))
+          cached: true, cacheKey: sql, cachedInDb: inDbCache))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
@@ -591,20 +606,48 @@ proc prepare*(conn: var Connection; sql: string): Result[Statement, DbError] =
       inc stats[].misses
       return Result[Statement, DbError](isOk: true,
         value: Statement(raw: raw, db: conn.db, errorSource: conn.raw,
-          cached: true, cacheKey: sql))
+          cached: true, cacheKey: sql, cachedInDb: inDbCache))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.raw))
 
 proc prepare*(conn: var UpdateConnection; sql: string): Result[Statement, DbError] =
-  ## A prepared statement used only inside the current update transaction.
+  ## A prepared statement used inside the current update transaction.
+  ##
+  ## When `config.statementCacheEnabled` is set, the statement is cached on the
+  ## persistent write connection (`db.statementCache`) so repeated update
+  ## messages with the same SQL skip re-preparation. Cached handles carry the
+  ## transaction lease and are rejected by `step`/`bind` once the lease ends, so
+  ## a handle leaked past `withUpdate` cannot run outside its transaction. The
+  ## cache is reset (not finalized) at the end of every transaction and an entry
+  ## is evicted if SQLite reports an error for it.
   if conn.db.isNil or conn.db[].raw.isNil or conn.lease.isNil or not conn.lease.active:
     return Result[Statement, DbError](isOk: false,
       error: DbError(code: -1, message: "update connection is not active", kind: dekInvalidState))
+  if sql.len == 0 or uint64(sql.len) > conn.db[].config.maxSqlBytes:
+    return Result[Statement, DbError](isOk: false,
+      error: DbError(code: -1, message: "SQL exceeds configured limit", kind: dekInvalidState))
+  let cacheable = conn.db[].config.statementCacheEnabled
+  if cacheable:
+    let cache = addr conn.db[].statementCache
+    if cache[].hasKey(sql):
+      let raw = cache[][sql]
+      discard sqlite3_reset(raw)
+      discard sqlite3_clear_bindings(raw)
+      inc conn.db[].statementCacheStats.hits
+      return Result[Statement, DbError](isOk: true,
+        value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw,
+          cached: true, cacheKey: sql, lease: conn.lease, cachedInDb: true))
   var raw: ptr Sqlite3Stmt
   let code = sqlite3_prepare_v2(conn.db[].raw, sql.cstring, sql.len.cint, addr raw, nil)
   if code != sqlite_api.SqliteOk:
     if not raw.isNil: discard sqlite3_finalize(raw)
     return Result[Statement, DbError](isOk: false, error: sqliteError(conn.db[].raw, code))
+  if cacheable and uint64(conn.db[].statementCache.len) < conn.db[].config.maxCachedStatements:
+    conn.db[].statementCache[sql] = raw
+    inc conn.db[].statementCacheStats.misses
+    return Result[Statement, DbError](isOk: true,
+      value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw,
+        cached: true, cacheKey: sql, lease: conn.lease, cachedInDb: true))
   Result[Statement, DbError](isOk: true,
     value: Statement(raw: raw, db: conn.db, errorSource: conn.db[].raw))
 
@@ -644,6 +687,10 @@ var emptyBlobByte: byte
 proc `bind`*(statement: var Statement; index: int; value: SqlValue): Result[bool, DbError] =
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   if index <= 0:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "bind index must be positive"))
   var code: cint
@@ -714,6 +761,10 @@ proc executeTextTextBorrowed*(statement: var Statement;
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   if int(sqlite3_bind_parameter_count(statement.raw)) != 2:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "statement must have exactly two parameters",
@@ -747,6 +798,7 @@ proc executeTextTextBorrowed*(statement: var Statement;
   ## never outlive this call, even when step failed.
   discard sqlite3_clear_bindings(statement.raw)
   if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)
 
@@ -759,6 +811,10 @@ proc executeTextBorrowed*(statement: var Statement;
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   if int(sqlite3_bind_parameter_count(statement.raw)) != 1:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "statement must have exactly one parameter",
@@ -777,6 +833,7 @@ proc executeTextBorrowed*(statement: var Statement;
   let code = sqlite3_step(statement.raw)
   discard sqlite3_clear_bindings(statement.raw)
   if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)
 
@@ -839,6 +896,10 @@ proc executeBorrowed*(statement: var Statement;
   if statement.raw.isNil or statement.db.isNil:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   if int(sqlite3_bind_parameter_count(statement.raw)) != values.len:
     return Result[bool, DbError](isOk: false,
       error: DbError(code: -1, message: "parameter count does not match bound values",
@@ -862,17 +923,34 @@ proc executeBorrowed*(statement: var Statement;
   ## Clear before inspecting the result: no borrowed buffer may outlive the call.
   discard sqlite3_clear_bindings(statement.raw)
   if code != sqlite_api.SqliteDone:
+    statement.invalidateCachedStatement()
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)
+
+proc invalidateCachedStatement(statement: var Statement) =
+  ## Evicts a cached update statement after SQLite reports an error for it so a
+  ## failed or expired plan is never reused. The entry is removed from the cache
+  ## but the raw handle is kept alive for the caller, which may reset and retry
+  ## within the same transaction; `finalize` now really finalizes it.
+  if not statement.cachedInDb or statement.cacheKey.len == 0: return
+  if not statement.db.isNil:
+    statement.db[].statementCache.del(statement.cacheKey)
+  statement.cached = false
+  statement.cachedInDb = false
 
 proc step*(statement: var Statement): Result[StepResult, DbError] =
   if statement.raw.isNil or statement.db.isNil:
     return Result[StepResult, DbError](isOk: false, error: DbError(code: -1, message: "statement is finalized"))
+  if statement.cachedInDb and not statement.lease.isNil and not statement.lease.active:
+    return Result[StepResult, DbError](isOk: false,
+      error: DbError(code: -1, message: "update statement lease is no longer active",
+        kind: dekInvalidState))
   let code = sqlite3_step(statement.raw)
   if code == sqlite_api.SqliteRow:
     return Result[StepResult, DbError](isOk: true, value: srRow)
   if code == sqlite_api.SqliteDone:
     return Result[StepResult, DbError](isOk: true, value: srDone)
+  statement.invalidateCachedStatement()
   Result[StepResult, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
 
 proc columnIsNull*(statement: Statement; index: int): bool =
@@ -928,6 +1006,7 @@ proc withUpdate*[T](db: var Db;
   let lease = TransactionLease(active: true, db: addr db)
   db.currentUpdate = lease
   defer:
+    db.resetCachedUpdateStatements()
     lease.active = false
     lease.db = nil
     if db.currentUpdate == lease: db.currentUpdate = nil

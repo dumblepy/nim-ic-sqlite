@@ -149,7 +149,7 @@ proc ensureDatabase(): string =
   var config = defaultDbConfig()
   config.cleanCachePages = dbCleanCachePages
   config.queryConnectionReuse = dbQueryReuse
-  config.statementCacheEnabled = dbStatementCache
+  config.statementCacheEnabled = dbStatementCache or defined(updateStatementCache)
   when defined(benchmarkFailpoint):
     let opened = database.init(newFaultInjectingBackend(), config = config)
   else:
