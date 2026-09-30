@@ -23,7 +23,8 @@ proc sha256(path: string): string = commandOutput("sha256sum " & quoteShell(path
 
 proc observe(transport: CliTransport; runId, implementation, repoSha, wasmSha,
              canister, didPath, methodName, args, phase: string;
-             cycle, rows: uint32; expectedCount, baseline: uint64): Measurement =
+             cycle, rows: uint32; expectedCount, baseline: uint64;
+             scenario = "churn_5000x100"): Measurement =
   let response = transport.call(canister, didPath, methodName, args)
   let count = response["row_count"].getNat64()
   if count != expectedCount:
@@ -36,7 +37,7 @@ proc observe(transport: CliTransport; runId, implementation, repoSha, wasmSha,
     raise newException(ValueError,
       "canister status memory_size is smaller than raw stable memory")
   Measurement(runId: runId, implementation: implementation, repoSha: repoSha,
-    wasmSha256: wasmSha, scenario: "churn_5000x100", phase: phase,
+    wasmSha256: wasmSha, scenario: scenario, phase: phase,
     trial: 1, cycle: cycle, rows: uint64(rows), success: true,
     instructionWindow: iwCore, instructionsUpdate: some(response["instructions"].getNat64()),
     dbSize: response["db_size"].getNat64(),
@@ -53,6 +54,19 @@ proc main() =
     raise newException(OSError, "run benchmarks/comparison/prepare_rust.sh first")
   ## Keep the Nim artifact comparable with Rust's Cargo release artifact.
   discard commandOutput("cd " & quoteShell(CanisterDir / "backend") & " && nicp productionBuild")
+  let churnCycles = block:
+    let raw = getEnv("NISQL_COMPARE_CHURN_CYCLES")
+    if raw.len == 0: 100'u32
+    else:
+      let parsed = parseInt(raw)
+      if parsed < 1 or parsed > 100:
+        raise newException(ValueError, "NISQL_COMPARE_CHURN_CYCLES must be 1..100")
+      uint32(parsed)
+  let nimBorrowed = getEnv("NISQL_COMPARE_NIM_CHURN_BORROWED") == "1"
+  let nimResetMethod = if nimBorrowed: "bench_churn_reset_borrowed" else: "bench_churn_reset"
+  let nimDeleteMethod = if nimBorrowed: "bench_churn_delete_borrowed" else: "bench_churn_delete"
+  let nimInsertMethod = if nimBorrowed: "bench_churn_insert_borrowed" else: "bench_churn_insert"
+  let churnScenario = "churn_5000x" & $churnCycles
   let runId = "churn-" & now().utc.format("yyyyMMdd'T'HHmmss") & "Z"
   let resultDir = ComparisonDir / "results" / runId
   createDir(resultDir)
@@ -90,10 +104,15 @@ proc main() =
     commandOutput("git -C /application/ic-sqlite status --porcelain").len > 0)
   manifest["nim_canister"] = %nimCanister
   manifest["rust_canister"] = %rustCanister
-  manifest["cycles"] = %100
+  manifest["cycles"] = %int(churnCycles)
+  manifest["nim_churn_borrowed"] = %nimBorrowed
   manifest["rows_initial"] = %5_000
   manifest["rows_per_step"] = %1_000
-  manifest["notes"] = %["Each implementation keeps one canister for all 100 cycles.",
+  manifest["notes"] = %["Each implementation keeps one canister for all churn cycles.",
+    (if nimBorrowed:
+      "Nim churn steps use the SQLITE_STATIC scoped borrowed binding."
+     else:
+      "Nim churn steps use the SQLITE_TRANSIENT copy binding."),
     "A failed step terminates the run; completed rows remain in measurements files."]
   writeFile(resultDir / "manifest.json", manifest.pretty())
   var csv = MeasurementCsvHeader & "\n"
@@ -115,25 +134,29 @@ proc main() =
       if isNim: nimCanister else: rustCanister,
       if isNim: NimDid else: RustDid,
       methodName, args, phase, cycle, rows, expectedCount,
-      if isNim: nimBaseline else: rustBaseline)
+      if isNim: nimBaseline else: rustBaseline,
+      scenario = churnScenario)
     csv.add(m.toCsvRow() & "\n")
     jsonl.add($m.toJson() & "\n")
     writeFile(resultDir / "measurements.csv", csv)
     writeFile(resultDir / "measurements.jsonl", jsonl)
 
   for implementation in ["nim", "rust"]:
-    record(implementation, "bench_churn_reset", "(5000)", "reset", 0, 5_000, 5_000)
-  for cycle in 0'u32 ..< 100'u32:
+    record(implementation, if implementation == "nim": nimResetMethod else: "bench_churn_reset",
+      "(5000)", "reset", 0, 5_000, 5_000)
+  for cycle in 0'u32 ..< churnCycles:
     let (deleteStart, deleteRows) = churnDeleteRange(cycle)
     let (insertStart, insertRows) = churnInsertRange(cycle)
     for implementation in ["nim", "rust"]:
-      record(implementation, "bench_churn_delete",
+      record(implementation,
+        if implementation == "nim": nimDeleteMethod else: "bench_churn_delete",
         fmt"({deleteStart}, {deleteRows}, {cycle})", "delete", cycle, deleteRows, 4_000)
-      record(implementation, "bench_churn_insert",
+      record(implementation,
+        if implementation == "nim": nimInsertMethod else: "bench_churn_insert",
         fmt"({insertStart}, {insertRows}, {cycle})", "insert", cycle, insertRows, 5_000)
-    echo fmt"churn cycle {cycle + 1}/100 complete"
+    echo fmt"churn cycle {cycle + 1}/{churnCycles} complete"
   writeFile(resultDir / "summary.md", "# " & runId & "\n\n" &
-    "All 100 churn cycles completed for both implementations. " &
+    fmt"All {churnCycles} churn cycles completed for both implementations. " &
     "Raw memory and SQLite page counts for every step are in measurements.csv.\n")
   echo resultDir
 

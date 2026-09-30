@@ -15,6 +15,19 @@ when defined(benchmarkProfile):
     cleanCacheReadBytes*: uint64
     cleanCacheEvictions*: uint64
 
+when defined(overlayDirtySeq):
+  ## C1: small linear-scanned store. Cheaper than a hash table while the
+  ## resident dirty set is tiny; the linear scan is bounded by
+  ## `maxDirtyPages`/`maxDirtyBytes`.
+  type
+    DirtyPageEntry = object
+      page: uint64
+      data: seq[byte]
+    DirtyStore = seq[DirtyPageEntry]
+else:
+  ## C0 (default): hash table keyed by logical page number.
+  type DirtyStore = Table[uint64, seq[byte]]
+
 type
   Overlay* = object
     baseSize*: uint64
@@ -23,7 +36,7 @@ type
     dbBaseOffset*: uint64
     maxDirtyPages*: uint64
     maxDirtyBytes*: uint64
-    dirtyPages: Table[uint64, seq[byte]]
+    dirtyPages: DirtyStore
     zeroExtents*: seq[ZeroExtent]
     ## Optional read cache for base pages that are not dirty. Disabled by
     ## default (`cleanCacheMax == 0`) and only measurable under
@@ -35,6 +48,68 @@ type
 
 type PublishStartedError* = object of CatchableError
 
+proc initDirtyStore(): DirtyStore =
+  when defined(overlayDirtySeq):
+    @[]
+  else:
+    initTable[uint64, seq[byte]]()
+
+proc dirtyLen(overlay: Overlay): int {.inline.} =
+  overlay.dirtyPages.len
+
+proc dirtyHas(overlay: Overlay; page: uint64): bool =
+  when defined(overlayDirtySeq):
+    for entry in overlay.dirtyPages:
+      if entry.page == page: return true
+    false
+  else:
+    overlay.dirtyPages.hasKey(page)
+
+proc dirtyPtr(overlay: var Overlay; page: uint64): ptr seq[byte] =
+  ## Returns a pointer to the resident page, or nil. Under C0 this is a single
+  ## `withValue` lookup; under C1 a bounded linear scan. The pointer stays valid
+  ## until the store is mutated, so callers must not insert/delete while using
+  ## it (the existing call sites copy immediately).
+  when defined(overlayDirtySeq):
+    for index in 0 ..< overlay.dirtyPages.len:
+      if overlay.dirtyPages[index].page == page:
+        return addr overlay.dirtyPages[index].data
+    nil
+  else:
+    overlay.dirtyPages.withValue(page, target):
+      return target
+    nil
+
+proc dirtyInsert(overlay: var Overlay; page: uint64; data: var seq[byte]) =
+  ## Precondition: `page` is not already resident. Moves `data` into the store.
+  when defined(overlayDirtySeq):
+    overlay.dirtyPages.add DirtyPageEntry(page: page, data: move(data))
+  else:
+    overlay.dirtyPages[page] = move(data)
+
+proc dirtyDel(overlay: var Overlay; page: uint64) =
+  when defined(overlayDirtySeq):
+    for index in 0 ..< overlay.dirtyPages.len:
+      if overlay.dirtyPages[index].page == page:
+        overlay.dirtyPages.delete(index)
+        return
+  else:
+    overlay.dirtyPages.del(page)
+
+proc dirtyKeys(overlay: Overlay): seq[uint64] =
+  when defined(overlayDirtySeq):
+    result = newSeq[uint64](overlay.dirtyPages.len)
+    for index in 0 ..< overlay.dirtyPages.len:
+      result[index] = overlay.dirtyPages[index].page
+  else:
+    result = toSeq(overlay.dirtyPages.keys)
+
+proc dirtyClear(overlay: var Overlay) =
+  when defined(overlayDirtySeq):
+    overlay.dirtyPages.setLen(0)
+  else:
+    overlay.dirtyPages.clear()
+
 proc initOverlay*(baseSize: uint64; pageSize = 16384'u32;
                   dbBaseOffset = SuperblockReservedBytes;
                   maxDirtyPages = high(uint64); maxDirtyBytes = high(uint64);
@@ -45,7 +120,7 @@ proc initOverlay*(baseSize: uint64; pageSize = 16384'u32;
   let cleanLimit = if cleanCachePages < 0: 0'u64 else: uint64(cleanCachePages)
   Overlay(baseSize: baseSize, size: baseSize, pageSize: pageSize,
     dbBaseOffset: dbBaseOffset, maxDirtyPages: maxDirtyPages,
-    maxDirtyBytes: maxDirtyBytes, dirtyPages: initTable[uint64, seq[byte]](),
+    maxDirtyBytes: maxDirtyBytes, dirtyPages: initDirtyStore(),
     cleanCacheMax: cleanLimit, cleanCache: initTable[uint64, seq[byte]]())
 
 when defined(benchmarkProfile):
@@ -105,10 +180,10 @@ proc addZeroExtent(overlay: var Overlay; startPage, endPage: uint64) =
 
 proc ensureDirtyPage(overlay: var Overlay; storage: StableBackend; page: uint64;
                      loadBase: bool) =
-  ## Inserts at most one resident page. Existing table entries are subsequently
-  ## mutated through `mget`, never copied out and assigned back.
-  if overlay.dirtyPages.hasKey(page): return
-  let nextPages = uint64(overlay.dirtyPages.len) + 1
+  ## Inserts at most one resident page. Existing entries are subsequently
+  ## mutated through `dirtyPtr`, never copied out and assigned back.
+  if overlay.dirtyHas(page): return
+  let nextPages = uint64(overlay.dirtyLen) + 1
   if nextPages > overlay.maxDirtyPages or
       nextPages > overlay.maxDirtyBytes div overlay.pageBytes:
     raise newException(ValueError, "dirty overlay limit exceeded")
@@ -128,12 +203,12 @@ proc ensureDirtyPage(overlay: var Overlay; storage: StableBackend; page: uint64;
       else:
         storage.read(overlay.dbBaseOffset + pageOffset, addr data[0], readable)
   overlay.cleanPageCached(page)
-  overlay.dirtyPages[page] = move(data)
+  overlay.dirtyInsert(page, data)
   when defined(benchmarkProfile):
     inc overlay.profile.dirtyPageNew
     overlay.profile.dirtyPageNewBytes += overlay.pageBytes
     overlay.profile.dirtyPagePeak = max(overlay.profile.dirtyPagePeak,
-      uint64(overlay.dirtyPages.len))
+      uint64(overlay.dirtyLen))
 
 proc readInto*(overlay: var Overlay; storage: StableBackend; offset: uint64;
                dst: pointer; length: uint64): bool =
@@ -156,44 +231,43 @@ proc readInto*(overlay: var Overlay; storage: StableBackend; offset: uint64;
     let page = position div overlay.pageBytes
     let inPage = int(position mod overlay.pageBytes)
     let take = min(validLen - destination, overlay.pageBytes - uint64(inPage))
-    if overlay.dirtyPages.hasKey(page):
-      let source = overlay.dirtyPages[page]
-      copyMem(addr target[int(destination)], unsafeAddr source[inPage], int(take))
+    let dirty = overlay.dirtyPtr(page)
+    if not dirty.isNil:
+      copyMem(addr target[int(destination)], unsafeAddr dirty[][inPage], int(take))
     elif overlay.pageIsZero(page) or position >= overlay.baseSize:
       zeroMem(addr target[int(destination)], int(take))
     else:
       let readable = min(take, overlay.baseSize - position)
       if readable > 0:
-        if inPage == 0 and take == overlay.pageBytes:
-          ## Whole clean page: serve from the optional cache when enabled.
+        if overlay.cleanCacheMax > 0:
+          ## Optional clean page cache: a partial base read loads the whole
+          ## page once (zero-padded past base EOF) and later partial reads of
+          ## the same page are served without another stable read.
           if overlay.cleanCache.hasKey(page):
             let cached = overlay.cleanCache[page]
             copyMem(addr target[int(destination)], unsafeAddr cached[inPage], int(take))
             when defined(benchmarkProfile):
               inc overlay.profile.cleanCacheHits
           else:
-            if overlay.cleanCacheMax > 0:
-              var buffer = newSeq[byte](int(overlay.pageSize))
-              storage.read(overlay.dbBaseOffset + position, addr buffer[0], readable)
-              copyMem(addr target[int(destination)], unsafeAddr buffer[inPage], int(take))
-              if uint64(overlay.cleanCache.len) >= overlay.cleanCacheMax:
-                ## The experimental cache is tiny (0/2/4/8 pages); arbitrary
-                ## eviction is acceptable for the A/B measurement.
-                var evicted: uint64
-                for candidate in overlay.cleanCache.keys:
-                  evicted = candidate
-                  break
-                overlay.cleanCache.del(evicted)
-                when defined(benchmarkProfile):
-                  inc overlay.profile.cleanCacheEvictions
-              overlay.cleanCache[page] = move(buffer)
+            var buffer = newSeq[byte](int(overlay.pageSize))
+            let pageOffset = page * overlay.pageBytes
+            let pageReadable = min(overlay.pageBytes, overlay.baseSize - pageOffset)
+            storage.read(overlay.dbBaseOffset + pageOffset, addr buffer[0], pageReadable)
+            copyMem(addr target[int(destination)], unsafeAddr buffer[inPage], int(take))
+            if uint64(overlay.cleanCache.len) >= overlay.cleanCacheMax:
+              ## The experimental cache is tiny (0/2/4/8 pages); arbitrary
+              ## eviction is acceptable for the A/B measurement.
+              var evicted: uint64
+              for candidate in overlay.cleanCache.keys:
+                evicted = candidate
+                break
+              overlay.cleanCache.del(evicted)
               when defined(benchmarkProfile):
-                inc overlay.profile.cleanCacheMisses
-                overlay.profile.cleanCacheReadBytes += readable
-            else:
-              storage.read(overlay.dbBaseOffset + position, addr target[int(destination)], readable)
-              if readable < take:
-                zeroMem(addr target[int(destination) + int(readable)], int(take - readable))
+                inc overlay.profile.cleanCacheEvictions
+            overlay.cleanCache[page] = move(buffer)
+            when defined(benchmarkProfile):
+              inc overlay.profile.cleanCacheMisses
+              overlay.profile.cleanCacheReadBytes += pageReadable
         else:
           storage.read(overlay.dbBaseOffset + position, addr target[int(destination)], readable)
           if readable < take:
@@ -228,7 +302,8 @@ proc writeFrom*(overlay: var Overlay; storage: StableBackend; offset: uint64;
     let take = min(length - sourceOffset, overlay.pageBytes - uint64(inPage))
     overlay.ensureDirtyPage(storage, page,
       loadBase = not (inPage == 0 and take == overlay.pageBytes))
-    overlay.dirtyPages.withValue(page, target):
+    let target = overlay.dirtyPtr(page)
+    if not target.isNil:
       copyMem(addr target[][inPage],
         unsafeAddr cast[ptr UncheckedArray[byte]](src)[int(sourceOffset)], int(take))
     overlay.removeZeroPage(page)
@@ -247,15 +322,16 @@ proc truncate*(overlay: var Overlay; newSize: uint64; storage: StableBackend = n
       if storage.isNil: raise newException(ValueError, "storage is required for partial truncate")
       let page = newSize div overlay.pageBytes
       overlay.ensureDirtyPage(storage, page, loadBase = true)
-      overlay.dirtyPages.withValue(page, target):
+      let target = overlay.dirtyPtr(page)
+      if not target.isNil:
         zeroMem(addr target[][int(partial)], int(overlay.pageBytes - partial))
     let firstZeroPage = (newSize + overlay.pageBytes - 1) div overlay.pageBytes
     let oldEndPage = (overlay.size + overlay.pageBytes - 1) div overlay.pageBytes
     overlay.addZeroExtent(firstZeroPage, oldEndPage)
     var removePages: seq[uint64]
-    for page in overlay.dirtyPages.keys:
+    for page in overlay.dirtyKeys:
       if page * overlay.pageBytes >= newSize: removePages.add page
-    for page in removePages: overlay.dirtyPages.del(page)
+    for page in removePages: overlay.dirtyDel(page)
     ## Bytes removed by the truncate are logically zero now; cached base
     ## copies of whole removed pages would keep dead data resident.
     var removeCached: seq[uint64]
@@ -269,20 +345,21 @@ proc truncate*(overlay: var Overlay; newSize: uint64; storage: StableBackend = n
       if storage.isNil: raise newException(ValueError, "storage is required for overlay extension")
       let page = overlay.size div overlay.pageBytes
       overlay.ensureDirtyPage(storage, page, loadBase = true)
-      overlay.dirtyPages.withValue(page, target):
+      let target = overlay.dirtyPtr(page)
+      if not target.isNil:
         zeroMem(addr target[][int(partial)], int(overlay.pageBytes - partial))
     let firstZeroPage = (overlay.size + overlay.pageBytes - 1) div overlay.pageBytes
     let endPage = (newSize + overlay.pageBytes - 1) div overlay.pageBytes
     overlay.addZeroExtent(firstZeroPage, endPage)
   overlay.size = newSize
 
-proc dirtyPageCount*(overlay: Overlay): int = overlay.dirtyPages.len
+proc dirtyPageCount*(overlay: Overlay): int = overlay.dirtyLen
 
 proc cleanCacheCount*(overlay: Overlay): int = overlay.cleanCache.len
 proc cleanCacheMaxPages*(overlay: Overlay): uint64 = overlay.cleanCacheMax
 
-proc publishDirtyPages*(overlay: Overlay; storage: StableBackend) =
-  var pages = toSeq(overlay.dirtyPages.keys)
+proc publishDirtyPages*(overlay: var Overlay; storage: StableBackend) =
+  var pages = overlay.dirtyKeys
   pages.sort()
   var requiredBytes = overlay.dbBaseOffset + overlay.size
   for page in pages:
@@ -293,16 +370,17 @@ proc publishDirtyPages*(overlay: Overlay; storage: StableBackend) =
   var started = false
   try:
     for page in pages:
-      overlay.dirtyPages.withValue(page, data):
+      let data = overlay.dirtyPtr(page)
+      if not data.isNil:
         started = true
         storage.write(overlay.dbBaseOffset + page * overlay.pageBytes,
-          unsafeAddr data[0], uint64(data.len))
+          unsafeAddr data[][0], uint64(data[].len))
   except CatchableError as error:
     if started: raise newException(PublishStartedError, error.msg)
     raise
 
 proc discardOverlay*(overlay: var Overlay) =
-  overlay.dirtyPages.clear()
+  overlay.dirtyClear()
   overlay.zeroExtents.setLen(0)
   overlay.size = overlay.baseSize
   overlay.cleanCache.clear()

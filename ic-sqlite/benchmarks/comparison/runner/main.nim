@@ -41,11 +41,12 @@ proc median(values: seq[uint64]): float64 =
 
 proc measure(transport: CliTransport; runId, implementation, repoSha, wasmSha,
              canister, didPath, phase: string; trial, rows: uint32;
-             baselineRaw: Option[uint64]; updateEndpoint = "bench_update_only"): Measurement =
+             baselineRaw: Option[uint64]; updateEndpoint = "bench_update_only";
+             readEndpoint = "bench_read"): Measurement =
   let query = phase == "read"
   let response = transport.call(canister, didPath,
     if phase == "reset": "bench_reset"
-    elif phase == "read": "bench_read"
+    elif phase == "read": readEndpoint
     else: updateEndpoint, fmt"({rows})", query = query)
   response.assertValue("rows", uint64(rows))
   response.assertValue("checksum", if phase == "read":
@@ -87,10 +88,16 @@ proc main() =
   let nimUpdateEndpoint = getEnv("NISQL_COMPARE_NIM_UPDATE_ENDPOINT", "bench_update_only")
   const SupportedNimUpdateEndpoints = [
     "bench_update_only", "bench_update_only_borrowed_string", "bench_update_only_borrowed",
-    "bench_update_only_borrowed_general"]
+    "bench_update_only_borrowed_general",
+    "bench_insert_only", "bench_insert_only_borrowed"]
   if nimUpdateEndpoint notin SupportedNimUpdateEndpoints:
     raise newException(ValueError,
       "unsupported NISQL_COMPARE_NIM_UPDATE_ENDPOINT: " & nimUpdateEndpoint)
+  let nimReadEndpoint = getEnv("NISQL_COMPARE_NIM_READ_ENDPOINT", "bench_read")
+  const SupportedNimReadEndpoints = ["bench_read", "bench_read_borrowed"]
+  if nimReadEndpoint notin SupportedNimReadEndpoints:
+    raise newException(ValueError,
+      "unsupported NISQL_COMPARE_NIM_READ_ENDPOINT: " & nimReadEndpoint)
   if not fileExists(RustWasm) or not fileExists(RustDid):
     raise newException(OSError, "run benchmarks/comparison/prepare_rust.sh first")
   let rustSha = shellOutput("git -C " & quoteShell(RustRepo) & " rev-parse HEAD")
@@ -133,6 +140,7 @@ proc main() =
   manifest["trials"] = %trialCount
   manifest["rows_per_trial"] = %100'u32
   manifest["nim_update_endpoint"] = %nimUpdateEndpoint
+  manifest["nim_read_endpoint"] = %nimReadEndpoint
   manifest["trial_baselines"] = newJArray()
   manifest["cycle_balance_observations"] = newJArray()
   manifest["notes"] = %[(if externalNetwork:
@@ -186,7 +194,8 @@ proc main() =
           if implementation == "nim": NimDid else: RustDid,
           phase, uint32(trial), 100'u32,
           if implementation == "nim": nimBaseline else: rustBaseline,
-          updateEndpoint = if implementation == "nim": nimUpdateEndpoint else: "bench_update_only")
+          updateEndpoint = if implementation == "nim": nimUpdateEndpoint else: "bench_update_only",
+          readEndpoint = if implementation == "nim": nimReadEndpoint else: "bench_read")
         let afterStatus = transport.canisterStatus(canister)
         let beforeCycles = beforeStatus.canisterCycles()
         let afterCycles = afterStatus.canisterCycles()

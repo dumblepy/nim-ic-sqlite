@@ -307,3 +307,39 @@ suite "Overlay":
     check overlay.readInto(storage, 0, addr output[0], 16)
     check output == full
     check CountingReadBackend(storage).readCount == readsAfterWrite
+
+  test "partial clean reads populate and then hit the clean cache":
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(4)
+    let storage: StableBackend = CountingReadBackend(delegate: raw)
+    var base = newSeq[byte](48)
+    for index in 0 ..< base.len: base[index] = byte(index + 7)
+    raw.write(64, addr base[0], uint64(base.len))
+    var overlay = initOverlay(48, pageSize = 16, dbBaseOffset = 64,
+      cleanCachePages = 2)
+    var buffer = newSeq[byte](6)
+    # First partial read of page 0 misses and loads the whole page once.
+    check overlay.readInto(storage, 2, addr buffer[0], 6)
+    check buffer == base[2 ..< 8]
+    check overlay.cleanCacheCount == 1
+    check CountingReadBackend(storage).readCount == 1
+    # A second partial read of page 0 is served from the cache.
+    check overlay.readInto(storage, 9, addr buffer[0], 6)
+    check buffer == base[9 ..< 15]
+    check CountingReadBackend(storage).readCount == 1
+    # A different page still misses once and then hits.
+    check overlay.readInto(storage, 20, addr buffer[0], 6)
+    check buffer == base[20 ..< 26]
+    check overlay.cleanCacheCount == 2
+    check CountingReadBackend(storage).readCount == 2
+    check overlay.readInto(storage, 20, addr buffer[0], 6)
+    check CountingReadBackend(storage).readCount == 2
+    # Dirtying a cached page evicts its clean copy.
+    var one = [byte 0xEE]
+    overlay.writeFrom(storage, 4, addr one[0], 1)
+    check overlay.cleanCacheCount == 1
+    # A partial read past base EOF is zero-padded in the cached page.
+    var tail: array[8, byte]
+    check not overlay.readInto(storage, 44, addr tail[0], 8)
+    check tail[0 .. 3] == base[44 .. 47]
+    check tail[4 .. 7] == [byte 0, 0, 0, 0]

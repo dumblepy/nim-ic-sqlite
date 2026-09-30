@@ -750,6 +750,36 @@ proc executeTextTextBorrowed*(statement: var Statement;
     return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
   Result[bool, DbError](isOk: true, value: true)
 
+proc executeTextBorrowed*(statement: var Statement;
+                           value: openArray[char]): Result[bool, DbError] =
+  ## Internal-only, allocation-free execution of a statement that binds exactly
+  ## one TEXT parameter. Same scoped contract as `executeTextTextBorrowed`:
+  ## `value` must stay alive until this call returns and bindings are always
+  ## cleared before returning, on success and on every error path.
+  if statement.raw.isNil or statement.db.isNil:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement is finalized", kind: dekInvalidState))
+  if int(sqlite3_bind_parameter_count(statement.raw)) != 1:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "statement must have exactly one parameter",
+        kind: dekInvalidState))
+  if uint64(value.len) > statement.db[].config.maxBlobBytes:
+    return Result[bool, DbError](isOk: false,
+      error: DbError(code: -1, message: "bound value exceeds maxBlobBytes",
+        kind: dekResourceLimit))
+  discard sqlite3_reset(statement.raw)
+  let data = if value.len == 0: cstring("") else: cast[cstring](unsafeAddr value[0])
+  let bound = ic_sqlite_bind_text_static(statement.raw, 1.cint, data, value.len.cint)
+  if bound != sqlite_api.SqliteOk:
+    discard sqlite3_clear_bindings(statement.raw)
+    return Result[bool, DbError](isOk: false,
+      error: sqliteError(statement.errorSource, bound))
+  let code = sqlite3_step(statement.raw)
+  discard sqlite3_clear_bindings(statement.raw)
+  if code != sqlite_api.SqliteDone:
+    return Result[bool, DbError](isOk: false, error: sqliteError(statement.errorSource, code))
+  Result[bool, DbError](isOk: true, value: true)
+
 proc bindStaticValue(statement: var Statement; values: openArray[SqlValue];
                      index: int): Result[bool, DbError] =
   ## STATIC bind of one element of `values` for a scoped execution. It indexes
@@ -940,8 +970,13 @@ proc queryOneText*(db: var Db; sql: string; values: openArray[string]): Result[O
       return Result[Option[string], DbError](isOk: false, error: prepared.error)
     var statement = prepared.value
     defer: statement.finalize()
-    for index, item in queryValues:
-      let bound = statement.bind(index + 1, sqlText(item))
+    for index in 0 ..< queryValues.len:
+      ## `queryValues` is a local copy that stays alive until `finalize`, so the
+      ## parameters can be bound with SQLITE_STATIC without a second copy.
+      let itemLen = queryValues[index].len
+      let data = if itemLen == 0: cstring("")
+                 else: cast[cstring](unsafeAddr queryValues[index][0])
+      let bound = statement.bindStaticText(index + 1, data, itemLen)
       if not bound.isOk:
         return Result[Option[string], DbError](isOk: false, error: bound.error)
     let stepped = statement.step()

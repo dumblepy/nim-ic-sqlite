@@ -133,8 +133,12 @@ proc closeFile*(handleId: uint32): cint =
   if not files.hasKey(handleId): return SqliteIoErr
   files.del(handleId); SqliteOk
 proc stateFor(handleId: uint32): FileState =
-  if not files.hasKey(handleId): raise newException(ValueError, "unknown VFS handle")
-  files[handleId]
+  ## Single hash lookup for the hot VFS path: `withValue` uses one `rawGet`
+  ## instead of a `hasKey` lookup followed by a second `[]` lookup.
+  files.withValue(handleId, state):
+    result = state[]
+  do:
+    raise newException(ValueError, "unknown VFS handle")
 proc readFile*(handleId: uint32; dst: pointer; amount: cint; offset: int64): cint =
   if amount < 0 or offset < 0 or (amount > 0 and dst.isNil): return SqliteIoErrRead
   try:

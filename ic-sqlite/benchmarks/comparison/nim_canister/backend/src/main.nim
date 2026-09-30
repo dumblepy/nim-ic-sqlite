@@ -212,6 +212,43 @@ proc insertRows(tableName: string; start, count: uint32; operation: string;
     Result[uint64, DbError](isOk: true, value: uint64(count))
   )
 
+proc insertRowsBorrowed(tableName: string; start, count: uint32; operation: string;
+                        resetTable = false): Result[uint64, DbError] =
+  ## A1-style borrowed variant of `insertRows`: same seed/SQL/transaction/report,
+  ## but the TEXT parameters are bound with SQLITE_STATIC through the scoped
+  ## helpers and cleared per row.
+  database.withUpdate(proc(conn: var UpdateConnection): Result[uint64, DbError] =
+    if resetTable:
+      let dropped = conn.exec("DROP TABLE IF EXISTS " & tableName)
+      if not dropped.isOk: return Result[uint64, DbError](isOk: false, error: dropped.error)
+      let created = conn.exec(if tableName == "bench": BenchSchemaSql else: ChurnSchemaSql)
+      if not created.isOk: return Result[uint64, DbError](isOk: false, error: created.error)
+    let sql = case operation
+      of "insert": "INSERT INTO " & tableName & "(key, value) VALUES (?, ?)"
+      of "update": "UPDATE bench SET value = ? WHERE key = ?"
+      else: "DELETE FROM churn_bench WHERE key = ?"
+    let prepared = conn.prepare(sql)
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    for offset in 0'u32 ..< count:
+      let index = start + offset
+      let key = if tableName == "churn_bench": churnKey(index) else: benchKey(index)
+      case operation
+      of "update":
+        let executed = statement.executeTextTextBorrowed(updatedValue(index), key)
+        if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+      of "delete":
+        let executed = statement.executeTextBorrowed(key)
+        if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+      else:
+        let executed = statement.executeTextTextBorrowed(key, benchValue(index))
+        if not executed.isOk: return Result[uint64, DbError](isOk: false, error: executed.error)
+      if operation == "delete" and conn.changes() != 1:
+        return Result[uint64, DbError](isOk: false, error: DbError(message: "churn row not found"))
+    Result[uint64, DbError](isOk: true, value: uint64(count))
+  )
+
 proc resetBench(rows: uint32): Result[uint64, DbError] =
   insertRows("bench", 0, rows, "insert", resetTable = true)
 
@@ -248,6 +285,21 @@ proc bench_insert_only() {.update.} =
   if not cleared.isOk: replyErr(cleared.error.message); return
   let start = ic0_performance_counter(0'u32)
   let inserted = insertRows("bench", 0, rows, "insert")
+  if not inserted.isOk: replyErr(inserted.error.message); return
+  replyOk(report(rows, start, uint64(rows)))
+
+proc bench_insert_only_borrowed() {.update.} =
+  ## A1: same as `bench_insert_only` but TEXT parameters are bound with
+  ## SQLITE_STATIC through the scoped borrowed helpers.
+  let request = Request.new()
+  let rows = request.getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let cleared = resetBench(0)
+  if not cleared.isOk: replyErr(cleared.error.message); return
+  let start = ic0_performance_counter(0'u32)
+  let inserted = insertRowsBorrowed("bench", 0, rows, "insert")
   if not inserted.isOk: replyErr(inserted.error.message); return
   replyOk(report(rows, start, uint64(rows)))
 
@@ -427,6 +479,35 @@ proc bench_read() {.query.} =
     var checksum = 0'u64
     for index in 0'u32 ..< rows:
       let bound = statement.bind(1, sqlText(benchKey(index)))
+      if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
+      let stepped = statement.step()
+      if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
+      if stepped.value == srRow: checksum += uint64(statement.columnBytes(0))
+      let resetResult = statement.reset()
+      if not resetResult.isOk: return Result[uint64, DbError](isOk: false, error: resetResult.error)
+    Result[uint64, DbError](isOk: true, value: checksum)
+  )
+  if not read.isOk: replyErr(read.error.message); return
+  replyOk(report(rows, start, read.value))
+
+proc bench_read_borrowed() {.query.} =
+  ## A1-style read: the point-read key is bound with SQLITE_STATIC and the
+  ## bindings are cleared by `reset` after the column is read, so no borrowed
+  ## pointer outlives the loop iteration.
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let read = database.withQuery(proc(conn: var Connection): Result[uint64, DbError] =
+    let prepared = conn.prepare("SELECT value FROM bench WHERE key = ?")
+    if not prepared.isOk: return Result[uint64, DbError](isOk: false, error: prepared.error)
+    var statement = prepared.value
+    defer: statement.finalize()
+    var checksum = 0'u64
+    for index in 0'u32 ..< rows:
+      let key = benchKey(index)
+      let bound = statement.bindStaticText(1, cast[cstring](unsafeAddr key[0]), key.len)
       if not bound.isOk: return Result[uint64, DbError](isOk: false, error: bound.error)
       let stepped = statement.step()
       if not stepped.isOk: return Result[uint64, DbError](isOk: false, error: stepped.error)
@@ -1030,7 +1111,7 @@ when defined(benchmarkProfile):
       raw_stable_bytes_before: 0, raw_stable_bytes_after: 0))
 
   ## VFS/core workload: allocation-free fixed-length key/value buffers from
-  ## `bench_spec` (benchKeyBuffer / benchValueBuffer), one prepared statement,
+  ## `bench_spec` (benchKeyBuffer / updatedValueBuffer), one prepared statement,
   ## `rows` step / reset cycles, and a read-back checksum, all in a single
   ## transaction. This is the isolated VFS/core comparison series, deliberately
   ## separate from the public API series that formats strings.
@@ -1058,8 +1139,11 @@ when defined(benchmarkProfile):
       defer: statement.finalize()
       for index in 0'u32 ..< rows:
         let keyBuffer = benchKeyBuffer(index)
-        let valueBuffer = benchValueBuffer(index)
-        # `benchKeyBuffer` / `benchValueBuffer` already encode the digits
+        ## `updatedValueBuffer` differs from the seeded `benchValueBuffer`, so
+        ## this is a real UPDATE that dirties pages for the overlay/dirty-store
+        ## measurement (an identical-value upsert would be a no-op).
+        let valueBuffer = updatedValueBuffer(index)
+        # `benchKeyBuffer` / `updatedValueBuffer` already encode the digits
         # into a fixed-width array; converting to string here is a
         # single bounded copy (not a format pass), which isolates the
         # VFS/core I/O from the public API's format-then-copy path.
@@ -1223,3 +1307,34 @@ proc churnStep(operation: string) =
 
 proc bench_churn_delete() {.update.} = churnStep("delete")
 proc bench_churn_insert() {.update.} = churnStep("insert")
+
+proc churnStepBorrowed(operation: string) =
+  let request = Request.new()
+  let startIndex = request.getNat32(0)
+  let rows = request.getNat32(1)
+  let cycle = request.getNat32(2)
+  if rows == 0 or not validateFixedBenchKeyRange(startIndex, rows):
+    replyErr("invalid churn range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let written = insertRowsBorrowed("churn_bench", startIndex, rows, operation)
+  if not written.isOk: replyErr(written.error.message); return
+  let observed = churnReport(cycle, operation, rows, start)
+  if not observed.isOk: replyErr(observed.error.message); return
+  replyOk(observed.value)
+
+proc bench_churn_reset_borrowed() {.update.} =
+  let rows = Request.new().getNat32(0)
+  if not validateFixedBenchKeyRows(rows): replyErr("rows exceeds fixed key range"); return
+  let failure = ensureDatabase()
+  if failure.len > 0: replyErr(failure); return
+  let start = ic0_performance_counter(0'u32)
+  let inserted = insertRowsBorrowed("churn_bench", 0, rows, "insert", resetTable = true)
+  if not inserted.isOk: replyErr(inserted.error.message); return
+  let observed = churnReport(0, "reset", rows, start)
+  if not observed.isOk: replyErr(observed.error.message); return
+  replyOk(observed.value)
+
+proc bench_churn_delete_borrowed() {.update.} = churnStepBorrowed("delete")
+proc bench_churn_insert_borrowed() {.update.} = churnStepBorrowed("insert")

@@ -412,19 +412,21 @@ nim c -r runner/validate.nim results/<run-id>
 `NISQL_COMPARE_NIM_SHA=HEAD` measures the currently checked-out Nim source.
 Omit it to reproduce a pinned SHA.
 
-The Nim update phase can select one of three equivalent mid-benchmark
+The Nim update phase can select one of several equivalent mid-benchmark
 endpoints with `NISQL_COMPARE_NIM_UPDATE_ENDPOINT` so the borrowed bindings can
-be measured against each other on the same harness. All three run the same
-100-row `UPDATE bench SET value = ? WHERE key = ?` transaction and report the
-same checksum; only the per-row input formatting and binding differ:
+be measured against each other on the same harness. All run the same 100-row
+transaction and report the same checksum; only the per-row input formatting and
+binding differ:
 
 - `bench_update_only` (default): formatted `string` plus `SQLITE_TRANSIENT`.
 - `bench_update_only_borrowed_string`: formatted `string`, borrowed
-  `SQLITE_STATIC` bind.
+  `SQLITE_STATIC` bind (the A1 baseline).
 - `bench_update_only_borrowed`: fixed-length `array` inputs with the borrowed
   `SQLITE_STATIC` bind.
 - `bench_update_only_borrowed_general`: the same workload through the general
   scoped `executeBorrowed(openArray[SqlValue])` API.
+- `bench_insert_only` / `bench_insert_only_borrowed`: the 100-row insert
+  workload with `SQLITE_TRANSIENT` or the A1 borrowed bind.
 
 ```bash
 NISQL_COMPARE_NIM_SHA=HEAD \
@@ -432,6 +434,18 @@ NISQL_COMPARE_NIM_UPDATE_ENDPOINT=bench_update_only_borrowed ./runner/main 5
 ```
 
 The chosen endpoint is recorded as `nim_update_endpoint` in `manifest.json`.
+The Nim read phase can select `bench_read` (default) or the A1 borrowed
+`bench_read_borrowed` with `NISQL_COMPARE_NIM_READ_ENDPOINT`; it is recorded as
+`nim_read_endpoint`.
+
+The churn runner can measure the A1 borrowed bind with
+`NISQL_COMPARE_NIM_CHURN_BORROWED=1`; use `NISQL_COMPARE_CHURN_CYCLES` to run a
+shorter comparison:
+
+```bash
+NISQL_COMPARE_CHURN_CYCLES=10 NISQL_COMPARE_NIM_CHURN_BORROWED=1 \
+  nim c -d:release -r runner/churn.nim
+```
 
 To also record balance changes on an external network, set the network and the
 initial cycles per fresh canister explicitly. This creates, installs, and runs

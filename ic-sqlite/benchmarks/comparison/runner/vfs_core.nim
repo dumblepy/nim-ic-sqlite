@@ -8,7 +8,9 @@
 ##
 ## The workload manifest records SQL, transaction count, prepare/step/reset
 ## counts, and input lengths so the comparison is reproducible.
-import std/[json, os, osproc, strformat, strutils, times]
+import std/[json, os, options, osproc, strformat, strutils, times]
+import nicp_cdk/ic_types/candid_types
+import nicp_cdk/ic_types/ic_record except `%`, `%*`
 import ../shared/bench_spec
 import ./transport
 
@@ -51,7 +53,20 @@ proc main() =
   if rows == 0 or rows > 10_000'u32:
     raise newException(ValueError, "rows must be 1..10000")
 
-  discard commandOutput("cd " & quoteShell(NimBackendDir) & " && nicp productionBuild")
+  let useDirtySeq = getEnv("NISQL_ENABLE_DIRTY_SEQ", "0") == "1"
+  ## Profile-instrumented build; the dirty store variant is selected by env so
+  ## C0 and C1 can be measured as separate Wasm artifacts.
+  block:
+    let previousDir = getCurrentDir()
+    try:
+      setCurrentDir(NimBackendDir)
+      putEnv("NISQL_ENABLE_PROFILE", "1")
+      putEnv("NISQL_ENABLE_DIRTY_SEQ", if useDirtySeq: "1" else: "0")
+      discard commandOutput("nicp productionBuild")
+    finally:
+      setCurrentDir(previousDir)
+      delEnv("NISQL_ENABLE_PROFILE")
+      delEnv("NISQL_ENABLE_DIRTY_SEQ")
   let nimSha = commandOutput("git -C /application/ic-sqlite rev-parse HEAD")
   let dirtyTree = commandOutput("git -C /application/ic-sqlite status --porcelain")
   let nimWasmSha = sha256(NimWasm)
@@ -89,6 +104,7 @@ proc main() =
   manifest["source_sha256"] = %sourceSha
   manifest["db_source_sha256"] = %dbSourceSha
   manifest["source_dirty"] = %(dirtyTree.len > 0)
+  manifest["dirty_seq"] = %useDirtySeq
   manifest["rows"] = %rows
   manifest["sql"] = %VfsCoreSql
   manifest["read_sql"] = %VfsCoreReadSql
@@ -97,7 +113,7 @@ proc main() =
   manifest["step_count"] = %(rows * 2)  # upsert rows + read-back rows
   manifest["reset_count"] = %(rows * 2)  # upsert rows + read-back rows
   manifest["key_length"] = %9   # benchKeyBuffer = array[9, char]
-  manifest["value_length"] = %25  # benchValueBuffer = array[25, char]
+  manifest["value_length"] = %27  # updatedValueBuffer = array[27, char]
   manifest["toolchains"] = %*{
     "nim": commandOutput("nim --version").splitLines()[0],
     "icp_cli": commandOutput("icp --version"),
@@ -115,35 +131,35 @@ proc main() =
   var measurement = newJObject()
   measurement["run_id"] = %runId
   measurement["rows"] = %rows
-  measurement["instructions"] = response["instructions"]
-  measurement["checksum"] = response["checksum"]
-  measurement["db_size"] = response["db_size"]
-  measurement["sqlite_virtual_pages"] = response["stable_pages"]
-  measurement["sqlite_page_count"] = response["sqlite_page_count"]
-  measurement["sqlite_cache_used_bytes"] = response["sqlite_cache_used_bytes"]
-  measurement["clean_cache_pages"] = response["clean_cache_pages"]
-  measurement["dirty_pages_current"] = response["dirty_pages_current"]
-  measurement["dirty_pages_peak"] = response["dirty_pages_peak"]
-  measurement["dirty_pages_new"] = response["dirty_pages_new"]
-  measurement["dirty_pages_new_bytes"] = response["dirty_pages_new_bytes"]
-  measurement["clean_cache_hits"] = response["clean_cache_hits"]
-  measurement["clean_cache_misses"] = response["clean_cache_misses"]
-  measurement["clean_cache_evictions"] = response["clean_cache_evictions"]
-  measurement["clean_cache_bytes"] = response["clean_cache_bytes"]
-  measurement["temp_buffer_allocs"] = response["temp_buffer_allocs"]
-  measurement["temp_buffer_alloc_bytes"] = response["temp_buffer_alloc_bytes"]
-  measurement["vfs_read_calls"] = response["vfs_read_calls"]
-  measurement["vfs_write_calls"] = response["vfs_write_calls"]
-  measurement["vfs_short_reads"] = response["vfs_short_reads"]
-  measurement["vfs_truncate_calls"] = response["vfs_truncate_calls"]
-  measurement["stable_read_calls"] = response["stable_read_calls"]
-  measurement["stable_read_bytes"] = response["stable_read_bytes"]
-  measurement["stable_write_calls"] = response["stable_write_calls"]
-  measurement["stable_write_bytes"] = response["stable_write_bytes"]
-  measurement["stable_grow_calls"] = response["stable_grow_calls"]
-  measurement["stable_grow_pages"] = response["stable_grow_pages"]
-  measurement["raw_stable_pages"] = response["raw_stable_pages"]
-  measurement["raw_stable_bytes"] = response["raw_stable_bytes"]
+  for (jsonName, candidName) in [
+      ("instructions", "instructions"), ("checksum", "checksum"),
+      ("db_size", "db_size"), ("sqlite_virtual_pages", "sqlite_virtual_pages"),
+      ("sqlite_page_count", "sqlite_page_count"),
+      ("sqlite_cache_used_bytes", "sqlite_cache_used_bytes"),
+      ("clean_cache_pages", "clean_cache_pages"),
+      ("dirty_pages_current", "dirty_pages_current"),
+      ("dirty_pages_peak", "dirty_pages_peak"),
+      ("dirty_pages_new", "dirty_pages_new"),
+      ("dirty_pages_new_bytes", "dirty_pages_new_bytes"),
+      ("clean_cache_hits", "clean_cache_hits"),
+      ("clean_cache_misses", "clean_cache_misses"),
+      ("clean_cache_evictions", "clean_cache_evictions"),
+      ("clean_cache_bytes", "clean_cache_bytes"),
+      ("temp_buffer_allocs", "temp_buffer_allocs"),
+      ("temp_buffer_alloc_bytes", "temp_buffer_alloc_bytes"),
+      ("vfs_read_calls", "vfs_read_calls"),
+      ("vfs_write_calls", "vfs_write_calls"),
+      ("vfs_short_reads", "vfs_short_reads"),
+      ("vfs_truncate_calls", "vfs_truncate_calls"),
+      ("stable_read_calls", "stable_read_calls"),
+      ("stable_read_bytes", "stable_read_bytes"),
+      ("stable_write_calls", "stable_write_calls"),
+      ("stable_write_bytes", "stable_write_bytes"),
+      ("stable_grow_calls", "stable_grow_calls"),
+      ("stable_grow_pages", "stable_grow_pages"),
+      ("raw_stable_pages", "raw_stable_pages"),
+      ("raw_stable_bytes", "raw_stable_bytes")]:
+    measurement[jsonName] = %response[candidName].getNat64()
   if heapBytes.isSome:
     measurement["heap_bytes"] = %(heapBytes.get())
   else:
@@ -196,7 +212,7 @@ proc main() =
 - Step count: {rows * 2}
 - Reset count: {rows * 2}
 - Key length: 9 bytes
-- Value length: 25 bytes
+- Value length: 27 bytes
 """)
   echo resultDir
 

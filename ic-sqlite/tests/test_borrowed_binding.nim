@@ -341,6 +341,35 @@ suite "borrowed (SQLITE_STATIC) binding":
     check select.isOk
     db.close()
 
+  test "executeTextBorrowed executes and clears a one-parameter statement":
+    var db: Db
+    check db.initMemoryForTest().isOk
+    check db.exec("CREATE TABLE o (k TEXT PRIMARY KEY, v TEXT NOT NULL)").isOk
+    check db.execText("INSERT INTO o(k, v) VALUES (?, ?)", ["a", "1"]).isOk
+    check db.execText("INSERT INTO o(k, v) VALUES (?, ?)", ["b", "2"]).isOk
+    let result = db.withUpdate(proc(conn: var UpdateConnection): Result[bool, DbError] =
+      # A two-parameter statement must be rejected by the one-parameter helper.
+      let twoParam = conn.prepare("DELETE FROM o WHERE k = ? AND v = ?")
+      if not twoParam.isOk: return Result[bool, DbError](isOk: false, error: twoParam.error)
+      var twoStmt = twoParam.value
+      defer: twoStmt.finalize()
+      if twoStmt.executeTextBorrowed("x").isOk:
+        return Result[bool, DbError](isOk: false, error: DbError(message: "expected parameter mismatch"))
+      let prepared = conn.prepare("DELETE FROM o WHERE k = ?")
+      if not prepared.isOk: return Result[bool, DbError](isOk: false, error: prepared.error)
+      var stmt = prepared.value
+      defer: stmt.finalize()
+      let deleted = stmt.executeTextBorrowed("a")
+      if not deleted.isOk: return Result[bool, DbError](isOk: false, error: deleted.error)
+      if conn.changes() != 1:
+        return Result[bool, DbError](isOk: false, error: DbError(message: "delete did not affect one row"))
+      Result[bool, DbError](isOk: true, value: true)
+    )
+    check result.isOk
+    let remaining = db.queryOneText("SELECT COUNT(*) FROM o", [])
+    check remaining.isOk and remaining.value.isSome and remaining.value.get == "1"
+    db.close()
+
   test "empty blob binds as a zero-length blob, not NULL":
     var db: Db
     check db.initMemoryForTest().isOk

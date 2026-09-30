@@ -78,11 +78,24 @@
 ### 4. PR-3: dirty-page 保持方式と publish
 
 - [x] `removeZeroPage` / `pageIsZero` の空 fast path を追加（本 PR の安全な部分）。
-- [x] 上限 `maxDirtyPages` / `maxDirtyBytes` と zero extent の重なり結合・分割を壊さない。
-- [ ] dirty-page の小規模線形探索方式（C1）と publish sort 省略は、同一条件の unprofiled 実測が本環境で得られないため見送り（`10.3 採用ゲート`）。既定 C0（`Table`）と sort ありを維持。根拠は実行記録に記載。
-- [x] dirty 上限・zero extent・公開規則の既存テストが緑。
+- [x] C1（small linear `seq[DirtyPageEntry]`）を `-d:overlayDirtySeq` で切替可能に実装。`dirtyHas`/`dirtyPtr`/`dirtyInsert`/`dirtyDel`/`dirtyKeys`/`dirtyClear` の抽象に集約し、既定は C0（`Table`）のまま。上限 `maxDirtyPages` / `maxDirtyBytes`・zero extent の重なり結合/分割・publish の trap 保護を維持。
+- [x] `readInto` の dirty 参照を `dirtyPages[page]` の値取得から `dirtyPtr` に変更し、16 KiB の deep copy の可能性を除去（C0/C1 共通）。
+- [x] C1 は `test_overlay` / `test_vfs_semantics` / `test_zero_extent_persistence` / `test_failure_atomicity` / `test_db_api` / `test_query_stable` / `test_typed_write` / `test_storage_stats` で緑。
+- [x] canister config に `NISQL_ENABLE_DIRTY_SEQ` を追加。旧来コンパイル不能だった `runner/vfs_core.nim` を修正（ic_record/options import、profile+dirty-seq ビルド、dirty_seq を manifest 記録）。
+- [x] C0/C1 の命令数 A/B 計測（rows=1000/10000、同一条件・決定論的）。
+- [ ] canister profile の dirty peak カウンタが 0 を返す事象を切り分け（native では `dirtyNew=4, peak=2` で正常。canister 集計側の調査は別課題）。
+- [x] publish sort 省略は物理 write 順序を変えるため、トラップ時の部分公開保護を維持したまま既定 sort ありを維持（別途計測が必要ならフラグ化）。
 
 完了条件: 既定（C0）の意味論・上限・公開規則が不変で、C1/publish sort は実測に基づく採否判断が記録される。
+
+**C0/C1 判定（再計測）**: 旧計測は seed と同値 upsert の no-op ワークロードで dirty 0 だったため無効だった。`bench_vfs_core_profile` を `updatedValueBuffer`（seed と異なる値）に変更し、実 dirty ページ（1000 rows: 5 ページ、10000 rows: 30 ページ、`vfs_write_calls` も 5/30）で再計測した。
+
+| workload | C0 命令数 | C1 命令数 | 差 | dirty peak |
+|---|---:|---:|---:|---:|
+| upsert 1000 rows | 32,300,869 | 32,272,826 | −28,043 (−0.087%) | 5 |
+| upsert 10000 rows | 340,092,018 | 339,959,294 | −132,724 (−0.039%) | 30 |
+
+→ C1 は僅かに速いが 0.1% 未満で、`10.3 採用ゲート`（有意かつ再現性のある削減）を満たさないため **既定は C0 のまま**。C1 は `-d:overlayDirtySeq` の実験用として保持。`readInto` の `dirtyPtr` 化（deep copy 回避）と zero extent fast path は C0 でも有効なので採用。
 
 ### 5. PR-4: VirtualBackend 1-entry BucketCache
 
@@ -95,18 +108,23 @@
 
 ### 6. PR-5: update partial clean cache / readonly per-file cache
 
-- [ ] reset 前に cache hit/miss と stable read bytes を測れる計測点を用意する（`-d:benchmarkProfile` 分離）。既存の計測点は維持。
-- [ ] query-only handle の read-only page cache を検討し、update 直前の invalidation を保証する。
-- [x] 実測なしに既定有効化しない。clean cache は既存どおり既定 0（無効）。
-- [ ] partial-read cache variant は実測根拠が無いため見送り（`10.3 採用ゲート`）。理由を実行記録に記載。
+- [x] `overlay.readInto` の clean cache を、全ページ読取時のみから **部分読取時にも base page 全体を 1 回ロード**して再利用する方式へ拡張（`cleanCachePages > 0` の opt-in。base EOF 超はゼロ埋め）。
+- [x] 既定は `cleanCachePages = 0`（無効）のまま。dirty 化・truncate・discard での invalidation は既存どおり。
+- [x] native テスト追加: 部分読取の miss→hit（stable read 回数不変）、別ページの miss、dirty による evict、base EOF 超のゼロ埋め。
+- [ ] readonly per-file cache（query-only handle の 8 ページデータキャッシュ）は、SQLite pager cache が既に存在し、canister profile の overlay カウンタが 0 を返す計測不具合のため、効果検証ができず見送り（別課題）。
+- [x] 実測なしに既定有効化しない。
 
 完了条件: stable read bytes / instructions / heap のトレードオフが数値化され、既定設定を変えない。
 
+**PR-5 判定**: partial-read clean cache は実装・native 検証済みだが opt-in（既定無効）を維持。canister の clean-cache counters は機能しており（`clean-cache-ab-20260930T021646Z` で variant 2/4/8 が hits=1 / misses=4）、partial 読取でもキャッシュが使われることを示す。readonly per-file cache は見送り。
+
+**profile カウンタの異常（要調査）**: canister の `dirty_pages_new/peak` と `vfs_write_calls` が 0 のまま（`bench_vfs_core_profile` および `bench_clean_cache_write_profile`）。native 診断では `dirtyNew=4, peak=2` と正常で、`clean_cache_hits/misses`・`vfs_read_calls` は canister でも非 0。コミット済み変更があるのに write/dirty が 0 になるのは計測経路の不整合であり、PR-3/PR-5 の dirty 依存の判定は命令数（`ic0_performance_counter`）で代替している。原因究明は「阻害事項」に記載。
+
 ### 7. PR-6: file-handle lookup / update statement cache
 
-- [ ] `stateFor` の一回 lookup 化（`withValue` 等）と handle 数 1 の specialized branch を A/B する。→ 実測不能のため見送り。
-- [ ] update statement cache は multi-message 系列でのみ評価し、commit/rollback/schema 変更/error で無効化する条件を定義する。→ 実測不能のため見送り。
-- [x] 実測で差が出る根拠が無いため既定・公開 API は変更しない。
+- [x] `stateFor` の一回 lookup 化（`withValue`）を実装。`hasKey` + `[]` の二重ハッシュ参照を 1 回の `rawGet` に統合（VFS hot path）。
+- [ ] update statement cache は multi-message 系列でのみ評価する。→ 実測不能のため見送り。
+- [x] 実測で差が出る根拠が無いため既定・公開 API は変更しない（`stateFor` は意味論不変の内部最適化）。
 
 完了条件: 高頻度 multi-message で有意差がある場合のみ採用し、公開 API と不変条件を維持する。
 
@@ -119,9 +137,14 @@
 - [x] one-call ヘルパー `execTextRaw` / `execValues`（`Db` / `UpdateConnection`）を汎用借用へ移行。値は引数として呼び出し中有効なので安全。
 - [x] 空 `seq[byte]` は NULL ではなく長さ 0 の BLOB を bind するよう修正（`bind` / `executeBorrowed`）。SQLite は NULL ポインタで NULL を bind するため。
 - [x] テスト: N 引数・混在型・空 BLOB・制約違反・step=ROW 拒否・引数数不一致・空テキスト（`test_borrowed_binding.nim`）。
+- [x] `executeTextBorrowed`（1 TEXT、A1 と同契約）を追加し、テスト追加。
+- [x] canister に A1 借用の insert/churn endpoint を追加（`bench_insert_only_borrowed` / `bench_churn_reset_borrowed` / `bench_churn_delete_borrowed` / `bench_churn_insert_borrowed`、`insertRowsBorrowed`）。
+- [x] core runner に insert endpoint を追加、churn runner に `NISQL_COMPARE_NIM_CHURN_BORROWED`（Nim を借用版へ切替）と `NISQL_COMPARE_CHURN_CYCLES`（既定 100）を追加。
 - [x] 全 native 回帰 **29/29 PASS**。
 - [ ] query（step=ROW）系への借用適用は、行読み取り中の binding 寿命が別問題のため見送り（`queryOneText` は TRANSIENT 維持）。
-- [ ] insert / churn / large blob の命令数計測は未実施。更新系は `bench_update_only_borrowed_general` で汎用 API を計測する。
+- [x] 他ワークロード計測: update(A1) / insert(A0 vs A1) / churn(A0 vs A1, 10 cycles) を完走。large blob は `execValues` 経由で既に汎用借用を採用済み。すべて同一 Wasm `efb6b37c…` で、raw stable / heap / page count は A0/A1 で不変。
+- [x] query 系: `bench_read_borrowed`（`bindStaticText` + `reset`）を追加し、`NISQL_COMPARE_NIM_READ_ENDPOINT` で A/B 可能にした。`queryOneText` はローカルコピー `queryValues` を STATIC bind（finalize で解除）へ変更。
+- [x] query A0/A1 計測: 同一 Wasm `c4e204bd…` で point read 2,088,872 → 2,015,945（−3.49%）、退行なし。成果物 validated。
 
 完了条件: 汎用 API が専用 A2 と同等の削減を保ち、公開 API の安全性を変えず、全 native 回帰が緑。
 
@@ -165,6 +188,44 @@ Nim の update 命令数は 5/5 完全に同一値（決定論的）。
 - 使い分け方針: N 引数・混在型のスコープ付き書き込みは `executeBorrowed`、ホットな同型 TEXT ループは `executeTextTextBorrowed`（将来は array 入力の一般化を検討）。
 - `heap_bytes` は汎用 3,402,974 と A0/A2 より約 +6 KB（行ごとの一時 `SqlValue`/`string`）。raw stable・page count は不変。
 
+### 追補: A1 をベースにした他ワークロード計測（Wasm `efb6b37c55b921b1…`）
+
+すべて同一 Wasm、fresh canister ペア。命令数は決定論的（5/5 同値）。A1 = 文字列入力の `SQLITE_STATIC` 借用バインド。
+
+| workload | A0（TRANSIENT） | A1（借用） | 削減 | 備考 |
+|---|---:|---:|---:|---|
+| update 100 rows | 1,927,772 | 1,675,310 | −13.10% | 既存値と一致 |
+| insert 100 rows | 1,387,661 | 1,183,392 | **−14.72%** | `bench_insert_only` vs `_borrowed` |
+| churn delete 1000 rows | 18,527,240 | 17,230,399 | −7.00% | 10 cycles の中央値 |
+| churn insert 1000 rows | 22,586,651 | 20,411,594 | −9.63% | 10 cycles の中央値 |
+
+- insert / churn とも `heap_bytes`・`raw_stable_bytes`・`sqlite_page_count` は A0/A1 で完全に不変（churn: heap 3,746,283 / raw 67,567,616 / pc 18）。
+- churn は Rust 比較用の runner（`NISQL_COMPARE_NIM_CHURN_BORROWED` / `NISQL_COMPARE_CHURN_CYCLES`）で計測。A1 は delete/insert 双方で退行なし。
+- large blob は `bench_large_blob` が `execValues` 経由で既に汎用借用（A2-general）を採用しており、追加の A/B は不要と判断。
+
+### 追補: query 借用の計測（Wasm `c4e204bdf7169a7b…`）
+
+`NISQL_COMPARE_NIM_READ_ENDPOINT` で point read の A0/A1 を比較（update は既定、5 trials、決定論的）。
+
+| workload | A0 `bench_read` | A1 `bench_read_borrowed` | 削減 |
+|---|---:|---:|---:|
+| point read 100 rows | 2,088,872 | 2,015,945 | **−3.49%** |
+
+- Rust read 中央値は 858,068（接続 warmup 経路が異なるため記述的のみ）。
+- read は I/O 支配のため binding の寄与は小さく、削減は −3.49%。退行はなし。`queryOneText` もローカルコピーを STATIC bind する 1 コピー経路へ変更した。
+
+### 追補: `stateFor` 単一 lookup（PR-6）
+
+`stateFor` を `hasKey` + `[]` から `withValue` 1 回 lookup に変更（意味論不変）。同一条件で前後比較（Wasm 前 `c4e204bd…` / 後 `80b2f4bb…`、5 trials、決定論的）。
+
+| workload | 前 | 後 | 差 |
+|---|---:|---:|---:|
+| point read 100 rows | 2,088,872 | 2,086,766 | −2,106 (−0.10%) |
+| update 100 rows | 1,926,972 | 1,926,766 | −206 (−0.01%) |
+
+- 効果はごく僅か（VFS の全操作で 1 ハッシュ参照削減）で、有意な最適化とは主張しない。退行はなく、コードも単純化されるため構造的整理として保持する。
+- insert 100 rows = 1,387,455（`80b2f4bb…`）。
+
 ## 実行記録
 
 | 日時 (UTC) | 範囲 | コマンド／証跡 | 結果 |
@@ -180,15 +241,27 @@ Nim の update 命令数は 5/5 完全に同一値（決定論的）。
 | 2026-09-29 | A2 のスコープ一般化 | `db.nim`（`bindStaticValue` / `executeBorrowed` / `execTextRaw` / `execValues`） | 汎用借用 API を追加し、one-call ヘルパーへ採用。空 BLOB の NULL バインドを長さ0 BLOB に修正。 |
 | 2026-09-29 | 一般化の native 回帰 | `testament --print --megatest:off p 'tests/test_*.nim'` | **29/29 PASS**（`test_borrowed_binding` に N引数/混在型/空BLOB/制約/ROW拒否/引数不一致を追加）。 |
 | 2026-09-29 | 汎用 API の計測 | `bench_update_only_borrowed_general` + `runner/main 5`（A0/A2/general, 再ビルド Wasm `1a07c0e8…`） | A0 `20260929T174152Z`=1,927,772、A2 `20260929T174357Z`=1,446,843（旧 Wasm と同値）、general `20260929T174603Z`=**1,808,512**（A0 比 −6.19%、Rust 比 1.2183）。汎用 API は安全だが専用 A1/A2 には届かない。 |
+| 2026-09-29 | A1 をベースにした insert/churn 計測 | `bench_insert_only(_borrowed)`、`runner/churn`（`NISQL_COMPARE_NIM_CHURN_BORROWED`, `NISQL_COMPARE_CHURN_CYCLES=10`） | Wasm `efb6b37c…`。A1 update=1,675,310（再現）。insert: A0 1,387,661 → A1 **1,183,392**（−14.72%）。churn delete 18,527,240 → 17,230,399（−7.00%）、insert 22,586,651 → 20,411,594（−9.63%）。heap/raw/page は A0/A1 で不変。 |
+| 2026-09-29 | churn validator の可変サイクル対応 | `runner/validate.nim`（`validateChurnResults` が実測の `maxCycle` に追従、`runKind` は `churn_5000x` prefix 判定） | 10 cycles の churn 成果物 2 件を含む全 5 成果物が `validated`。 |
+| 2026-09-29 | query 借用の実装・計測 | `bench_read_borrowed`、`NISQL_COMPARE_NIM_READ_ENDPOINT`、`queryOneText` の STATIC bind | 同一 Wasm `c4e204bd…` で point read 2,088,872 → **2,015,945**（−3.49%）。両成果物 validated、native 29/29。 |
+| 2026-09-30 | `stateFor` 単一 lookup（PR-6） | `vfs.nim`（`withValue`）、`runner/main 5` | Wasm `80b2f4bb…`。read 2,088,872 → 2,086,766（−0.10%）、update 1,926,972 → 1,926,766（−0.01%）。効果は僅少・退行なし。insert=1,387,455。両成果物 validated。 |
+| 2026-09-30 | PR-3 C1 dirty store 実装 | `overlay.nim`（`DirtyStore` 抽象 + `-d:overlayDirtySeq`）、canister config、`runner/vfs_core.nim` 修正 | C1 は overlay/VFS/transaction 系テストで緑。`readInto` の `dirtyPtr` 化も実装。 |
+| 2026-09-30 | PR-3 C0/C1 計測 | `NISQL_ENABLE_DIRTY_SEQ=0/1 ./runner/vfs_core 1000/10000`（profile Wasm） | upsert 1000: C0 30,500,070 vs C1 30,490,136（−0.033%）。upsert 10000: 323,335,710 vs 323,322,097（−0.004%）。有意差なし → **既定 C0 維持**。dirty peak カウンタは canister で 0（native では正常、別課題）。 |
+| 2026-09-30 | PR-3 後の全回帰 | `testament ... p 'tests/test_*.nim'` | **29/29 PASS**。 |
+| 2026-09-30 | PR-5 partial-read clean cache | `overlay.nim`（部分読取で base page をキャッシュ）、`test_overlay.nim` | 部分読取の miss→hit・evict・EOF ゼロ埋めを追加。C0 29/29、C1 overlay も PASS。既定 `cleanCachePages=0` 維持。 |
+| 2026-09-30 | profile カウンタ切り分け | `runner/clean_cache_ab.nim`（強制クリーン）、native 診断 | 原因判明: ワークロードが seed と同値 upsert の no-op で dirty 0。カウンタは正常（native dirtyNew=4、canister clean-cache hits>0）。 |
+| 2026-09-30 | 既定 canister ビルド | `rm nimcache && nicp productionBuild`（backend） | 成功、Wasm `919ffd9cd145…`。 |
+| 2026-09-30 | PR-3 C0/C1 再計測 | `bench_vfs_core_profile` を `updatedValueBuffer` 化、`NISQL_ENABLE_DIRTY_SEQ=0/1 ./runner/vfs_core 1000/10000` | 実 dirty 5/30 ページ。1000 rows: C0 32,300,869 vs C1 32,272,826（−0.087%）。10000 rows: 340,092,018 vs 339,959,294（−0.039%）。有意差なし → 既定 C0 維持。 |
 
 ## 現在の未確定事項
 
-- insert / churn / large blob の命令数計測は未実施。`executeBorrowed` は update のみ計測済みで、他ワークロードで退行がないことの確認が残る（§10.3 採用ゲート）。
-- 汎用 `executeBorrowed` は安全だが専用 A2 より削減が小さい（−6.2% vs −25.0%）。N 引数・混在型は汎用、ホットな同型 TEXT ループは専用 `executeTextTextBorrowed` を使う方針を採用する。
-- query（step=ROW）系への借用適用は行読み取り中の binding 寿命が別問題のため未対応（`queryOneText` は TRANSIENT 維持）。
-- PR-3 の small `seq` / hybrid dirty store、PR-5 の partial clean cache、PR-6 の file-handle lookup 単一化と update statement cache は、`10.3 採用ゲート` を満たす実測が未取得のため、既定・公開 API を変えず見送った。
+- PR-6 の update statement cache は、commit/rollback・schema 変更・SQLite error での無効化、lease 終了後の statement エスケープ防止、capacity 制限を満たす設計が必要で、multi-message 系列の実測基盤も未整備なため見送り。既定・公開 API は変更しない。
+- PR-5 の readonly per-file cache は SQLite pager cache が既にあるため見送り。
+- canister の overlay 書き込み系プロファイルカウンタ（dirty/write）が 0 を返す（「阻害事項」参照）。native では正常。
+- 汎用 `executeBorrowed` は安全だが専用 A1/A2 より削減が小さい（update −6.2% vs A1 −13.1% / A2 −25.0%）。N 引数・混在型は汎用、ホットな同型 TEXT ループは専用 `executeTextTextBorrowed` / `executeTextBorrowed`（A1）を使う方針。
+- PR-3 の C1（small seq dirty store）は命令数で有意差なしのため既定 C0 を維持。
 - cycle cost は両実装とも取得不可のまま（設計 10.2 のとおり「未取得」と明示）。
 
 ## 阻害事項
 
-- なし。native 回帰・benchmark canister ビルド・A0/A1/A2 の 5 trials 比較はいずれも本環境で完走した。
+- なし（旧記載の「canister カウンタ 0」は原因判明・解消）。原因: `bench_vfs_core_profile` が seed と同じ `benchValue` を upsert していたため SQLite がページを書かず（差分なし）、`dirty_pages_new/peak`・`vfs_write_calls` が 0 になっていた。`bench_clean_cache_write_profile` も rep1 のみ実書き込みで median が 0。カウンタ計測自体は native（`dirtyNew=4, peak=2`）・canister（clean-cache hits 等）とも正常。`bench_vfs_core_profile` を `updatedValueBuffer`（seed と異なる値）へ変更し、実書き込みする dirty ワークロードにした。

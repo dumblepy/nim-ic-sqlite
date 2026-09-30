@@ -32,6 +32,11 @@ if getEnv("NISQL_ENABLE_FAILPOINT") == "1":
 if getEnv("NISQL_ENABLE_PROFILE") == "1":
   switch("define", "benchmarkProfile")
 
+# Experimental dirty-page store variant (PR-3): C1 small linear-scanned seq
+# instead of the default C0 hash table. Never enabled in the committed build.
+if getEnv("NISQL_ENABLE_DIRTY_SEQ") == "1":
+  switch("define", "overlayDirtySeq")
+
 # Enforce static linking for the WASI target to make it self-contained.
 switch("passC", "-target wasm32-wasip1")
 switch("passL", "-target wasm32-wasip1")
