@@ -57,8 +57,10 @@ import ic_sqlite
 ## Database initialization and migrations
 
 On an IC canister, initialize the database in both the init and post-upgrade
-hooks. Migrations are trusted, static SQL statements. They are recorded in the
-database and each version is applied at most once.
+hooks. The open **intent** is explicit: `init` creates, `post_upgrade` only
+reopens an image that already exists. Migrations are trusted, static SQL
+statements. They are recorded in the database and each version is applied at
+most once.
 
 ```nim
 import ic_sqlite
@@ -74,32 +76,46 @@ const migrations = [
     sql: "CREATE INDEX users_active_idx ON users(active)")
 ]
 
-proc initializeDatabase() =
+proc initializeDatabase(intent: DbOpenIntent) =
   database.close()
-  let initialized = database.initDatabase(newIcStableBackend(), migrations)
+  ## `initDatabaseExclusive` gives SQLite the whole raw region. Use
+  ## `initDatabaseManaged(manager, id, ...)` to place it in one MemoryId.
+  let initialized = database.initDatabaseExclusive(
+    newIcStableBackend(), migrations, intent)
   if not initialized.isOk:
     let message = "database initialization failed: " & initialized.error.message
     ic0_trap(cast[int](message.cstring), message.len)
 
 proc canister_init() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiCreateOnly)
 
 proc canister_post_upgrade() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiOpenExisting)
 ```
+
+The intent is validated before SQLite writes anything:
+
+- `doiCreateOnly` fails if the selected storage already holds a SQLite image.
+- `doiOpenExisting` fails without writing if the storage is empty. Always use
+  it in `post_upgrade`, so a wrong or empty `MemoryId` can never silently
+  create a new database.
+- `doiOpenOrCreate` is the compatibility behaviour of the older
+  `initDatabase(db, backend, ...)` overload.
 
 `newIcStableBackend()` is available only in a wasm32 IC canister. For native
 unit tests, use `db.initMemoryForTest()` instead.
 
 ## Sharing stable memory with a MemoryManager
 
-By default `initDatabase(newIcStableBackend(), ...)` uses **exclusive stable
+`initDatabaseExclusive(newIcStableBackend(), ...)` uses **exclusive stable
 memory**: SQLite owns the whole raw region (superblock at offset 0, DB image
 from 64 KiB). In that mode you must not place `IcStableSeq`, `IcStableTable`,
 or `IcStableHashMap` in the same raw stable memory.
 
 To store SQLite inside one virtual `MemoryId` alongside other stable
-structures, use the MemoryManager-compatible API. Its on-stable layout is
+structures, own a single `MemoryManager` and select one fixed `MemoryId` for
+SQLite. The manager must be the only allocator of the raw region, and the
+`MemoryId` must stay identical across upgrades. The on-stable layout is
 byte-compatible with `ic-stable-structures` 0.7 (`MGR`) and the Rust
 `ic-sqlite-vfs` memory manager.
 
@@ -112,25 +128,27 @@ import nicp_cdk/ic0/ic0
 var manager: MemoryManager
 var database: Db
 
-const dbMemory = 8'u8  # ids 0..7 are used by the wasi2ic polyfill
+const SqliteMemoryId = 8'u8  # choose once; never change across upgrades
 
-proc initializeDatabase() =
+proc initializeDatabase(isUpgrade: bool) =
   database.close()
   let raw = newIcStableBackend()
-  # Boot through wasi2ic: place the SQLite-owned manager after the polyfill's
-  # fixed MGR prefix. Without wasi2ic this is just `raw`.
-  manager = initMemoryManager(stableBackendAfterForeignManager(raw))
-  let initialized =
-    database.initDatabase(manager.getMemory(newMemoryId(dbMemory)), migrations)
+  # Create only a fresh region; reopen only an existing MGR on upgrade.
+  manager =
+    if isUpgrade: openExistingMemoryManagerStrict(raw)
+    else: createMemoryManagerStrict(raw)
+  let storage = managedDbStorage(manager, newMemoryId(SqliteMemoryId))
+  let intent = if isUpgrade: doiOpenExisting else: doiCreateOnly
+  let initialized = database.initDatabase(storage, migrations, intent)
   if not initialized.isOk:
     let message = "database initialization failed: " & initialized.error.message
     ic0_trap(cast[int](message.cstring), message.len)
 
 proc canister_init() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(false)
 
 proc canister_post_upgrade() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(true)
 ```
 
 `getMemory(id)` returns a `VirtualStableBackend` that inherits from
@@ -156,24 +174,40 @@ Buckets are assigned to exactly one owner in the allocation table, so physical
 ranges never overlap. Buckets allocated to one memory may be interleaved with
 another memory's buckets.
 
-- `initMemoryManager(backend)`: creates a fresh / all-zero region, validates and
-  loads an existing `MGR` region, and rejects any other non-empty region without
-  overwriting it (`ValueError`).
-- `newMemoryId(id)`: the virtual memory id to use (`255` is reserved).
-- `manager.getMemory(id)`: returns a `VirtualStableBackend` usable as a
-  `StableBackend`.
-- `stableBackendAfterForeignManager(raw)`: detects a wasi2ic/`MGR` prefix and
-  offsets the SQLite-owned manager past its fixed reservation
-  (`Wasi2icReservedStablePages = 1025` pages) so the two do not share an
-  allocation table.
+- `createMemoryManagerStrict(raw)`: creates a new `MGR` header and allocation
+  table. It requires a completely empty region and never overwrites non-empty
+  bytes (`ValueError`). Use it on install.
+- `openExistingMemoryManagerStrict(raw)`: validates and loads an existing `MGR`.
+  Size 0, an all-zero region, an unknown magic, and any inconsistent layout are
+  rejected without writing (`ValueError`). Use it in `post_upgrade`.
+- `initMemoryManager(raw)`: compatibility create-or-open that also tolerates an
+  all-zero region. Prefer the strict pair above for new code.
+- `newMemoryId(id)`: the virtual memory id to use (`255` is reserved). The
+  library never reserves an id for SQLite; `120` is only a common convention
+  for new databases. Keep the id that a deployed canister already uses.
+- `managedDbStorage(manager, id)`: selects `manager.getMemory(id)` as the SQLite
+  target. `Db.init` never inspects the raw bytes to move the backend.
 - Limits: up to 255 memory ids (`255` is reserved), up to 32768 buckets, and
   `grow` is a page-granular operation. `MemoryId`/bucket bounds are validated
   on load, and every access is bounds-checked.
 
-> Note: the `1025`-page reservation assumes the wasi2ic polyfill keeps eight
-> 128-page buckets. If it grows past that, it could overlap the SQLite-owned
-> manager. The safest layout is to create a single `MemoryManager` and place
-> every stable structure, including SQLite, in `MemoryId`s under it.
+### Reopening a legacy wasi2ic layout
+
+A canister that boots through the WASI polyfill and let a previous release
+place SQLite after the polyfill's fixed `MGR` prefix must opt in explicitly:
+
+```nim
+let storage = legacyWasi2icDbStorage(newIcStableBackend())
+discard database.initDatabase(storage, migrations, doiOpenExisting)
+```
+
+`legacyWasi2icOffsetBackend(raw)` / `legacyWasi2icDbStorage(raw)` reuse the old
+fixed `1025`-page reservation (`Wasi2icReservedStablePages`). This is **not a
+guaranteed partition**: the polyfill could grow past eight 128-page buckets and
+overlap SQLite. Do not use it for new canisters; create a single
+`MemoryManager` and place every stable structure, including SQLite, under it.
+The checked-in `examples/kv_crud/` and `examples/minimal_kv/` canisters use this explicit
+legacy path because they boot through the polyfill.
 
 ## Safe SQL execution
 
@@ -317,12 +351,13 @@ explicit `SqlCodec[T]` with `encode` and `decode` procedures, then use
 
 ## Complete canister example
 
-[`example/`](./example/) is a deployable Nim canister. It runs migrations,
-implements `put`, `get`, `update`, and `deleteValue`, and preserves its SQLite
-image across upgrades.
+[`examples/kv_crud/`](./examples/kv_crud/) is a deployable Nim canister. It runs
+migrations, implements `put`, `get`, `update`, and `deleteValue`, and preserves
+its SQLite image across upgrades. [`examples/minimal_kv/`](./examples/minimal_kv/)
+is a smaller single-migration example.
 
 ```sh
-cd example
+cd examples/kv_crud
 icp network start -d
 icp deploy -y
 icp canister call backend migrationCount '()' --query
@@ -347,6 +382,28 @@ projects without a fixed gateway-port conflict.
   are preserved. A canister upgrade only recreates heap state; the SQLite image
   and metadata are restored from stable memory.
 
+### Breaking change: no implicit wasi2ic offset
+
+Before this release `Db.init(backend)` inspected the raw bytes and, when it saw
+an `MGR` magic at offset 0, silently opened SQLite at the fixed 1025-page base
+used by the WASI polyfill. That implicit behaviour is removed. `Db.init` now
+uses the backend's logical offset 0 as the SQLite superblock, so a raw `MGR`
+handed to `Db.init` fails as a foreign image instead of being relocated.
+
+If a deployed canister relied on the old auto-detection, keep the same physical
+base and `MemoryId` and opt in explicitly:
+
+```nim
+# Explicit legacy adapter: same physical layout as before.
+let storage = legacyWasi2icDbStorage(newIcStableBackend())
+discard database.initDatabase(storage, migrations, doiOpenExisting)
+```
+
+`stableBackendAfterForeignManager(raw)` remains as a deprecated alias of
+`legacyWasi2icOffsetBackend(raw)`. No existing SQLite superblock, `MGR` header,
+or `MemoryId` is moved: the physical layout is unchanged, and managed migration
+to a single-allocator layout is a separate data-move operation.
+
 ## Testing
 
 Run the full suite from `ic-sqlite/` (after checking out the `nicp_cdk` submodule):
@@ -363,8 +420,10 @@ upgrade.
 
 Native tests use `VecStableBackend` to verify overlay, superblock, VFS, and
 MemoryManager logic without a local replica. The `MGR` layout, non-overlapping
-`MemoryId` ranges, loading an existing `MGR` image, and SQLite coexistence are
-covered by `tests/test_memory_manager.nim`.
+`MemoryId` ranges, strict create/open, loading an existing `MGR` image, and
+SQLite coexistence are covered by `tests/test_memory_manager.nim`. Storage mode
+and open-intent behaviour (create-only / open-existing, wrong `MemoryId`,
+explicit legacy offset) are covered by `tests/test_storage_mode.nim`.
 
 To build only the SQLite archive:
 

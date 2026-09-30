@@ -1,8 +1,8 @@
 # Package
 
 version       = "0.1.0"
-author        = "Anonymous"
-description   = "A new awesome nimble package"
+author        = "ic-sqlite contributors"
+description   = "ic-sqlite CRUD example canister with migrations and upgrade persistence"
 license       = "MIT"
 srcDir        = "backend/src"
 bin           = @["main"]

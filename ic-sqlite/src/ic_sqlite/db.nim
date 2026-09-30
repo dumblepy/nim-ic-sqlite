@@ -33,7 +33,13 @@ type
     cacheUsedBytes*: uint64
   DbErrorKind* = enum
     dekSqlite, dekInvalidQuery, dekBind, dekColumnMissing, dekTypeMismatch,
-    dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState
+    dekNullViolation, dekOverflow, dekResourceLimit, dekInvalidState,
+    ## The selected storage contradicts the requested open intent, e.g. a
+    ## `doiCreateOnly` open of a slot that already holds a SQLite image.
+    dekStorageMode,
+    ## A `doiOpenExisting` open found no SQLite image.  This is the wrong /
+    ## empty `MemoryId` case detected during `post_upgrade`.
+    dekMissingDatabase
   DbError* = object
     code*: cint
     message*: string
@@ -42,6 +48,28 @@ type
     expectedType*: string
     actualType*: string
     rowIndex*: int
+  DbOpenIntent* = enum
+    ## Fail if the selected region already holds a SQLite image.
+    doiCreateOnly
+    ## Fail if the selected region does not hold a SQLite image. Recommended
+    ## for `post_upgrade`, so a wrong or empty `MemoryId` never becomes a new DB.
+    doiOpenExisting
+    ## Explicit compatibility behaviour: open an existing image, otherwise
+    ## create a fresh one.  Existing low-level `Db.init(backend)` callers use it.
+    doiOpenOrCreate
+  DbStorageMode* = enum
+    ## `manager.getMemory(id)`: SQLite lives inside one virtual `MemoryId`.
+    dsmManaged
+    ## SQLite owns the whole raw region (superblock at physical offset 0).
+    dsmExclusive
+    ## Explicit legacy view after a wasi2ic `MGR` fixed prefix.
+    dsmLegacyFixedOffset
+  DbStorage* = object
+    ## Resolved storage target plus the mode it was selected with.  The fields
+    ## stay private: callers select a mode through the constructors and cannot
+    ## re-interpret raw bytes.
+    backend: StableBackend
+    mode: DbStorageMode
   DbConfig* = object
     maxDirtyPages*: uint64
     maxDirtyBytes*: uint64
@@ -118,6 +146,31 @@ proc configIsValid(config: DbConfig): bool =
     config.maxResultRows > 0 and config.maxResultBytes > 0 and
     config.maxQueryParams > 0 and
     (not config.statementCacheEnabled or config.maxCachedStatements > 0)
+
+proc managedDbStorage*(manager: MemoryManager; id: MemoryId): DbStorage =
+  ## Selects one virtual `MemoryId` of an application-owned `MemoryManager` as
+  ## SQLite storage.  This only calls `manager.getMemory(id)`; it never inspects
+  ## or re-interprets the raw bytes at the manager base.
+  if manager.isNil:
+    raise newException(ValueError, "nil memory manager")
+  DbStorage(mode: dsmManaged, backend: manager.getMemory(id))
+
+proc exclusiveDbStorage*(raw: StableBackend): DbStorage =
+  ## SQLite owns the whole raw region.  The caller must guarantee no other
+  ## allocator (wasi2ic, IcStableSeq, ...) uses the same raw stable memory.
+  if raw.isNil:
+    raise newException(ValueError, "nil stable backend")
+  DbStorage(mode: dsmExclusive, backend: raw)
+
+proc legacyWasi2icDbStorage*(raw: StableBackend): DbStorage =
+  ## **Explicit legacy opt-in.**  Reopens a SQLite image that a previous release
+  ## placed after the wasi2ic `MGR` fixed prefix (1025 pages).  Not for new
+  ## configurations; prefer `managedDbStorage` with a single owner allocator.
+  if raw.isNil:
+    raise newException(ValueError, "nil stable backend")
+  DbStorage(mode: dsmLegacyFixedOffset, backend: legacyWasi2icOffsetBackend(raw))
+
+proc storageMode*(storage: DbStorage): DbStorageMode {.inline.} = storage.mode
 
 proc queryLimits*(db: Db): tuple[maxRows, maxBytes, maxParams: uint64] =
   (db.config.maxResultRows, db.config.maxResultBytes, db.config.maxQueryParams)
@@ -199,14 +252,6 @@ proc resetCachedUpdateStatements(db: var Db) =
       discard sqlite3_reset(raw)
       discard sqlite3_clear_bindings(raw)
 
-proc sqliteStableBackend(backend: StableBackend): StableBackend =
-  ## When the process boots through wasi2ic, the WASI polyfill owns a fixed
-  ## `MGR` prefix.  Preserve that region and give SQLite a logical page-aligned
-  ## view after it.  Applications that instead drive a SQLite-owned
-  ## `MemoryManager` should pass `manager.getMemory(id)` here, whose offset 0
-  ## is not `MGR` and is therefore used verbatim.
-  stableBackendAfterForeignManager(backend)
-
 proc sqliteError(raw: ptr Sqlite3; code: cint): DbError =
   DbError(code: code, message: if raw.isNil: "SQLite open failed" else: $sqlite3_errmsg(raw))
 
@@ -233,19 +278,41 @@ proc persistMetadata(db: Db): Result[bool, DbError] =
     Result[bool, DbError](isOk: false, error: DbError(code: -1, message: error.msg))
 
 proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
-           config = defaultDbConfig()): Result[bool, DbError] =
+           config = defaultDbConfig();
+           intent = doiOpenOrCreate): Result[bool, DbError] =
   ## Opens /main.db through the `icstable` VFS. The caller selects an
   ## IcStableBackend in canisters or VecStableBackend in native tests.
+  ##
+  ## The backend's logical offset 0 is the SQLite superblock: this proc never
+  ## inspects an `MGR` magic to move the backend. A previous release applied an
+  ## implicit 1025-page offset here; use `legacyWasi2icDbStorage` explicitly if
+  ## that legacy physical layout must be reopened.
   if backend.isNil: return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "nil stable backend"))
   if not config.configIsValid:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "invalid database resource limits"))
   when not defined(wasm32):
     if ic_sqlite_register_vfs() != sqlite_api.SqliteOk:
       return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "unable to register icstable VFS"))
-  let sqliteBackend = sqliteStableBackend(backend)
+  let sqliteBackend = backend
   let existing = readExistingSuperblock(sqliteBackend)
   if not existing.isOk:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: existing.error))
+  ## Resolve the open intent before any metadata, schema or DB page write. A
+  ## rejected open must leave the target region byte-for-byte unchanged.
+  let hasExistingImage = existing.value.isSome
+  case intent
+  of doiCreateOnly:
+    if hasExistingImage:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, kind: dekStorageMode,
+          message: "stable storage already contains a SQLite image"))
+  of doiOpenExisting:
+    if not hasExistingImage:
+      return Result[bool, DbError](isOk: false,
+        error: DbError(code: -1, kind: dekMissingDatabase,
+          message: "no SQLite image to open in the selected storage"))
+  of doiOpenOrCreate:
+    discard
   let restoredSize = if existing.value.isSome: existing.value.get.dbSize else: 0'u64
   let restoredTxId = if existing.value.isSome: existing.value.get.lastTxId else: 0'u64
   let restoredPageSize = if existing.value.isSome: existing.value.get.sqlitePageSize else: 16384'u32
@@ -284,6 +351,14 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
     db.raw = nil
     return Result[bool, DbError](isOk: false, error: metadata.error)
   Result[bool, DbError](isOk: true, value: true)
+
+proc init*(db: var Db; storage: DbStorage; dbSize = 0'u64;
+           config = defaultDbConfig();
+           intent = doiOpenOrCreate): Result[bool, DbError] =
+  ## Storage-mode entry point. The constructor has already resolved the
+  ## backend (managed `MemoryId`, exclusive raw region, or explicit legacy
+  ## offset), so the DB layer never guesses a layout from raw bytes.
+  db.init(storage.backend, dbSize = dbSize, config = config, intent = intent)
 
 when not defined(wasm32):
   proc initMemoryForTest*(db: var Db; config = defaultDbConfig()): Result[bool, DbError] =
