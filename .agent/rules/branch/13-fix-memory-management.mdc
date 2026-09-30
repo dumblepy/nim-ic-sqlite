@@ -240,7 +240,7 @@ proc canister_post_upgrade() {.exportwasm.} = openDatabase(true)
 ### PR-4: サンプル・ドキュメント・統合試験
 
 - `README.md` の推奨例を Managed と Exclusive に分離。`120` は新規例、既存 ID は変更禁止と明記。
-- `ic-sqlite/examples/minimal_kv/`、`ic-sqlite/example/`、ベンチマーク canister を対象別に見直す。**wasi2ic の有無を確認せずに raw manager 初期化へ一括置換しない**。
+- `ic-sqlite/examples/minimal_kv/`、`ic-sqlite/examples/kv_crud/`、ベンチマーク canister を対象別に見直す。**wasi2ic の有無を確認せずに raw manager 初期化へ一括置換しない**。
 - 単体テスト、native roundtrip、IC canister init→update→upgrade→query、旧形式再開の統合テストを追加。
 
 ## 9. 受け入れテスト・合格条件
@@ -318,7 +318,7 @@ layout、SQL API、publish 仕様は変更していない。
 | `src/ic_sqlite/stable/memory_manager.nim` | `createMemoryManagerStrict` / `openExistingMemoryManagerStrict` を追加。`initMemoryManager` は compat として維持し、`initMemoryManagerCompat` を deprecated 名で追加。`stableBackendAfterForeignManager` を `legacyWasi2icOffsetBackend` へ改名し、旧名は deprecated alias。 |
 | `src/ic_sqlite/db.nim` | `DbOpenIntent` / `DbStorageMode` / `DbStorage` と `managedDbStorage` / `exclusiveDbStorage` / `legacyWasi2icDbStorage` を追加。`DbErrorKind` に `dekStorageMode` / `dekMissingDatabase` を追加。`Db.init` に `intent` を追加し、superblock 判定直後・実書込前に intent を検証。暗黙 offset（旧 `sqliteStableBackend`）を削除し backend の logical offset 0 をそのまま使用。 |
 | `src/ic_sqlite/lifecycle.nim` | `initDatabase(storage, migrations, intent, config)`、`initDatabaseManaged`、`initDatabaseExclusive` を追加。`reopenDatabaseAfterUpgrade` は `doiOpenExisting`。旧 `initDatabase(db, backend, ...)` は `doiOpenOrCreate` の compat。 |
-| `example/` / `examples/minimal_kv/` | `canister_init` は `doiCreateOnly`、`canister_post_upgrade` は `doiOpenExisting`。wasi2ic 前提のため `legacyWasi2icDbStorage` を明示使用。 |
+| `examples/kv_crud/` / `examples/minimal_kv/` | `canister_init` は `doiCreateOnly`、`canister_post_upgrade` は `doiOpenExisting`。wasi2ic 前提のため `legacyWasi2icDbStorage` を明示使用。 |
 | `benchmarks/comparison/nim_canister` | 従来と同じ暗黙 1025 ページ挙動を `legacyWasi2icOffsetBackend` の明示適用で維持。 |
 
 ### 12.2 リリースノート（breaking change）

@@ -206,7 +206,7 @@ fixed `1025`-page reservation (`Wasi2icReservedStablePages`). This is **not a
 guaranteed partition**: the polyfill could grow past eight 128-page buckets and
 overlap SQLite. Do not use it for new canisters; create a single
 `MemoryManager` and place every stable structure, including SQLite, under it.
-The checked-in `example/` and `examples/minimal_kv/` canisters use this explicit
+The checked-in `examples/kv_crud/` and `examples/minimal_kv/` canisters use this explicit
 legacy path because they boot through the polyfill.
 
 ## Safe SQL execution
@@ -351,12 +351,13 @@ explicit `SqlCodec[T]` with `encode` and `decode` procedures, then use
 
 ## Complete canister example
 
-[`example/`](./example/) is a deployable Nim canister. It runs migrations,
-implements `put`, `get`, `update`, and `deleteValue`, and preserves its SQLite
-image across upgrades.
+[`examples/kv_crud/`](./examples/kv_crud/) is a deployable Nim canister. It runs
+migrations, implements `put`, `get`, `update`, and `deleteValue`, and preserves
+its SQLite image across upgrades. [`examples/minimal_kv/`](./examples/minimal_kv/)
+is a smaller single-migration example.
 
 ```sh
-cd example
+cd examples/kv_crud
 icp network start -d
 icp deploy -y
 icp canister call backend migrationCount '()' --query

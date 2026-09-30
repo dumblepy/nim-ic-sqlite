@@ -63,7 +63,7 @@
 ### 4. PR-4: サンプル・ドキュメント・統合試験
 
 - [x] `README.md`: Exclusive / Managed の推奨例を分離。`120` は新規例、既存 ID 変更禁止、intent を明記。
-- [x] `example/` / `examples/minimal_kv/` を explicit intent（init=createOnly / post_upgrade=openExisting）へ更新。wasi2ic 前提のため explicit legacy adapter を使用。
+- [x] `examples/kv_crud/` / `examples/minimal_kv/` を explicit intent（init=createOnly / post_upgrade=openExisting）へ更新。wasi2ic 前提のため explicit legacy adapter を使用。
 - [x] 統合試験 `test_example_canister.nim` は `./scripts/test.sh`（local network 起動）で実行することを明記。
 - [x] 移行ガイド・Release note 相当（README の breaking change 節）を追加。
 
@@ -92,6 +92,7 @@
 | 2026-09-30 | baseline | `cd ic-sqlite && testament --megatest:off p 'tests/test_*.nim'` | 29/30 PASS（known: network 未起動） |
 | 2026-09-30 | 実装後 全 native + 統合 | `cd ic-sqlite && testament --megatest:off p 'tests/test_*.nim'` | **31/31 PASS**（local IC network 起動済み・`test_example_canister.nim` 含む） |
 | 2026-09-30 | example wasm build | `cd example && nicp developmentBuild` | 成功 |
+| 2026-09-30 | example を examples/kv_crud へ移動 | `mv ic-sqlite/example ic-sqlite/examples/kv_crud`、`example.nimble`→`kv_crud.nimble`、参照パス更新 | 移動後 `test_example_canister.nim` が **PASS** |
 | 2026-09-30 | minimal_kv wasm build | `cd examples/minimal_kv && nicp developmentBuild` | Nim コンパイル成功。candid metadata で `.did` 名不一致（既存・本改修外） |
 
 ## 現在の未確定事項

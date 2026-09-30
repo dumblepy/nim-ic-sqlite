@@ -5,7 +5,7 @@
 ## calls instead of only exercising the native SQLite test backend.
 import std/[os, osproc, strformat, strutils, unittest]
 
-const ExampleDir = "/application/ic-sqlite/example"
+const ExampleDir = "/application/ic-sqlite/examples/kv_crud"
 
 proc runExample(command: string): string =
   let originalDir = getCurrentDir()
