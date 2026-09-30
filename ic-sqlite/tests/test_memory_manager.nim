@@ -128,13 +128,13 @@ suite "MemoryManager virtual stable memory":
     check row.value.get == "b"
     database2.close()
 
-  test "places a SQLite-owned manager after the wasi2ic MGR prefix":
+  test "places a SQLite-owned manager after the wasi2ic MGR prefix (explicit legacy)":
     let raw: StableBackend = newVecStableBackend()
     raw.writeValidMgrFixture()
     let sentinel = [byte 0x11, 0x22, 0x33, 0x44]
     raw.write(StablePageSize, unsafeAddr sentinel[0], uint64(sentinel.len))
 
-    let manager = initMemoryManager(stableBackendAfterForeignManager(raw))
+    let manager = initMemoryManager(legacyWasi2icOffsetBackend(raw))
     check raw.sizePages > Wasi2icReservedStablePages
     check manager.rawBackend.sizePages == 1
     # The polyfill's own header and bucket are untouched.
@@ -263,3 +263,123 @@ suite "MemoryManager virtual stable memory":
     var afterGrow = newSeq[byte](pattern.len)
     vm.read(0, addr afterGrow[0], uint64(afterGrow.len))
     check afterGrow == pattern
+
+  test "T01 strict create requires an empty backing and produces a valid MGR":
+    let raw: StableBackend = newVecStableBackend()
+    let manager = createMemoryManagerStrict(raw)
+    check raw.sizePages >= 1
+    check manager.bucketSizeInPages == DefaultBucketSizeInPages
+    check manager.allocatedBucketCount == 0
+
+    let header = readBytes(raw, 0, MgrHeaderSize)
+    check header[0 .. 2] == [byte('M'), byte('G'), byte('R')]
+    check header[3] == 1
+    check header[4] == 0 and header[5] == 0
+    check header[6] == byte(MgrBucketSizePages) and header[7] == 0
+
+    let allocations = readBytes(raw, uint64(MgrHeaderSize), MgrAllocationTableSize)
+    for value in allocations: check value == MgrUnallocated
+
+  test "T01b strict open rejects missing storage without writing":
+    let raw: StableBackend = newVecStableBackend()
+    expect ValueError:
+      discard openExistingMemoryManagerStrict(raw)
+    # Still empty: a post_upgrade open must not grow or write the backing.
+    check raw.sizePages == 0
+
+  test "T02 non-empty all-zero raw is never initialized by strict APIs":
+    let forCreate: StableBackend = newVecStableBackend()
+    check forCreate.grow(1)
+    expect ValueError:
+      discard createMemoryManagerStrict(forCreate)
+    # Untouched: still exactly one page, all zero, no MGR header written.
+    check forCreate.sizePages == 1
+    check readBytes(forCreate, 0, 8) == @[byte 0, 0, 0, 0, 0, 0, 0, 0]
+
+    let forOpen: StableBackend = newVecStableBackend()
+    check forOpen.grow(1)
+    expect ValueError:
+      discard openExistingMemoryManagerStrict(forOpen)
+    check forOpen.sizePages == 1
+    check readBytes(forOpen, 0, 8) == @[byte 0, 0, 0, 0, 0, 0, 0, 0]
+
+  test "T03 strict open rejects foreign and corrupt images without modification":
+    let foreign: StableBackend = newVecStableBackend()
+    check foreign.grow(1)
+    var marker = [byte 9, 8, 7, 6, 5, 4, 3, 2]
+    foreign.write(0, addr marker[0], uint64(marker.len))
+    expect ValueError:
+      discard openExistingMemoryManagerStrict(foreign)
+    expect ValueError:
+      discard createMemoryManagerStrict(foreign)
+    check readBytes(foreign, 0, marker.len) == @marker
+
+    let corrupt: StableBackend = newVecStableBackend()
+    corrupt.writeValidMgrFixture()
+    # Bucket 1 is declared unallocated but carries an owner: invalid layout.
+    var owner = [MgrOwnerId]
+    corrupt.write(uint64(MgrHeaderSize) + 1, addr owner[0], 1)
+    expect ValueError:
+      discard openExistingMemoryManagerStrict(corrupt)
+    check readBytes(corrupt, uint64(MgrHeaderSize), 2) == @[MgrOwnerId, MgrOwnerId]
+
+  test "T04 reserved memory id 255 is rejected":
+    expect ValueError:
+      discard newMemoryId(255)
+    check memoryIdValue(newMemoryId(0)) == 0
+    check memoryIdValue(newMemoryId(254)) == 254
+
+  test "T12 raw MGR sharing is not silently accepted by strict manager APIs":
+    ## The polyfill owns offset 0; a SQLite-owned manager must be created on a
+    ## fresh region instead of silently sharing the polyfill allocation table.
+    let raw: StableBackend = newVecStableBackend()
+    raw.writeValidMgrFixture()
+    let before = readBytes(raw, 0, 3)
+    expect ValueError:
+      discard createMemoryManagerStrict(raw)
+    expect ValueError:
+      discard openExistingMemoryManagerStrict(newVecStableBackend())
+    check readBytes(raw, 0, 3) == before
+
+  test "T14 loads a two-memory fixture with exact header and bucket mapping":
+    ## Hand-built `ic-stable-structures`-style image: MemoryId 7 owns logical
+    ## bucket 0 (physical page 1) and MemoryId 2 owns logical bucket 1
+    ## (physical page 129).  Loading must reproduce the exact sizes/mapping.
+    let raw: StableBackend = newVecStableBackend()
+    check raw.grow(1 + 3 * MgrBucketSizePages)
+    var header = newSeq[byte](MgrHeaderSize)
+    header[0 .. 2] = [byte('M'), byte('G'), byte('R')]
+    header[3] = 1
+    header.putLe16(4, 3)
+    header.putLe16(6, uint16(MgrBucketSizePages))
+    # MemoryId 7: 200 pages -> ceil(200/128) = 2 buckets.
+    header.putLe64(MgrMemorySizesOffset + 7 * 8, 200)
+    # MemoryId 2: 1 page -> 1 bucket.
+    header.putLe64(MgrMemorySizesOffset + 2 * 8, 1)
+    raw.write(0, unsafeAddr header[0], uint64(header.len))
+
+    var allocations = newSeq[byte](MgrAllocationTableSize)
+    for index in 0 ..< allocations.len: allocations[index] = MgrUnallocated
+    allocations[0] = 7
+    allocations[1] = 7
+    allocations[2] = 2
+    raw.write(uint64(MgrHeaderSize), unsafeAddr allocations[0], uint64(allocations.len))
+
+    let manager = openExistingMemoryManagerStrict(raw)
+    check manager.memorySizePages(newMemoryId(7)) == 200
+    check manager.memoryBucketCount(newMemoryId(7)) == 2
+    check manager.memorySizePages(newMemoryId(2)) == 1
+    check manager.memoryBucketCount(newMemoryId(2)) == 1
+    check manager.allocatedBucketCount == 3
+
+    # MemoryId 7's second logical bucket maps to physical bucket 1 (page 129),
+    # and MemoryId 2's single bucket maps to physical bucket 2 (page 257).
+    let vm7 = manager.getMemory(newMemoryId(7))
+    var payload7 = [byte 0x77, 0x88]
+    vm7.write(MgrBucketSizePages * StablePageSize, addr payload7[0], uint64(payload7.len))
+    check readBytes(raw, StablePageSize + MgrBucketSizePages * StablePageSize, 2) == @payload7
+    let vm2 = manager.getMemory(newMemoryId(2))
+    var payload2 = [byte 0x22, 0x33]
+    vm2.write(0, addr payload2[0], uint64(payload2.len))
+    check readBytes(raw, StablePageSize + 2 * MgrBucketSizePages * StablePageSize, 2) == @payload2
+

@@ -53,12 +53,14 @@ suite "MemoryManager stable-memory isolation":
     raw.writeValidMgrFixture()
     raw.checkValidMgrFixture()
 
-    # Physical page 1 is bucket 0's payload. SQLite must begin at page 1025.
+    # Physical page 1 is bucket 0's payload. The explicit legacy adapter gives
+    # SQLite a view starting at page 1025; `Db.init` itself never applies this
+    # offset implicitly anymore.
     let sentinel = [byte 0xA5, 0x5A, 0x19, 0xE7]
     raw.write(StablePageSize, unsafeAddr sentinel[0], uint64(sentinel.len))
 
     var database: Db
-    check database.init(raw).isOk
+    check database.init(legacyWasi2icOffsetBackend(raw)).isOk
     check database.exec("CREATE TABLE isolated (key TEXT PRIMARY KEY, value TEXT)").isOk
     check database.execText("INSERT INTO isolated(key, value) VALUES (?, ?)", ["a", "b"]).isOk
     database.close()

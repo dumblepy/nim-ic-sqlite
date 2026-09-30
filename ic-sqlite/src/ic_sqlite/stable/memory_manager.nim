@@ -207,13 +207,40 @@ proc isAllZero(data: openArray[byte]): bool =
     if value != 0: return false
   true
 
+proc createMemoryManagerStrict*(backend: StableBackend;
+    bucketSizeInPages = DefaultBucketSizeInPages): MemoryManager =
+  ## Creates a brand-new `MGR` region and requires the raw backing store to be
+  ## completely empty (`sizePages == 0`).  A non-empty region is never probed,
+  ## all-zeroed, or overwritten: the composition root has to guarantee that the
+  ## backing memory is fresh before calling this (design INV-04 / INV-06).
+  if backend.isNil:
+    raise newException(ValueError, "nil stable backend")
+  if backend.sizePages != 0:
+    raise newException(ValueError,
+      "new memory manager requires empty stable memory")
+  initNew(backend, bucketSizeInPages)
+
+proc openExistingMemoryManagerStrict*(backend: StableBackend): MemoryManager =
+  ## Loads and validates an already persisted `MGR` region.  A missing backing
+  ## store (`sizePages == 0`), an all-zero region, an unknown magic and any
+  ## inconsistent layout are rejected without writing.  `post_upgrade` must use
+  ## this entry point so a wrong or empty `MemoryId` range can never silently
+  ## become a fresh manager (design INV-04).
+  if backend.isNil:
+    raise newException(ValueError, "nil stable backend")
+  if backend.sizePages == 0:
+    raise newException(ValueError, "existing memory manager is missing")
+  loadValidated(backend)
+
 proc initMemoryManager*(backend: StableBackend;
                         bucketSizeInPages = DefaultBucketSizeInPages): MemoryManager =
-  ## Opens or creates the `MGR` region on `backend`.
+  ## Compatibility entry point.  It creates a fresh / all-zero region, validates
+  ## and loads an existing `MGR` region, and rejects any other non-empty region.
   ##
-  ## * fresh / all-zero region: writes a new header and allocation table.
-  ## * existing `MGR` region: validated and loaded in place.
-  ## * any other non-empty region: rejected without modification.
+  ## New code should prefer `createMemoryManagerStrict` on a fresh canister and
+  ## `openExistingMemoryManagerStrict` in `post_upgrade`; the all-zero tolerance
+  ## kept here is only for legacy `init`/`post_upgrade` call sites that shared
+  ## one code path (design 5.2).
   if backend.isNil:
     raise newException(ValueError, "nil stable backend")
   if backend.sizePages == 0:
@@ -224,11 +251,21 @@ proc initMemoryManager*(backend: StableBackend;
     return initNew(backend, bucketSizeInPages)
   loadValidated(backend)
 
-proc stableBackendAfterForeignManager*(backend: StableBackend): StableBackend =
-  ## Returns a page-aligned view placed after a wasi2ic / ic-stable-structures
-  ## `MGR` region.  A SQLite-owned `MemoryManager` must not share the same
-  ## allocation table as the polyfill, so callers that already boot through
-  ## wasi2ic should pass its result to `initMemoryManager`.
+proc initMemoryManagerCompat*(backend: StableBackend;
+    bucketSizeInPages = DefaultBucketSizeInPages): MemoryManager {.deprecated: "use createMemoryManagerStrict / openExistingMemoryManagerStrict".} =
+  ## Explicit name for the legacy create-or-open behaviour of
+  ## `initMemoryManager`.  Kept separate so recommended examples can avoid it.
+  initMemoryManager(backend, bucketSizeInPages)
+
+proc legacyWasi2icOffsetBackend*(backend: StableBackend): StableBackend =
+  ## **Explicit legacy adapter (opt-in only).**  Returns a page-aligned view
+  ## placed after a wasi2ic / ic-stable-structures `MGR` prefix at offset 0.
+  ##
+  ## This assumes the polyfill keeps at most `Wasi2icReservedStablePages`
+  ## (1025) pages and is *not* a guaranteed partition: it is retained only so a
+  ## canister that already persisted a SQLite image at that fixed physical base
+  ## can be reopened.  Do not use it for new configurations (design 4.2 / 5.3);
+  ## the SQLite `Db` layer never applies this offset implicitly.
   if backend.isNil or backend.sizePages == 0: return backend
   var magic: array[4, byte]
   try:
@@ -238,6 +275,11 @@ proc stableBackendAfterForeignManager*(backend: StableBackend): StableBackend =
   if magic[0 .. 2] == [byte('M'), byte('G'), byte('R')]:
     return newOffsetStableBackend(backend, Wasi2icReservedStablePages * StablePageSize)
   backend
+
+proc stableBackendAfterForeignManager*(backend: StableBackend): StableBackend {.deprecated: "use legacyWasi2icOffsetBackend for explicit legacy layouts".} =
+  ## Deprecated alias of `legacyWasi2icOffsetBackend`.  Kept so existing source
+  ## keeps compiling, but it is no longer called from `Db.init`.
+  legacyWasi2icOffsetBackend(backend)
 
 # ---------------------------------------------------------------------------
 # virtual memory operations

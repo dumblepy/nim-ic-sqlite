@@ -12,24 +12,28 @@ const migrations = [
     sql: "CREATE TABLE kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
 ]
 
-proc initializeDatabase() =
+proc initializeDatabase(intent: DbOpenIntent) =
+  ## This minimal example boots through the WASI polyfill, so it keeps the
+  ## explicit legacy `MGR` prefix layout. New canisters should use
+  ## `managedDbStorage(manager, id)` with a single owner allocator.
   database.close()
-  let initialized = database.initDatabase(newIcStableBackend(), migrations)
+  let storage = legacyWasi2icDbStorage(newIcStableBackend())
+  let initialized = database.initDatabase(storage, migrations, intent)
   if not initialized.isOk:
     let message = "minimal_kv database initialization failed: " & initialized.error.message
     ic0_trap(cast[int](message.cstring), message.len)
   databaseReady = true
 
 proc canister_init() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiCreateOnly)
 
 proc canister_post_upgrade() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiOpenExisting)
 
 proc put() {.update.} =
   let request = Request.new()
   if not databaseReady:
-    initializeDatabase()
+    initializeDatabase(doiOpenExisting)
   let saved = database.execText(
     "INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     [request.getStr(0), request.getStr(1)])

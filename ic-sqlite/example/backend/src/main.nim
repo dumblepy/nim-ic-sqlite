@@ -18,26 +18,32 @@ proc greet() {.query.} =
   let request = Request.new()
   reply("Hello, " & request.getStr(0) & "!")
 
-proc initializeDatabase() =
+proc initializeDatabase(intent: DbOpenIntent) =
   ## Both lifecycle hooks recreate transient SQLite/VFS state from the stable
   ## image. A failure must reject install/upgrade rather than leave a canister
   ## that might later overwrite a foreign stable-memory image.
+  ##
+  ## This example boots through the WASI polyfill, which owns the `MGR` prefix
+  ## at raw stable-memory offset 0. `legacyWasi2icDbStorage` is the explicit
+  ## opt-in that keeps that fixed physical layout. A new canister should instead
+  ## create one `MemoryManager` and pass `managedDbStorage(manager, id)`.
   database.close()
-  let initialized = database.initDatabase(newIcStableBackend(), migrations)
+  let storage = legacyWasi2icDbStorage(newIcStableBackend())
+  let initialized = database.initDatabase(storage, migrations, intent)
   if not initialized.isOk:
     let message = "ic-sqlite initialization failed: " & initialized.error.message
     ic0_trap(cast[int](message.cstring), message.len)
   databaseReady = true
 
 proc canister_init() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiCreateOnly)
 
 proc canister_post_upgrade() {.exportwasm.} =
-  initializeDatabase()
+  initializeDatabase(doiOpenExisting)
 
 proc ensureDatabase(): string =
   if databaseReady: return ""
-  initializeDatabase()
+  initializeDatabase(doiOpenExisting)
   ""
 
 proc selectOne() {.update.} =

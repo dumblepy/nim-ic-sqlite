@@ -1,0 +1,351 @@
+---
+description: 13-fix-memory-management ブランチでの開発時に読み込む
+alwaysApply: false
+---
+
+# nim-ic-sqlite Stable Memory Ownership / MemoryId 改修設計書
+
+- **状態**: 実装提案（設計書。実装済みを意味しない）
+- **作成日**: 2026-09-30
+- **対象**: [`dumblepy/nim-ic-sqlite`](https://github.com/dumblepy/nim-ic-sqlite)、主に `ic-sqlite/`
+- **比較対象**: [`humandebri/ic-sqlite-vfs`](https://github.com/humandebri/ic-sqlite-vfs)
+- **目的**: SQLite が利用する stable memory の所有範囲と `MemoryId` の選択を明示化し、upgrade 時の誤初期化・異なる allocator 間の物理領域衝突を防ぐ。
+
+> **最重要の制約**: 既存の raw stable memory で wasi2ic が `MemoryManager` を所有している場合、Nim 側で同じ raw backend 上に別の `MemoryManager` インスタンスを作るだけでは安全な「単一 manager」にならない。複数インスタンスが互いの allocation state を同期しない限り、新しい bucket の所有権が衝突し得る。本設計は、同じ raw領域の allocator の**単一所有者**を要求する。既存領域を新方式へ自動再配置しない。
+
+## 1. 結論・実装方針
+
+1. 新規 canister の推奨形を **単一の allocator → 選択した VirtualMemory → SQLite** とする。SQLite の既定 `MemoryId` をライブラリが暗黙に確保することはしない。`120` は Rust README の慣例に合わせた**新規DB向けのサンプル値**であり、既存の `8` を自動変更してはならない。
+2. SQLite の DB API は、渡された `StableBackend` の **offset 0 をそのまま SQLite superblock として使う**。既存の `sqliteStableBackend()` による MGR magic の自動検出・1025ページ移動は廃止する。明示的な legacy アダプタでのみ旧配置を開けるようにする。
+3. `MemoryManager` の新規作成と既存再オープンを分離する。**post_upgrade では再オープン専用APIを呼び、raw size=0でも新規MGRを作らない**。新規作成用の strict 経路は、サイズ0なら作成、非空なら有効な `MGR` のみロードし、非空・全ゼロを暗黙に初期化しない。
+4. `init` と `post_upgrade` で **Create / OpenExisting** の intent を区別する。upgrade 時、誤った空の `MemoryId` に新DBを静かに作ることを防ぐ。
+5. wasi2ic と同じ raw 領域を利用する場合は、同一 manager/allocator を共有する統合アダプタ、または **互いに grow を制約できる、境界が保証された別 region** が提供できるときだけ managed mode を許可する。固定1025ページの「推測上の領域分離」は新規構成から除外する。
+6. 現在の Rust/Nim `MGR` レイアウト（version 1、header 2080 byte、255 slots、32768 buckets、既定128 pages/bucket）は変更しない。SQLite superblock フォーマット、DB ページ位置、SQL API、トランザクション publish の仕様も原則変更しない。
+
+**非目標**: 本改修だけで複数 `Db` の同時利用を実現すること、旧 exclusive DB の自動 in-place 移行、`ic-rusqlite` のイメージ移行、wasi2ic の内部 allocator を推測して再実装すること、`MemoryId=120` の強制。
+
+## 2. 調査根拠・現状
+
+### 2.1 Nim 側
+
+| ファイル | 現状と改修理由 |
+|---|---|
+| [`stable/memory_manager.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/stable/memory_manager.nim) | `MemoryId = distinct uint8`、`newMemoryId(255)` は拒否。`getMemory(id)` は仮想 backend を返す。`initMemoryManager` はサイズ0**または先頭header全ゼロ**なら新規 `MGR` を作る。`stableBackendAfterForeignManager` は MGR を検出すると `1025 * 64KiB` 後方へ offset する。 |
+| [`db.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/db.nim) | `sqliteStableBackend(backend)` が上記自動 offset を呼び、`Db.init` は変換後の backend で `readExistingSuperblock`、VFS、publish を行う。呼び出し側からアクセス先が明瞭ではない。 |
+| [`stable/superblock.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/stable/superblock.nim) | サイズ0/先頭superblock領域全ゼロを未初期化と判定し、非ゼロ・未知 magic を拒否する。DB の Create/OpenExisting 判定に再利用できるが、intent を適用するタイミングは最初の書込前でなければならない。 |
+| [`stable/backend.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/stable/backend.nim) | `newOffsetStableBackend` と `StableRegion` が存在。ただし offset が page aligned であるだけでは**他 allocator からの物理領域保護にはならない**。 |
+| [`lifecycle.nim`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/ic-sqlite/src/ic_sqlite/lifecycle.nim) | `initDatabase` と `reopenDatabaseAfterUpgrade` は現在実質同じ処理。異なるオープン intent を渡す場所。 |
+| [`README.md`](https://github.com/dumblepy/nim-ic-sqlite/blob/main/README.md) | 既定例は `newIcStableBackend()` の exclusive 利用。managed 例は `MemoryId(8)` + wasi2ic を考慮した別manager方式。 |
+
+### 2.2 Rust 側から採用する契約
+
+- [`README: Stable Memory Ownership`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/README.md): クレートは `MemoryId` を予約しない。利用 canister が SQLite 用 ID を決め、upgrade 後も固定する。`120` は新規配置向けの慣例であり必須値ではない。
+- [`src/stable/memory_manager.rs`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/src/stable/memory_manager.rs): `MemoryManager::init_strict` を用意し、未知の非空 raw layout を拒否する。
+- [`src/stable/memory_layout.rs`](https://github.com/humandebri/ic-sqlite-vfs/blob/main/src/stable/memory_layout.rs): `MemoryId` は0〜254、255は未割当。`MGR` version 1 の byte layout を維持する。
+- Rust の **ownership model** を参照するのであって、Rust の `MemoryId=120` や独立した manager 初期化コードを、wasi2ic が raw memory を所有している Nim canister にそのままコピーしない。
+
+## 3. 安全性の不変条件
+
+**INV-01 単一所有者**: 同一物理 stable-memory 領域を grow / allocate できる allocator は1つ。複数 manager が必要なら共有 state または非重複を強制する容量境界を必須とする。
+
+**INV-02 明示アドレス**: `Db.init(backend)` に渡した backend の論理 offset 0 が SQLite superblock。DB 層は MGR magic を見て backend を暗黙にすり替えない。
+
+**INV-03 永続ID**: 同じ DB を再開するときは、同じ manager の基点（base）、layout、`MemoryId` を再利用する。数字が同じでも manager の基点が違えば別ストレージである。
+
+**INV-04 Fail closed**: 非空・未知の manager image や非空・未知の DB image は上書きせず失敗する。upgrade 時に選択スロットが未初期化なら新規 DB を作らない。
+
+**INV-05 レイアウト不変**: `MGR` と既存 SQLite superblock の byte layout を変更しない。`MemoryId` の勝手な付け替え、物理 prefix の勝手な移動はしない。
+
+**INV-06 成功前無書込**: backend 種別 / ID / base / intent / format の検証は新規 metadata、schema migration、SQLite open に伴う publish より前に完了する。エラー時は対象領域の既存 byte が不変であることを検証する。
+
+**INV-07 サポート範囲**: 本改修段階では同時に開く SQLite DB は1つ。複数DBを許可するのは VFS グローバル状態と DB context の分離後とする。
+
+## 4. 採用するストレージモード
+
+| モード | 用途 | backend の意味 | 条件 |
+|---|---|---|---|
+| **Managed（推奨）** | 新規構築・他 stable structure と共存 | `manager.getMemory(id)` を DB に渡す | 管理対象 raw region の allocator をアプリが単独所有、または共有 manager から取得している |
+| **Exclusive** | SQLite だけが raw region を占有する構成 | raw backend のoffset 0を DB として使う | wasi2ic 等の別所有者が同じ raw 領域を使わないと保証できる |
+| **LegacyFixedOffset（移行専用）** | 既存の1025ページ配置を読み出す | 旧 base に明示 offset | 既存レイアウト確認＋運用上の領域非重複が担保される短期利用のみ。新規作成・増分 grow の常用を推奨しない |
+
+`MGR` magic を見たことだけを「その manager を所有してよい」証拠としない。`newIcStableBackend()` は raw syscall アダプタであり allocator の排他的所有権を証明するものではない。
+
+### 4.1 推奨レイアウト
+
+```text
+Raw IC Stable Memory（アプリが単独管理できる場合）
+└── MemoryManager（共有される唯一の allocator/state）
+    ├── MemoryId A: 他の stable data
+    ├── MemoryId B: 他の stable data
+    └── MemoryId S: SQLite 専用 VirtualStableBackend
+        ├── logical offset 0..64KiB: SQLite superblock
+        └── logical offset 64KiB..: SQLite DB image
+```
+
+### 4.2 wasi2ic 併用環境の扱い
+
+```text
+禁止する新規構成:
+raw MGR (wasi2ic)  +  別の initMemoryManager(raw)
+raw MGR (wasi2ic)  +  別の manager at guessed 1025-page base
+```
+
+実装は次のいずれかが成立する場合に限る。
+
+- **A. 同一 allocator を共有**: wasi2ic/関連 runtime が既存 manager の virtual memory を安全に払い出す API を持つ場合、その API 由来の backend を SQLite に渡す。別インスタンスの `initMemoryManager` を独立に使わない。Nim 側で直結できない場合、連携アダプタを別タスクとして設計する。
+- **B. 保証された partition**: 開始位置と最大容量が実際の provider によって固定され、両 allocator の `grow` と全 read/write に非重複範囲が強制される場合のみ、その subregion 上で SQLite-owned manager を構築する。単なる `newOffsetStableBackend(..., baseOffset)` は保証された partition と見なさない。
+- **C. どちらも不可**: 起動時エラーを返す、または既存運用を legacy path として明示的に維持し、新規採用を停止する。安全な共有が実現するまで raw を使い回さない。
+
+## 5. API 変更設計
+
+以下は**提案する API の概念例**。既存命名・Nim コンパイル可否は実装 PR で確定する。低レベルの `StableBackend` は今までどおり維持する。
+
+### 5.1 初期化時にモードと intent を明示する
+
+```nim
+# 新規導入の型/関数名（擬似 API）
+type
+  DbOpenIntent* = enum
+    doiCreateOnly,       # 既存 image があれば拒否
+    doiOpenExisting,     # 未初期化 image なら拒否（post_upgrade 推奨）
+    doiOpenOrCreate      # 明示的な互換用途のみ
+
+  DbStorage* = object    # 実際のフィールドは非公開にする
+
+proc managedDbStorage*(manager: MemoryManager; id: MemoryId): DbStorage
+proc exclusiveDbStorage*(raw: StableBackend): DbStorage
+
+proc initDatabase*(db: var Db; storage: DbStorage;
+                   migrations: openArray[Migration] = [];
+                   intent: DbOpenIntent;
+                   config = defaultDbConfig()): Result[bool, DbError]
+```
+
+- `DbStorage` は backend と明示されたモードを保持する。`managedDbStorage` は実装内部で `manager.getMemory(id)` を取得するだけで、raw bytes を再解釈しない。
+- 実装負荷を抑える第一段階では、型付き wrapper を導入する前に `initDatabaseManaged(db, manager, id, intent, ...)` / `initDatabaseExclusive(db, raw, intent, ...)` の明示的 overload でもよい。ただし公開APIの最終形は一貫させる。
+- `doiCreateOnly` は選択領域に既存 SQLite image があれば失敗する。`doiOpenExisting` は未初期化（サイズ0または認められた全ゼロ superblock）なら**何も書かず**失敗する。`doiOpenOrCreate` は呼び出し側が明示したときのみ使用する。
+- 外部公開の low-level `Db.init(backend)` は backend の論理 offset 0 をそのまま用いる。`sqliteStableBackend()` による暗黙 offset の適用は取り除く。high-level API を使う場合、mode/intent 判定を `Db.init` の副作用より前に置く。
+- `newMemoryId(id)` の範囲検証は現状維持（0〜254）。ライブラリは勝手に ID を割り当てない。アプリは `const SqliteMemoryId = 120'u8` 等を定義し、upgrade を跨いで変更しない。
+- `post_upgrade` の呼び出し例に `doiOpenExisting` を必須として明記する。`init` の `doiCreateOnly`/`doiOpenOrCreate` はデプロイ/再初期化運用に従って選ぶ。
+
+### 5.2 MemoryManager の strict 経路
+
+```nim
+# 擬似 API。実装は初期化前に所有権を確認する。
+proc createMemoryManagerStrict*(raw: StableBackend;
+    bucketSizeInPages = DefaultBucketSizeInPages): MemoryManager =
+  if raw.isNil: raise newException(ValueError, "nil backend")
+  if raw.sizePages() != 0:
+    raise newException(ValueError, "new manager requires an empty raw memory")
+  return initNew(raw, bucketSizeInPages)
+
+proc openExistingMemoryManagerStrict*(raw: StableBackend): MemoryManager =
+  if raw.isNil or raw.sizePages() == 0:
+    raise newException(ValueError, "existing manager is missing")
+  return loadValidated(raw)  # non-MGR / all-zero / invalid layout は拒否
+```
+
+- `loadValidated` は magic、version、allocated buckets、bucket ownership、memory sizes、raw capacity の整合性を検証する現行コードを再利用する。`post_upgrade` では **必ず `openExistingMemoryManagerStrict` を呼び、失敗時は新規書込しない**。
+- 現行 `initMemoryManager` の全ゼロ許容を残す必要があれば `initMemoryManagerCompat` として明示的に隔離し、推奨例から外す。新規作成/既存再開を兼ねる `initMemoryManagerStrict` が別途必要なら上記2関数を包む convenience API としてのみ設計し、`post_upgrade` からは使わない。次の breaking release で strict を標準にするかは移行利用状況を見て決定する。
+- **注意**: 全ゼロの非空領域が IC runtime の通常動作によってできる場合、raw が完全に新規であることを composition root が明示した専用 Create API を別途設ける。未知の既存領域を暗黙に消さない。
+
+### 5.3 自動1025ページ offset の撤去
+
+現状の `db.nim`:
+
+```nim
+proc sqliteStableBackend(backend: StableBackend): StableBackend =
+  stableBackendAfterForeignManager(backend)
+# Db.init: let sqliteBackend = sqliteStableBackend(backend)
+```
+
+改修後の low-level は単純に `let sqliteBackend = backend` とする。これにより raw MGR を誤って DB として渡した場合は、`readExistingSuperblock` の未知 magic 拒否により DB初期化が失敗し、別位置へ自動作成しない。
+
+`stableBackendAfterForeignManager` は新規設計から除外し、公開互換APIとして必要な場合は `legacyWasi2icOffsetBackend` 等に改名して **deprecated / explicit opt-in** にする。既存ABIや呼び出しの破壊を避けるには旧名を一時的に alias として残し、ビルド時警告とドキュメントの移行先を示す。ただし旧名が暗黙に `Db.init` から呼ばれる状態は残さない。
+
+## 6. 利用コード（新規 canister の概念例）
+
+以下の raw manager の例は、**他ランタイムが raw stable memory を管理していない** canister 専用。wasi2ic が独自 manager を稼働させる環境へ、そのまま貼り付けてはいけない。
+
+```nim
+import ic_sqlite
+import ic_sqlite/stable/ic_backend
+import ic_sqlite/stable/memory_manager
+
+const SqliteMemoryId = 120'u8  # 新規例。既存IDは変更しない。
+
+var manager: MemoryManager
+var database: Db
+
+proc openDatabase(isUpgrade: bool) =
+  database.close()
+  let raw = newIcStableBackend()
+  manager =
+    if isUpgrade: openExistingMemoryManagerStrict(raw)
+    else: createMemoryManagerStrict(raw)
+  let storage = managedDbStorage(manager, newMemoryId(SqliteMemoryId))
+  let intent = if isUpgrade: doiOpenExisting else: doiCreateOnly
+  let opened = database.initDatabase(storage, migrations, intent)
+  if not opened.isOk:
+    # ここでは適切な canister trap/error へ変換する。
+    raise newException(ValueError, opened.error.message)
+
+proc canister_init() {.exportwasm.} = openDatabase(false)
+proc canister_post_upgrade() {.exportwasm.} = openDatabase(true)
+```
+
+実際の init は「空スロットなら作成してよいか」を canister の配備モデルに従って明示し、アップグレード時は manager もDBも existing-only で開く。上の `createMemoryManagerStrict` は新規の raw size 0 を前提とする。既存MGR内に新しい SQLite slot を作る用途には、別途明示的な「既存managerを開いたうえで slot を CreateOnly で作成する」経路を設ける。既に `MemoryId=8` にDBがある場合は**8のまま**再開する。
+
+## 7. 既存データとの互換性・移行
+
+| 既存配置 | 自動変更 | 対応方針 |
+|---|---|---|
+| ① Exclusive: raw offset 0 に SQLite superblock | **しない** | 従来と同じ raw を explicit Exclusive として開く。Managed 化する場合は別領域/別 canister 等へ検証可能な export/import を行う。raw offset 0 に `MGR` を上書きしない。 |
+| ② 単一 MGR 内の `MemoryId=8` 等 | **しない** | 同じ MGR base と同じ ID で継続。120への付け替えは独立したデータ移行作業。 |
+| ③ wasi2ic MGR + 固定1025ページ後方の第二MGR | **しない** | 既存の base と ID を記録して explicit legacy path で扱う。固定prefixの拡張余地について確認できなければ新規書込・growを継続する設計としては採用しない。新方式には snapshot/export→検証→restore/import 等で移行する。 |
+| ④ Rustの既存 `MGR` image | **しない** | MemoryManager byte layout は変えず、対応 fixture で読取と同一 ID の bucket mapping を検証する。SQLite image 自体の相互読書きは別テストで確認し、未検証のまま保証しない。 |
+
+移行時の必須手順:
+
+1. デプロイ済み canister の raw layout、manager base page、selected `MemoryId`、DB size、superblock/checksum、関連データの snapshot を保存する。
+2. 旧 image を読み出し、レコード数・キー/値・DDL/マイグレーション版等を検証する。移行中は並行 update を停止するか、一貫した snapshot を確保する。
+3. 新規領域を安全に確保した上でデータをコピー/import し、移行完了まで旧 image を破壊しない。
+4. 新領域で DB を再開し、内容・件数・代表クエリ・更新/再起動/upgrade 耐性を検証する。
+5. 所有者の切替を明示的に実施する。失敗時は事前保存した旧 image に戻せることを確認する。
+
+**同じ raw stable memory の空き領域への in-place 移動を既定の移行案にしない**。既存 allocator の将来の grow と競合し得るため、非重複保証がない場合はバックアップ/新 canister 等の独立領域を使う。
+
+## 8. 実装ステップと変更対象
+
+### PR-1: 安全性テストと strict manager（APIを壊さない）
+
+- `stable/memory_manager.nim`: `createMemoryManagerStrict` / `openExistingMemoryManagerStrict` 追加。既存 `initMemoryManager` は当面残し、compat の位置づけを明示。
+- `tests/test_memory_manager.nim`: 空raw / 全ゼロ非空 / valid MGR / corrupt MGR / foreign bytes / memory ID 境界のテストを追加。
+- `README.md`: raw memory の allocator 所有権と `MemoryId` 固定の契約を先に明記。
+
+### PR-2: DB の明示 storage mode と init intent
+
+- `stable/` または `lifecycle.nim`: `DbStorage` と `DbOpenIntent`、明示的な Managed/Exclusive constructor を追加。
+- `db.nim`: low-level で自動 offset を削除。superblock 判定から実書込までの順序を確認する。
+- `lifecycle.nim`: `init` と `post_upgrade` の intent を区別。
+- 必要なら `DbErrorKind` に `dekStorageMode` / `dekMissingDatabase` 等を追加し、既存エラーの文字列依存を避ける。
+- 旧 API から暗黙 offset 依存の呼び出しがある場合、リリース上の breaking change として明示する。旧動作が必要な利用者には explicit legacy backend の移行手順を提示する。
+
+### PR-3: wasi2ic 連携 / 旧配置の隔離
+
+- `stable/memory_manager.nim`: `stableBackendAfterForeignManager` の推奨利用を撤回。旧配置専用の explicit adapter に隔離し、1025ページ仮定を非推奨として記録。
+- wasi2ic と共有する場合は、共通 allocator のバックエンド提供契約、または provider が保証する bounded region を別途実装する。未提供の場合は managed-with-wasi2ic をサポート済みと記載しない。
+- legacy 固定offset利用の upgrade 手順とバックアップツール/サンプルを整備。
+
+### PR-4: サンプル・ドキュメント・統合試験
+
+- `README.md` の推奨例を Managed と Exclusive に分離。`120` は新規例、既存 ID は変更禁止と明記。
+- `ic-sqlite/examples/minimal_kv/`、`ic-sqlite/example/`、ベンチマーク canister を対象別に見直す。**wasi2ic の有無を確認せずに raw manager 初期化へ一括置換しない**。
+- 単体テスト、native roundtrip、IC canister init→update→upgrade→query、旧形式再開の統合テストを追加。
+
+## 9. 受け入れテスト・合格条件
+
+| ID | テスト | 期待結果 |
+|---|---|---|
+| T01 | サイズ0 raw に `createMemoryManagerStrict` | valid `MGR` が生成される |
+| T01b | サイズ0 raw に `openExistingMemoryManagerStrict` | 書込せず失敗する |
+| T02 | 非空・全ゼロ raw を create/open strict manager へ渡す | 書き換えず失敗する |
+| T03 | 非空・未知 magic / 破損 MGR | 書き換えず失敗する |
+| T04 | `MemoryId=255` | `newMemoryId` が拒否する |
+| T05 | `MemoryId=8` にある旧DBを同じ base+ID で再開 | データ完全一致。120へは移らない |
+| T06 | DB作成後に `doiOpenExisting` で同じ slot を開く | 成功し全レコード維持 |
+| T07 | upgrade 時に誤った空の `MemoryId` を指定 | 新DBを生成せず失敗する |
+| T08 | raw `MGR` を `Db.init` に直接渡す | 自動1025ページ移動をせず、非SQLite image として失敗する |
+| T09 | 有効な `VirtualStableBackend` を `Db.init` に渡す | offset 0 のsuperblockと後続DBが正常に永続化される |
+| T10 | 新規 Managed と他 `MemoryId` を交互 grow/read/write | bucket ownership が交差せず既存 bytes が不変 |
+| T11 | 旧1025ページの fixture を明示的な legacy backend で検査 | 旧 manager の base/ID を維持して読み出せる。暗黙アクセスはしない |
+| T12 | wasi2ic の外部 manager が同一 raw 領域を所有する構成 | 単一 allocator/保証付き partition が未提供なら新規 managed open を許さない |
+| T13 | init/update→canister upgrade→post_upgrade(`OpenExisting`)→query | DB、migrations version、record count が保持される |
+| T14 | manager の Nim/Rust fixture 照合 | header、memory sizes、allocation table、bucket mapping が一致する |
+| T15 | 初期化拒否が発生するすべての negative case | 既存の対象 bytes / sentinel が不変である |
+
+さらに、`doiCreateOnly` が既存DBを上書きしないこと、`doiOpenExisting` が全ゼロ・未作成の仮想領域にsuperblockを書かないこと、IC環境で `trap` と update の境界が従来どおりであることを検証する。
+
+## 10. リリース・ロールバック方針
+
+- **破壊的変更として扱う点**: `Db.init(raw)` に依存して「MGR だったら自動で1025ページずらす」利用コードは意味が変わる。黙って挙動変更せず、移行ガイド、リリースノート、推奨例、deprecated alias を整備する。
+- 既存 image の layout を自動変換するコードは新リリースに含めない。旧配置を利用する canister は explicit legacy adapter を指定して、従来の base/ID のまま再開するか、別手順でデータ移行する。
+- 既存 canister に rolling deployment する前に、本番相当 snapshot を用いた upgrade 演習を実施する。ロールバックは**コードだけ戻せばよいとは限らない**ため、新構成で旧領域へ書き込まないことと、事前のリストア手段を必須とする。
+- 互換 API の撤去は legacy 利用者の移行完了後。誤った初期化を許すより、起動時に明示エラーを返す。
+
+## 11. 実装レビュー用チェックリスト
+
+- [ ] `Db.init` から暗黙 `stableBackendAfterForeignManager()` 呼び出しがなくなった
+- [ ] `Db.init` は渡された backend の logical offset 0 を SQLite の起点にする
+- [ ] strict manager は create/open を分離し、upgrade 時にサイズ0・全ゼロ・未知/破損画像を上書きしない
+- [ ] canister の `post_upgrade` は `OpenExisting` を使う
+- [ ] 選択した `MemoryId` と manager base が upgrade 前後で同じ
+- [ ] wasi2ic と Nim が独立 manager を同一 raw領域に作らないことを保証できる
+- [ ] 固定1025ページ方式が通常API・推奨サンプルから外れている
+- [ ] 既存 `MemoryId=8`、legacy 1025-page fixture の保全テストがある
+- [ ] `MGR` header / SQLite superblock の on-stable byte format を変更していない
+- [ ] 初期化失敗時の sentinel bytes 不変をテストしている
+- [ ] 実機相当 canister で init→update→upgrade→read を検証した
+- [ ] README、例、移行ガイド、リリースノートに breaking change を記載した
+
+---
+
+### 参照ソースの確認時点
+
+2026-09-30 に GitHub の `main` から参照した実装（ファイル単位の取得 SHA）：
+
+- Nim `memory_manager.nim`: `c47e2079b28577373e09d2b01e6aa04f398e7641`
+- Nim `db.nim`: `8b9d130ae4d37848ba82e8031f1a8d586a9dd8cd`
+- Nim `backend.nim`: `6963dd9e0add6212b5727b08ec539650c7998de4`
+- Nim `superblock.nim`: `0e61852e210c8999829ef628a084b4796dc3a96e`
+- Nim `lifecycle.nim`: `d056ea533f44ad072bfcf3ec150c4f2e899d286d`
+- Rust `memory_manager.rs`: `acc4c89d012b45eff1f2b95efab2f998e11fd305`
+- Rust `memory_layout.rs`: `76314461c9e6ae4dd68e8bd41c51fd86791ea5bc`
+
+*これらは Git blob SHA（必ずしも commit SHA ではない）。実装 PR では branch の commit SHA を固定した上で再確認すること。*
+
+---
+
+## 12. 実装結果（2026-09-30）
+
+PR-1〜PR-4 をこの順で実装した。`MGR` header / SQLite superblock の on-stable byte
+layout、SQL API、publish 仕様は変更していない。
+
+### 12.1 変更点
+
+| ファイル | 変更 |
+|---|---|
+| `src/ic_sqlite/stable/memory_manager.nim` | `createMemoryManagerStrict` / `openExistingMemoryManagerStrict` を追加。`initMemoryManager` は compat として維持し、`initMemoryManagerCompat` を deprecated 名で追加。`stableBackendAfterForeignManager` を `legacyWasi2icOffsetBackend` へ改名し、旧名は deprecated alias。 |
+| `src/ic_sqlite/db.nim` | `DbOpenIntent` / `DbStorageMode` / `DbStorage` と `managedDbStorage` / `exclusiveDbStorage` / `legacyWasi2icDbStorage` を追加。`DbErrorKind` に `dekStorageMode` / `dekMissingDatabase` を追加。`Db.init` に `intent` を追加し、superblock 判定直後・実書込前に intent を検証。暗黙 offset（旧 `sqliteStableBackend`）を削除し backend の logical offset 0 をそのまま使用。 |
+| `src/ic_sqlite/lifecycle.nim` | `initDatabase(storage, migrations, intent, config)`、`initDatabaseManaged`、`initDatabaseExclusive` を追加。`reopenDatabaseAfterUpgrade` は `doiOpenExisting`。旧 `initDatabase(db, backend, ...)` は `doiOpenOrCreate` の compat。 |
+| `example/` / `examples/minimal_kv/` | `canister_init` は `doiCreateOnly`、`canister_post_upgrade` は `doiOpenExisting`。wasi2ic 前提のため `legacyWasi2icDbStorage` を明示使用。 |
+| `benchmarks/comparison/nim_canister` | 従来と同じ暗黙 1025 ページ挙動を `legacyWasi2icOffsetBackend` の明示適用で維持。 |
+
+### 12.2 リリースノート（breaking change）
+
+- `Db.init(raw)` は raw 先頭の `MGR` magic を検出して 1025 ページ後方へ自動移動
+  しなくなった。渡された backend の logical offset 0 が SQLite superblock になる。
+- 旧配置の canister は `legacyWasi2icDbStorage(raw)`（または
+  `legacyWasi2icOffsetBackend(raw)`）を明示指定すれば、base と `MemoryId` を変えずに
+  再開できる。サンプル canister はこの経路に更新済み。
+- 旧名 `stableBackendAfterForeignManager` は deprecated alias。新規採用は非推奨で、
+  単一 allocator（`createMemoryManagerStrict` / `openExistingMemoryManagerStrict` +
+  `managedDbStorage`）が推奨。
+- `reopenDatabaseAfterUpgrade` は既存のみを開く（`doiOpenExisting`）。誤った空の
+  `MemoryId` を指定しても新規 DB を作らない。
+
+### 12.3 検証
+
+- native unit: `testament --megatest:off p 'tests/test_*.nim'` → **31/31 PASS**。
+  `tests/test_memory_manager.nim`（T01/T01b/T02/T03/T04/T10/T12/T14）、
+  `tests/test_storage_mode.nim`（T05/T06/T07/T08/T09/T11/T13/T15）を追加。
+- 実機相当: `tests/test_example_canister.nim` が local IC network 上で
+  init→put/get/update→upgrade→query→delete を完走（legacy adapter + intent）。
+- `MGR` / superblock byte layout 不変、negative case の sentinel 不変をテストで確認。
+
+### 12.4 未実施・制約
+
+- wasi2ic と共通 allocator を共有する managed API は提供しない（設計 4.2 C）。
+- `examples/minimal_kv` の `nicp developmentBuild` は candid metadata ステップで
+  `.did` 名（`minimal_kv.did`）不一致により失敗する。Nim ソースのコンパイル自体は
+  成功しており、本改修とは無関係な既存のサンプル設定差。

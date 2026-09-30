@@ -151,9 +151,12 @@ proc ensureDatabase(): string =
   config.queryConnectionReuse = dbQueryReuse
   config.statementCacheEnabled = dbStatementCache or defined(updateStatementCache)
   when defined(benchmarkFailpoint):
-    let opened = database.init(newFaultInjectingBackend(), config = config)
+    let opened = database.init(legacyWasi2icOffsetBackend(newFaultInjectingBackend()), config = config)
   else:
-    let opened = database.init(if useMetricsBackend: newMetricsBackend() else: newIcStableBackend(), config = config)
+    let base = if useMetricsBackend: newMetricsBackend() else: newIcStableBackend()
+    ## The benchmark canister boots through the WASI polyfill, so keep the same
+    ## explicit legacy fixed-offset layout this harness always measured.
+    let opened = database.init(legacyWasi2icOffsetBackend(base), config = config)
   if not opened.isOk: return opened.error.message
   let schema = database.exec("CREATE TABLE IF NOT EXISTS bench (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID")
   if not schema.isOk: return schema.error.message
