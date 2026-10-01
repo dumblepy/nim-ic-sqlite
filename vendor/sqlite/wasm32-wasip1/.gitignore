@@ -1,0 +1,5 @@
+# Deterministic SQLite static archive: this is a committed distribution
+# artifact (17-fix-dir branch rule section 6).  Intermediate/consumer objects
+# are not committed.
+*.o
+obj/

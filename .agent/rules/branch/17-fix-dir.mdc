@@ -1,0 +1,1025 @@
+---
+description: 17-fix-dir ブランチでの開発時に読み込む
+alwaysApply: false
+---
+
+# nim-ic-sqlite C成果物 配布・リンク設計書
+
+## 1. 目的
+
+本設計書は、`nim-ic-sqlite` を利用するNimアプリケーションからSQLiteを呼び出せるようにするため、C言語由来の以下の成果物をどのように生成・配布・取得・リンクするかを定義する。
+
+対象成果物:
+
+- `libsqlite3_ic.a`
+- `ic_sqlite_vfs_shim.o`
+- `sqlite_helpers.o`
+
+本設計書は、Nimbleパッケージそのものの配置や `nimble install` のpackage root設計とは分離して扱う。
+
+---
+
+## 2. 結論
+
+推奨方式は以下とする。
+
+1. `libsqlite3_ic.a` は **prebuilt artifactとして `nim-ic-sqlite` リポジトリ内に同梱する**。
+2. `ic_sqlite_vfs_shim.o` と `sqlite_helpers.o` は **配布しない**。
+3. `ic_sqlite_vfs_shim.c` と `sqlite_helpers.c` をNimble packageに含め、consumer applicationのビルド時にコンパイルする。
+4. consumer application側に個別の絶対パス設定を書かせず、`ic-sqlite` 内部のNim moduleからC compile/link設定を行う。
+5. GitHub Releaseには、同じ `libsqlite3_ic.a` とmetadata/checksumを補助的に公開する。
+6. Git branch / tag / commitでNimble dependencyを取得した場合でも、そのGit revisionに対応するNim source、C source、prebuilt SQLite archiveが必ず同時に取得される構成にする。
+7. CIで `libsqlite3_ic.a` の再現ビルドとchecksum一致を検証し、source・compile flags・archiveの不整合を防ぐ。
+
+---
+
+## 3. 背景
+
+`nim-ic-sqlite` はNimコードだけでは完結しない。
+
+SQLite本体はCで実装されており、ICP canister向けWASMビルドでは少なくとも以下が必要になる。
+
+```text
+Nim application
+    |
+    v
+nim-ic-sqlite
+    |
+    +-- SQLite static library
+    |     libsqlite3_ic.a
+    |
+    +-- IC-specific VFS C shim
+    |     ic_sqlite_vfs_shim.c
+    |
+    +-- SQLite helper C functions
+          sqlite_helpers.c
+```
+
+現在のビルドスクリプトでは、これらを `wasm32-wasip1` 向けに生成している。
+
+SQLite本体は約数MB規模のCソースであり、consumerごとに毎回ビルドするコストが高い。
+
+一方、`ic_sqlite_vfs_shim.c` と `sqlite_helpers.c` は小規模であり、consumer build時にコンパイルしても負荷は小さい。
+
+この違いを利用して、SQLite本体だけをprebuiltとし、shim/helperはsource distributionとする。
+
+---
+
+## 4. 設計原則
+
+### 4.1 Git revisionとbinary artifactを一致させる
+
+最重要要件は以下である。
+
+```text
+Git revision
+   |
+   +-- Nim source
+   +-- C shim source
+   +-- SQLite header
+   +-- SQLite build flags
+   +-- libsqlite3_ic.a
+```
+
+すべて同じGit revisionに属すること。
+
+例えば以下でfeature branchをインストールした場合、
+
+```bash
+nimble install "https://github.com/dumblepy/nim-ic-sqlite@#feature/foo"
+```
+
+そのbranchに対応した `libsqlite3_ic.a` が取得されなければならない。
+
+したがって、GitHub Releaseだけを唯一のbinary distribution sourceにしてはならない。
+
+---
+
+### 4.2 consumerに手動downloadを要求しない
+
+以下のような操作は原則として不要にする。
+
+```bash
+ic-sqlite downloadLibs
+```
+
+```bash
+curl -L .../libsqlite3_ic.a
+```
+
+```bash
+export IC_SQLITE_LIB_PATH=...
+```
+
+また、consumer側 `config.nims` に以下のような絶対パスを書かせない。
+
+```nim
+switch("passL", "/root/.ic-sqlite/libsqlite3_ic.a")
+```
+
+consumerは原則として、
+
+```nim
+import ic_sqlite
+```
+
+するだけで必要なlink configurationが有効になることを目標とする。
+
+---
+
+### 4.3 build artifactとsource artifactを分ける
+
+3つのC由来成果物をすべてprebuiltとして配る必要はない。
+
+推奨分類:
+
+| Artifact | 配布方式 | 理由 |
+|---|---|---|
+| `libsqlite3_ic.a` | prebuilt | SQLite本体のcompile costが高い |
+| `ic_sqlite_vfs_shim.o` | 配布しない | 小さい。C sourceからbuild可能 |
+| `sqlite_helpers.o` | 配布しない | 小さい。C sourceからbuild可能 |
+| `ic_sqlite_vfs_shim.c/.h` | source distribution | Nim側ABIとの同期が重要 |
+| `sqlite_helpers.c/.h` | source distribution | Nim側FFIとの同期が重要 |
+| `sqlite3.h` | source distribution | compile時headerとして必要 |
+
+---
+
+## 5. 推奨repository構成
+
+`nim-ic-sqlite` package rootから見て以下とする。
+
+```text
+nim-ic-sqlite/
+├── ic_sqlite.nimble
+├── src/
+│   ├── ic_sqlite.nim
+│   └── ic_sqlite/
+│       ├── ffi/
+│       │   ├── sqlite_api.nim
+│       │   ├── vfs_exports.nim
+│       │   └── linkage.nim
+│       └── ...
+│
+├── c/
+│   ├── ic_sqlite_vfs_shim.c
+│   ├── ic_sqlite_vfs_shim.h
+│   ├── sqlite_helpers.c
+│   └── sqlite_helpers.h
+│
+├── vendor/
+│   └── sqlite/
+│       ├── sqlite3.c
+│       ├── sqlite3.h
+│       ├── build-flags.txt
+│       └── wasm32-wasip1/
+│           ├── libsqlite3_ic.a
+│           ├── manifest.json
+│           └── SHA256SUMS
+│
+├── scripts/
+│   ├── build_sqlite.sh
+│   ├── verify_prebuilt.sh
+│   └── package_prebuilt.sh
+│
+└── .github/
+    └── workflows/
+        ├── ci.yml
+        └── release.yml
+```
+
+### 5.1 target directory名
+
+現在のビルドtargetが
+
+```text
+wasm32-wasip1
+```
+
+であるなら、artifact directory名も
+
+```text
+vendor/sqlite/wasm32-wasip1/
+```
+
+に統一する。
+
+`wasm32-wasi` と `wasm32-wasip1` が混在すると、将来的にtargetの意味が曖昧になるため避ける。
+
+---
+
+## 6. `libsqlite3_ic.a` の配布方式
+
+### 6.1 repositoryにcommitする
+
+`libsqlite3_ic.a` は生成物ではあるが、consumer dependencyとして必要な正式なdistribution artifactとしてGit管理する。
+
+例:
+
+```text
+vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+`.gitignore` で全 `.a` を除外するのではなく、対象archiveだけを例外扱いにする。
+
+例:
+
+```gitignore
+vendor/sqlite/wasm32-wasip1/*.o
+vendor/sqlite/wasm32-wasip1/*.a
+
+!vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+#### 6.1.1 Git LFS は使わない
+
+archive は約 1.1 MiB と小さく、再生成も可能だが、通常の Git object として
+追跡する。理由:
+
+- `nimble install` は Git URL 依存を `git clone` で取得する。Git LFS を使うと
+  consumer 環境に `git-lfs`（smudge 有効化）を前提として要求することになり、
+  「追加ツール無しで install」という目標を損なう。
+- 1.1 MiB は Git LFS を必要とするサイズではない。
+- LFS は install 時の network 取得を増やし、offline / 再現性を弱める。
+
+したがって `.gitattributes` による LFS 指定は行わず、`libsqlite3_ic.a` を
+通常の blob として commit する。CI は `verify_prebuilt.sh` で再現ビルドと
+checksum を検証する。
+
+### 6.2 repository同梱を推奨する理由
+
+GitHub Releaseだけからdownloadする方式では、以下が難しい。
+
+- feature branch
+- development branch
+- arbitrary commit
+- pull request build
+- unreleased tag
+
+一方、repositoryにarchiveを含めれば、
+
+```text
+Nim source revision
+SQLite archive revision
+C shim revision
+```
+
+がGitにより一体として固定される。
+
+---
+
+## 7. shim/helper objectをprebuiltしない理由
+
+現在のC shimはSQLite本体と比較して小さい。
+
+これらを `.o` として配布すると、以下のABI整合性を管理する必要がある。
+
+```text
+Nim FFI declarations
+        |
+        +-- ic_sqlite_vfs_shim.o
+        |
+        +-- sqlite_helpers.o
+```
+
+Nim側のFFI interfaceを修正した際、prebuilt `.o` の更新を忘れるとlink-timeまたはruntime failureにつながる。
+
+そのため、
+
+```text
+.c source + .h
+```
+
+をpackageに含め、consumer build時にcompileする。
+
+これにより、Git revision内のNim sourceとC sourceの一致が自然に保証される。
+
+---
+
+## 8. consumer applicationでのリンク方式
+
+### 8.1 package内部からlink設定する
+
+consumer側の `config.nims` に設定を要求するのではなく、`ic-sqlite` package内部にlinkage専用moduleを設ける。
+
+例:
+
+```text
+src/ic_sqlite/ffi/linkage.nim
+```
+
+概念コード:
+
+```nim
+import std/os
+
+const ffiDir = currentSourcePath().parentDir
+const packageRoot = ffiDir.parentDir.parentDir.parentDir
+
+const sqliteDir = packageRoot / "vendor" / "sqlite"
+const cDir = packageRoot / "c"
+const artifactDir = sqliteDir / "wasm32-wasip1"
+
+when defined(wasm32):
+  {.passC: "-I" & sqliteDir.}
+  {.passC: "-I" & cDir.}
+
+  {.compile: cDir / "ic_sqlite_vfs_shim.c".}
+  {.compile: cDir / "sqlite_helpers.c".}
+
+  {.passL: artifactDir / "libsqlite3_ic.a".}
+```
+
+実際の `currentSourcePath()` からpackage rootまでの `parentDir` 数は、最終repository layoutに合わせてテストで固定する。
+
+### 8.2 `ic_sqlite.nim` から内部importする
+
+公開entry point:
+
+```nim
+import ic_sqlite/ffi/linkage
+```
+
+を内部的に行う。
+
+consumer側は単に、
+
+```nim
+import ic_sqlite
+```
+
+とする。
+
+### 8.3 `nimble path` への依存を避ける
+
+library内部から
+
+```bash
+nimble path ic_sqlite
+```
+
+を実行してinstall pathを取得する方式は推奨しない。
+
+理由:
+
+- subprocess dependencyになる
+- Nimble installation stateに依存する
+- 同packageの複数versionが存在するとambiguityが発生し得る
+- Git checkoutから直接buildする場合との挙動差が増える
+
+`currentSourcePath()` 基準なら、実際にimportされたpackage revision自身のpathを取得できる。
+
+---
+
+## 9. `config.nims` の役割
+
+package rootの `config.nims` にconsumer link設定を依存させない。
+
+package repository自身のtest/build用 `config.nims` は維持してよいが、consumer distribution contractには含めない。
+
+理由:
+
+dependency packageの `config.nims` がconsumer projectに自動伝播することを前提にすると、build contextによって挙動が変わるため。
+
+link configurationは、importされるNim module内のpragmaで明示する。
+
+---
+
+## 10. build process
+
+### 10.1 SQLite archive生成
+
+`scripts/build_sqlite.sh` はSQLite本体だけのarchive生成を主目的とする。
+
+概念例:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SQLITE_VERSION="3.53.4"
+readonly TARGET="wasm32-wasip1"
+readonly OUT_DIR="vendor/sqlite/${TARGET}"
+
+: "${WASI_SDK_PATH:?WASI_SDK_PATH is required}"
+
+CC="${WASI_SDK_PATH}/bin/clang"
+AR="${WASI_SDK_PATH}/bin/llvm-ar"
+
+mkdir -p "${OUT_DIR}/obj"
+
+"${CC}" \
+  --target="${TARGET}" \
+  -Os \
+  -std=c99 \
+  -c vendor/sqlite/sqlite3.c \
+  -o "${OUT_DIR}/obj/sqlite3.o" \
+  -DSQLITE_CORE \
+  -DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
+  -DSQLITE_ENABLE_API_ARMOR \
+  -DSQLITE_ENABLE_FTS5 \
+  -DSQLITE_USE_URI \
+  -DSQLITE_OS_OTHER=1 \
+  -DSQLITE_THREADSAFE=0 \
+  -DSQLITE_OMIT_WAL \
+  -DSQLITE_TEMP_STORE=3 \
+  -DSQLITE_OMIT_LOCALTIME \
+  -DSQLITE_OMIT_DEPRECATED \
+  -DSQLITE_OMIT_LOAD_EXTENSION \
+  -DSQLITE_OMIT_SHARED_CACHE \
+  -DSQLITE_DEFAULT_MEMSTATUS=0
+
+"${AR}" rcsD \
+  "${OUT_DIR}/libsqlite3_ic.a" \
+  "${OUT_DIR}/obj/sqlite3.o"
+```
+
+`llvm-ar rcsD` のdeterministic modeを利用し、CIでbinary reproducibilityを検証しやすくする。
+
+---
+
+## 11. build flagsの一元管理
+
+compile flagsをshell script内に直接重複記述し続けるのではなく、可能であれば
+
+```text
+vendor/sqlite/build-flags.txt
+```
+
+へ分離する。
+
+例:
+
+```text
+SQLITE_CORE
+SQLITE_DEFAULT_FOREIGN_KEYS=1
+SQLITE_ENABLE_API_ARMOR
+SQLITE_ENABLE_FTS5
+SQLITE_USE_URI
+SQLITE_OS_OTHER=1
+SQLITE_THREADSAFE=0
+SQLITE_OMIT_WAL
+SQLITE_TEMP_STORE=3
+SQLITE_OMIT_LOCALTIME
+SQLITE_OMIT_DEPRECATED
+SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_OMIT_SHARED_CACHE
+SQLITE_DEFAULT_MEMSTATUS=0
+```
+
+build scriptはこれを読み、
+
+```bash
+-D<flag>
+```
+
+へ変換する。
+
+これにより、SQLite compile configurationそのものをversion-controlled metadataとして扱える。
+
+---
+
+## 12. artifact metadata
+
+`manifest.json` を配置する。
+
+例:
+
+```json
+{
+  "package": "ic_sqlite",
+  "package_version": "0.1.0",
+  "sqlite_version": "3.53.4",
+  "target": "wasm32-wasip1",
+  "archive": "libsqlite3_ic.a",
+  "build_profile": "ic-canister",
+  "threadsafe": false,
+  "wal": false,
+  "fts5": true
+}
+```
+
+必要であれば以下も追加する。
+
+```json
+{
+  "wasi_sdk_version": "30.0",
+  "clang_version": "...",
+  "llvm_ar_version": "...",
+  "source_commit": "..."
+}
+```
+
+ただしGit checkout時には `source_commit` とarchive自体が同一commit内にあるため、commit hashは必須ではない。
+
+---
+
+## 13. checksum
+
+以下を生成する。
+
+```text
+vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+例:
+
+```text
+<sha256>  libsqlite3_ic.a
+```
+
+CIでは、
+
+```bash
+sha256sum -c vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+を実行する。
+
+---
+
+## 14. CI設計
+
+### 14.1 source test
+
+通常のNim testを実行する。
+
+### 14.2 prebuilt archive reproduction test
+
+CI上で、
+
+```bash
+cp vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a /tmp/committed.a
+
+./scripts/build_sqlite.sh
+
+cmp \
+  /tmp/committed.a \
+  vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+を実行する。
+
+deterministic archiveが完全再現できる場合はbinary compareを行う。
+
+環境差により完全binary reproducibilityが難しい場合は、少なくとも以下を検証する。
+
+- SQLite version
+- build-flags
+- archive target
+- exported symbol set
+- functional integration test
+
+実装上の注意（`scripts/verify_prebuilt.sh`）:
+
+- committed archive は `docker/test.Dockerfile` と同じ **wasi-sdk 34** で生成する。
+  `docker/develop.Dockerfile` も 34 に統一し、ドリフトを防ぐ。
+- binary compare が一致すれば byte 完全再現として成功。
+- 不一致の場合は上記の semantic checks にフォールバックし、警告を出して成功
+  させる（CI がツールチェーン差だけで落ちないようにする）。
+- `scripts/build_sqlite.sh` は WASI SDK major バージョンが 34 以外のとき警告する。
+
+### 14.3 symbol audit
+
+例:
+
+```bash
+llvm-nm vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+により、必要なSQLite symbolsが存在することを確認する。
+
+### 14.4 consumer integration test
+
+CI内で小さなconsumer projectを作る。
+
+例:
+
+```text
+integration/
+└── consumer/
+    ├── consumer.nimble
+    └── src/
+        └── main.nim
+```
+
+`main.nim`:
+
+```nim
+import ic_sqlite
+
+discard IcSqliteVersion
+```
+
+実際にcanister targetでcompileし、consumerが独自のlink path設定なしでbuildできることを確認する。
+
+このtestが最も重要である。
+
+---
+
+## 15. GitHub Release設計
+
+GitHub Releaseは主distribution channelではなく、補助distribution channelとする。
+
+### 15.1 Release artifact
+
+tag `v0.1.0` の場合:
+
+```text
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1.tar.gz
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1.tar.gz.sha256
+```
+
+tarball内容:
+
+```text
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1/
+├── lib/
+│   └── libsqlite3_ic.a
+├── include/
+│   ├── sqlite3.h
+│   ├── ic_sqlite_vfs_shim.h
+│   └── sqlite_helpers.h
+├── manifest.json
+└── SHA256SUMS
+```
+
+### 15.2 Release用途
+
+Release artifactは以下に利用する。
+
+- Nim以外の言語・toolchainからの利用
+- CI cache
+- binary provenance確認
+- checksum検証
+- manual debugging
+- source checkout不要のbinary-only integration
+
+Nimble packageの通常利用ではdownload不要とする。
+
+---
+
+## 16. `nicp cHeaders` 方式との差異
+
+`nicp_cdk` の `cHeaders` はheaderをdownloadするためのcommandである。
+
+同様に `ic-sqlite libs` のようなcommandを作ることも技術的には可能だが、標準distribution方式にはしない。
+
+理由:
+
+1. binary artifactはsource revisionとの整合性要求が高い
+2. `main` branchからdownloadするとdependency revisionと一致しない可能性がある
+3. offline buildができなくなる
+4. GitHub availabilityへbuildが依存する
+5. checksum/version mappingを別途管理する必要がある
+
+`nicp cHeaders` 型commandを将来追加するとしても、
+
+```bash
+ic-sqlite fetch-prebuilt --version 0.1.0
+```
+
+のような明示的な補助commandとし、通常のNimble consumer pathでは使わない。
+
+---
+
+## 17. `humandebri/ic-sqlite-vfs` から参考にする点
+
+参考にすべき設計は2つある。
+
+### 17.1 precompiled SQLite archiveをsource packageに含める
+
+同projectはprecompiled SQLite static libraryをvendor directoryに含める設計を採用している。
+
+この考え方は `nim-ic-sqlite` にも適している。
+
+### 17.2 GitHub Releaseで最終Wasmを配布する
+
+最終canister/Wasmはtag release時にbuildし、Release artifactとして配布する。
+
+ただし `nim-ic-sqlite` はlibraryであり、consumer application自身が最終Wasmを生成する。
+
+したがって、`nim-ic-sqlite` がReleaseで配布すべき主artifactは最終Wasmではなく、再利用可能なSQLite static archiveである。
+
+---
+
+## 18. Nimble packageに含めるファイル
+
+Nimble install後に最低限以下が残る必要がある。
+
+```text
+src/**
+c/**
+vendor/sqlite/sqlite3.h
+vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+vendor/sqlite/wasm32-wasip1/manifest.json
+vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+`sqlite3.c` をconsumer packageにも含めるかは選択肢である。
+
+### 案A: 含める
+
+利点:
+
+- sourceからarchiveを再build可能
+- source distributionとして完全
+- auditしやすい
+
+欠点:
+
+- package sizeが大きい
+
+### 案B: 含めない
+
+利点:
+
+- Nimble packageが小さくなる
+
+欠点:
+
+- installed package単体ではSQLite archiveを再生成できない
+
+初期段階では案Aを推奨する。
+
+理由は、prebuilt binaryを配布する以上、そのsourceを同revisionに含めておく方がprovenanceが明確だからである。
+
+---
+
+## 19. optional bundled build mode
+
+将来的には2モードを用意してもよい。
+
+### precompiled mode
+
+default:
+
+```text
+link vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+### bundled mode
+
+developer/debug/reproducibility用:
+
+```text
+compile sqlite3.c at application build
+```
+
+例えばNim defineを使用する。
+
+```bash
+nim c -d:icSqliteBundled ...
+```
+
+概念コード:
+
+```nim
+when defined(icSqliteBundled):
+  {.compile: sqliteDir / "sqlite3.c".}
+else:
+  {.passL: artifactDir / "libsqlite3_ic.a".}
+```
+
+ただしSQLite compile flagsを `.compile` pragmaだけで完全再現できるようにする必要があるため、初期releaseではprecompiled onlyでもよい。
+
+---
+
+## 20. versioning policy
+
+以下が変更された場合はprebuilt archiveを必ず再生成する。
+
+- SQLite version
+- SQLite compile flags
+- WASI target
+- WASI SDK compatibility requirement
+- compiler options
+- `SQLITE_OS_OTHER`
+- thread mode
+- FTS/JSONなどcompile-time feature
+- ABIに影響するSQLite configuration
+
+`libsqlite3_ic.a` の変更は `nim-ic-sqlite` package version変更と一体で管理する。
+
+---
+
+## 21. security / supply chain
+
+prebuilt binaryをrepositoryに含めるため、以下をCIで保証する。
+
+- sourceがrepositoryに含まれる
+- build scriptがrepositoryに含まれる
+- build flagsがrepositoryに含まれる
+- checksumがrepositoryに含まれる
+- release artifactとrepository artifactが一致する
+- release buildはGitHub Actions等のCIで行う
+- tagとpackage versionを一致させる
+
+Release workflowでは、
+
+```text
+git checkout tag
+    |
+    v
+build libsqlite3_ic.a
+    |
+    v
+compare with committed archive
+    |
+    v
+run integration tests
+    |
+    v
+package
+    |
+    v
+upload release artifact
+```
+
+の順序とする。
+
+---
+
+## 22. failure policy
+
+consumer build時に `libsqlite3_ic.a` が存在しない場合、曖昧なlinker errorにせず、可能ならNim compile時に明示的に失敗させる。
+
+概念例:
+
+```nim
+static:
+  if defined(wasm32):
+    doAssert fileExists(artifactDir / "libsqlite3_ic.a"),
+      "ic-sqlite prebuilt SQLite archive is missing: " &
+      artifactDir / "libsqlite3_ic.a"
+```
+
+同様にheader/sourceの存在も必要に応じて検証する。
+
+---
+
+## 23. 非推奨案
+
+### 23.1 毎回GitHub Releaseからdownload
+
+非推奨。
+
+理由:
+
+- branch/commit dependencyとversionが一致しない
+- network-required buildになる
+- offline reproducibilityが低下する
+
+### 23.2 `main` branch raw URLからdownload
+
+強く非推奨。
+
+source dependencyがtag/commit固定でもbinaryだけ最新 `main` になる可能性がある。
+
+### 23.3 `.a/.o` すべてをrepositoryにcommit
+
+動作はするが推奨しない。
+
+shim/helper `.o` は小さく、sourceからconsumer build時に生成した方がABI同期が容易。
+
+### 23.4 consumerに絶対pathを書かせる
+
+非推奨。
+
+Nimble package install先は環境ごとに異なり、複数version coexistenceにも弱い。
+
+---
+
+## 24. 実装タスク
+
+推奨実装順:
+
+1. target directoryを `wasm32-wasip1` に統一する。
+2. `libsqlite3_ic.a` をGit管理対象に変更する。
+3. `.o` はGit管理しない。
+4. `build-flags.txt` を追加する。
+5. `manifest.json` を追加する。
+6. `SHA256SUMS` を追加する。
+7. `src/ic_sqlite/ffi/linkage.nim` を実装する。
+8. `ic_sqlite.nim` から `linkage.nim` をimportする。
+9. consumer-side buildでC shim/helperが自動compileされることを確認する。
+10. consumer-side buildで `libsqlite3_ic.a` が自動linkされることを確認する。
+11. dummy consumer integration testをCIに追加する。
+12. release workflowを追加する。
+13. Release tarballを生成する。
+14. repository archiveとRelease archiveのchecksum一致を検証する。
+15. READMEへconsumer usageを記載する。
+
+---
+
+## 25. Acceptance Criteria
+
+以下をすべて満たせば本設計を完了とする。
+
+### install
+
+```bash
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+またはbranch/tag/commit指定でinstallできる。
+
+### consumer source
+
+```nim
+import ic_sqlite
+```
+
+のみでC linkageに必要な設定が有効になる。
+
+### consumer config
+
+consumer自身の `config.nims` に以下を書かなくてよい。
+
+- SQLite include path
+- shim include path
+- `libsqlite3_ic.a` path
+- shim `.o` path
+- helper `.o` path
+
+### network independence
+
+install後のapplication buildではGitHubから追加artifactをdownloadしない。
+
+### branch consistency
+
+branch dependencyを利用した場合、そのbranchのNim/C/binary artifactが一体で使用される。
+
+### release consistency
+
+Release assetに含まれる `libsqlite3_ic.a` とtag checkout内のarchiveが同一checksumである。
+
+### reproducibility
+
+CI上でprebuilt archiveがsourceとbuild flagsから再生成可能である。
+
+---
+
+## 26. 最終アーキテクチャ
+
+```text
+GitHub: dumblepy/nim-ic-sqlite
+|
++-- Nim source
+|
++-- C source
+|    +-- ic_sqlite_vfs_shim.c
+|    +-- sqlite_helpers.c
+|
++-- SQLite source/header
+|
++-- prebuilt
+|    +-- libsqlite3_ic.a
+|
++-- CI
+|    +-- rebuild SQLite archive
+|    +-- verify checksum
+|    +-- consumer integration test
+|
++-- GitHub Release
+     +-- versioned prebuilt tarball
+```
+
+consumer:
+
+```text
+Nim application
+     |
+     | import ic_sqlite
+     v
+nim-ic-sqlite
+     |
+     +-- compile ic_sqlite_vfs_shim.c
+     +-- compile sqlite_helpers.c
+     +-- link libsqlite3_ic.a
+     |
+     v
+final canister Wasm
+```
+
+---
+
+## 27. 推奨方針まとめ
+
+`nim-ic-sqlite` のC依存配布は、
+
+> SQLite本体だけをprebuilt static archiveとしてGit/Nimble packageに同梱し、IC固有shim/helperはC sourceで配布してconsumer build時にコンパイルする
+
+方式を採用する。
+
+GitHub Releaseは、同じprebuilt archiveをversioned artifactとして公開する補助distribution channelとする。
+
+この構成により、
+
+- Git branch / tag / commitとの整合性
+- offline build
+- ABI同期
+- consumer側設定の最小化
+- reproducible build
+- release provenance
+
+を同時に満たせる。

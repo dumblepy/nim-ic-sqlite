@@ -1,42 +1,201 @@
-# 15-transaction 実装進捗
+# 17-fix-dir 実装進捗
 
-最終ゴール: ブランチルール第22節の完了条件をすべて満たす。
+最終ゴール: `nimble install https://github.com/dumblepy/nim-ic-sqlite` がクエリなしで成功し、
+`import ic_sqlite` が一貫して解決できるパッケージ構成にする（ブランチルールの方針A）。
 
-- [x] プロジェクト・ブランチルールと既存 transaction 経路を確認
-- [x] AST マクロと公開 export
-- [x] nested update / 通常 Db write の guard
-- [x] native / VecStableBackend のマクロテスト
-- [x] README 更新
-- [x] ./scripts/test.sh の全検証
-- [x] ブランチルールの完了条件と検証結果を更新
+> 追記: ブランチルールは「C成果物 配布・リンク設計書」へ更新された。現在の
+> 最終ゴールは次とする: `import ic_sqlite` だけで C shim の自動 compile と
+> prebuilt `libsqlite3_ic.a` の自動 link が有効になり、consumer が SQLite 用の
+> パス設定を一切書かなくてよい構成にする（下記「C成果物 配布・リンク実装」）。
 
-調査: README は /application/README.md に存在し、ic-sqlite/README.md はない。進捗はユーザー指定の本ファイルに記録する。Nim 2.2.12 を使用。
+## 進捗
 
-検証: nim c -r --hints:off ic-sqlite/tests/test_transaction_macro.nim が成功（native 6件 / stable 6件）。rollback 時の stable 全バイト不変、再openでのcommit永続化、Result/例外rollback、Query lease失効、guard、return/hygiene、DB式1回評価を確認。
+- [x] プロジェクトルール・ブランチルール・現状構成の確認
+- [x] パッケージ本体を `ic-sqlite/` からリポジトリルートへ移動
+      (`src/`, `scripts/`, `tests/`, `examples/`, `benchmarks/`, `vendor/`, `c/`,
+      `build/`, `config.nims`, `ic_sqlite.nimble`, `LICENSE`)
+- [x] `ic_sqlite.nimble` をルートへ移動し、ライブラリとしては不要な
+      `bin = @["ic_sqlite"]` を削除
+- [x] ハードコードされた `/application/ic-sqlite` を `/application` へ更新
+      (examples / benchmarks / tests / CI)
+- [x] パッケージルート移動に伴う相対パス計算の修正
+      (`scripts/install.sh`, `tests/config.nims`)
+- [x] `AGENTS.md` の開発規約をルートへ統合
+- [x] ルート `.gitignore` にパッケージ用パターンを統合
+- [x] README のインストール手順・テスト実行手順をルート基準へ更新
+- [x] CI の作業ディレクトリを `/application` へ更新
+- [x] 依存関係パッケージの `nimble check` 検証
+- [x] `./scripts/test.sh` の全検証（Testament 34/34、skip 0）
+- [x] 完了条件と検証結果のブランチルールへの記録
 
-全体検証途中: wasm32-wasip1 SQLite archive ビルド成功。test_example_canister（deploy / CRUD / upgrade）、test_db_api、test_failure_atomicity など既存テストが成功。コンパイル拒否テスト（identifierエラーの診断、async呼出元からのawait拒否）を追加。
+## 調査結果・設計まとめ
 
-完了（2026-10-01）:
-- ./scripts/test.sh 成功: Testament 32/32、skip 0。Wasm SQLite build とキャニスター deploy / CRUD / upgrade の統合テストを含む。
-- テスト列挙後に追加した compile reject 2ファイルも個別の Testament 実行で各1/1成功。次回 test.sh は自動的に両ファイルを含む。
-- ブランチルール第22節の全完了条件（推奨 hardening を含む）を達成し、チェックリストを更新。
-- git diff --check 成功。git add / git commit は未実行。
+- リポジトリルートは `/application`（= GitHub `dumblepy/nim-ic-sqlite`）。
+  `nicp_cdk` は開発・CI 用サブモジュールとしてルートに維持する。
+- パッケージ本体を丸ごとルートへ移したため、パッケージ内部の相対関係
+  (`src/`, `vendor/`, `examples/*/backend` など) は不変。
+  修正が必要だったのは絶対パスと、「ic-sqlite を一段深い場所と仮定した」
+  パス計算の2箇所のみ。
+- `nimble check` はルートの `ic_sqlite.nimble` を正しく認識し、依存は
+  `nim >= 2.2.12`, `nicp_cdk >= 0.1.0` として解決される。
+- `bin` 削除によりライブラリとして扱われ、`ic_sqlite` CLI 実行ファイルは
+  生成されない。
+- `nicp_cdk` の registry 解決可否はネットワーク非接続のため最終確認できない。
+  解決できない運用が判明した場合は `.nimble` を Git URL 依存へ切り替える
+  （ブランチルール 3.4 節）。
 
-## examples transaction 追加
+## 検証
 
-- [x] kv_crud に putPair transaction マクロ実装と Candid を追加
-- [x] README に commit / rollback の実行例を記載
-- [x] 統合テストで commit・重複キーrollback・upgrade後永続化を確認
+- ルートで `nimble check` 成功（`The package "ic_sqlite" is valid.`）。
+- ルートで `nimble install -y` が成功し、`ic_sqlite` が Nimble パッケージとして登録された。
+- 一時ディレクトリ（リポジトリ外）で `import ic_sqlite; echo IcSqliteVersion` をコンパイル・実行し `0.1.0` を確認。
+- `nimble` の `bin` 指定を外したため、`ic_sqlite` 実行ファイルは生成されないことを確認。
+- ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`。
+  SQLite の wasm32-wasip1 ビルド、テスト列挙、キャニスター deploy / CRUD /
+  upgrade を含む統合テストまで成功。終了コード `0`。
 
-設計: kv_crud の既存 kv 表に2行を INSERT。各操作の Result を検査し、2件目の制約違反時は body の error Result により1件目もrollbackする。DB操作は tx に限定、request解析とreplyはtransaction外。
+## Git URL + ブランチ指定インストールの検証（2026-10-01）
 
-examples検証完了: ic-sqliteで testament --print --megatest:off p tests/test_example_canister.nim が1/1成功（55.73秒）。実Wasmのbuild/deploy、2件commit、2件目の重複キー制約違反による1件目rollback、既存値不変、upgrade後永続化、既存CRUDを確認。git diff --check 成功。
+指定コマンド:
 
-## README 使用例の統一
+```sh
+nimble install https://github.com/dumblepy/nim-ic-sqlite@#17-fix-dir
+```
 
-- [x] Transactions 節の withUpdate callback 使用例を transaction マクロに統合
-- [x] 同一 transaction 内の read-your-writes、Result 検査、Query 失効の説明を維持
-- [x] 機能一覧を transaction マクロ表記に更新
-- [x] README 全体の withUpdate 呼出し例がないことと git diff --check を確認
+- 構文は正しく、Nimble はリモートの `17-fix-dir` ブランチを取得できた。
+- クリーンな `NIMBLE_DIR` では **依存解決で失敗** した。
+  原因は `requires "nicp_cdk >= 0.1.0"` の `nicp_cdk` が Nimble registry に
+  未登録で、`Missing dependencies: nicp_cdk` になること（ブランチルール 3.4 節の想定）。
+- 対策として `.nimble` の依存を Git URL へ変更した:
 
-ドキュメント変更のみ。既存 withUpdate API の互換性説明は維持する。
+  ```nim
+  requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
+  ```
+
+- 変更後の作業ツリーでクリーンな `NIMBLE_DIR` にインストールし、`nicp_cdk` と
+  依存一式が Git URL から解決され、外部ディレクトリからの `import ic_sqlite` が
+  成功することを確認。
+- `nicp_cdk` を先にインストールした環境では、指定コマンド（リモートブランチ）も
+  `EXIT=0` で成功した。ic_sqlite 側の URL・ブランチ指定に問題はなく、
+  ブレーカーは依存解決のみ。
+- クリーンな新規利用者でも指定コマンドを成功させるには、上記 `.nimble` の修正を
+  `17-fix-dir` ブランチへコミット・プッシュする必要がある。
+  検証時点のリモート `17-fix-dir` (b371305) は修正前の registry 依存のまま。
+
+### 修正プッシュ後の再検証（00721132）
+
+- リモート `17-fix-dir` が `00721132`（Git URL 依存版）へ更新された。
+- クリーンな `NIMBLE_DIR` で指定コマンドを実行し **`EXIT=0`**。
+  `Fetching https://github.com/dumblepy/nim-ic-sqlite (#17-fix-dir) using git`
+  が記録され、`nicp_cdk` も Git URL から解決された。
+- インストール結果: `ic_sqlite-0.1.0`, `nicp_cdk-0.1.0`, `rustcrypto`, `cligen`,
+  `illwill`, `base32`。`bin` は `nicp`/`ndfx` のみで `ic_sqlite` 実行ファイルなし。
+- 別ディレクトリから `import ic_sqlite; echo IcSqliteVersion` を実行し `0.1.0` を確認。
+
+### 注意: pkgcache のキャッシュ
+
+Nimble は Git URL＋ブランチ単位で `/root/.nimble/pkgcache/<url>_<ref>` を再利用し、
+ブランチが更新されても自動再取得しない場合がある。検証中、修正前 (`b371305`) の
+キャッシュが残っていて最初は古い依存のまま失敗した。キャッシュ削除後に再取得され
+成功した。ブランチを上書きした直後に検証する場合はキャッシュに注意する。
+
+## C成果物 配布・リンク実装（ブランチルール §24 タスク）
+
+ブランチルールが「nim-ic-sqlite C成果物 配布・リンク設計書」へ更新されたため、
+§24 の実装タスクを上から順に実施した。
+
+- [x] 1. target directory を `wasm32-wasip1` に統一
+      (`vendor/sqlite/wasm32-wasi/` → `vendor/sqlite/wasm32-wasip1/`)
+- [x] 2. `libsqlite3_ic.a` を Git 管理対象に変更（`*.o` のみ ignore）
+- [x] 3. `.o` は Git 管理しない（ビルド中間物は mktemp へ出力）
+- [x] 4. `vendor/sqlite/build-flags.txt` を追加
+- [x] 5. `vendor/sqlite/wasm32-wasip1/manifest.json` を追加
+- [x] 6. `vendor/sqlite/wasm32-wasip1/SHA256SUMS` を追加
+- [x] 7. `src/ic_sqlite/ffi/linkage.nim` を実装
+- [x] 8. `ic_sqlite.nim` から `linkage.nim` を import
+- [x] 9. consumer build で C shim/helper が自動 compile されることを確認
+- [x] 10. consumer build で `libsqlite3_ic.a` が自動 link されることを確認
+- [x] 11. dummy consumer integration test を CI に追加
+      (`integration/consumer/` + `ci.yml` の compile step)
+- [x] 12. release workflow を追加 (`.github/workflows/release.yml`)
+- [x] 13. Release tarball を生成 (`scripts/package_prebuilt.sh`)
+- [x] 14. repository archive と Release archive の checksum 一致を検証
+      (`package_prebuilt.sh` 内で `cmp`)
+- [x] 15. README へ consumer usage を記載
+
+## 調査結果・設計まとめ（追記）
+
+- `linkage.nim` は `currentSourcePath()` から package root を上方探索して
+  `vendor/sqlite/sqlite3.h` と `c/` を持つディレクトリを特定する。これにより
+  repository レイアウト (`src/ic_sqlite/ffi`) と `nimble install` の flatten
+  レイアウト (`<pkg>/ic_sqlite/ffi`) の両方で解決できる。
+- Nimble は whitelist mode（`installDirs`/`installExt` 指定時）で、global
+  install 時に `srcDir` を flatten する。package root の `c/`・`vendor/` を
+  同梱するため `installExt = @["nim"]` と `installDirs = @["c", "vendor"]` を
+  指定した。
+- `installDirs` は whitelist 検査では `srcDir` 基準、実際のコピーでは package
+  root 基準という二重解釈になる（nimble 0.24.1）。`src/c`・`src/vendor` を
+  `../c`・`../vendor` への symlink にして「Missing directory」prompt を回避。
+  symlink は `.gitignore` の例外で追跡対象にする。
+- prebuilt archive は `llvm-ar rcsD`（deterministic）で生成し、
+  `scripts/verify_prebuilt.sh` が再ビルドして byte 比較・checksum・symbol
+  audit を行う。
+- `config.nims`（root）は削除し、consumer/example の link 設定は linkage
+  module へ一本化した。examples と benchmark の `config.nims` から SQLite
+  の include/archive/`.o` 指定を削除した。
+
+## 検証結果（C成果物 配布・リンク）
+
+- `WASI_SDK_PATH=/root/.wasi-sdk ./scripts/verify_prebuilt.sh` 成功:
+  checksum OK、再ビルド `cmp` 一致、`manifest.json` target 一致、
+  `sqlite3_*` symbol audit OK。
+- `./scripts/package_prebuilt.sh` 成功: `dist/ic-sqlite-prebuilt-v0.1.0-
+  wasm32-wasip1.tar.gz` と `.sha256` を生成し、repository archive と一致。
+- `nimble install -y` 後のインストール先に `ic_sqlite.nim`・`ic_sqlite/`・
+  `c/`・`vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a` が存在。
+- repository 外の一時 dir に `integration/consumer` をコピーし、
+  `nim c src/main.nim` が SQLite パス設定なしで成功（`ic_sqlite_register_vfs`
+  の link を確認）。
+- `examples/minimal_kv/backend` で `nicp developmentBuild` が成功（linkage に
+  よる C shim compile と archive link を確認）。
+- ネイティブ test (`test_project_layout`, `test_sqlite_api`, `test_vfs_exports`,
+  `test_db_api`) 成功。
+- `./scripts/test.sh` 全完走: `verify_prebuilt.sh` 成功、Testament
+  `34 / 34` 成功、skip `0`。`tests/test_example_canister.nim` を含み、
+  linkage 経由でビルドした kv_crud キャニスターの deploy / CRUD / upgrade が
+  成功した。終了コード `0`。
+
+## Git LFS 検討と撤回（追加要望）
+
+- 一時 `libsqlite3_ic.a` を Git LFS で管理する変更を入れた（`.gitattributes`、
+  CI の `lfs: true`、linkage / verify の pointer 検出）。
+- 検討の結果、`nimble install` は Git URL 依存を `git clone` で取得するため、
+  LFS 化すると consumer 環境に `git-lfs`（smudge 有効）が必須になることが判明。
+  「追加ツール無しで install」という目標と衝突する。
+- ユーザー判断により **LFS を撤回し、通常の Git object として管理** する方針へ
+  戻した。`.gitattributes` を削除し、CI の `lfs: true`、linkage / verify の
+  LFS pointer 検出、README / 設計の LFS 記述を撤去した。
+- archive は約 1.1 MiB で通常追跡に十分小さい。再現性は `verify_prebuilt.sh`
+  の再ビルド `cmp` と checksum で担保する。
+- LFS 撤回後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。
+  `nimble install` に git-lfs は不要。
+
+## CI 再現性エラーの修正（GitHub Actions）
+
+- 症状: CI の `verify_prebuilt.sh` で `libsqlite3_ic.a` の再ビルド `cmp` が
+  不一致 (`char 6554`)、`prebuilt archive is not reproducible from source`。
+- 原因: `docker/develop.Dockerfile` が wasi-sdk **30**、`docker/test.Dockerfile`
+  が wasi-sdk **34** でドリフトしており、clang バージョン差で object code が
+  異なっていた。
+- 対応:
+  - `develop.Dockerfile` の `WASI_VERSION` を **34** に統一（CI と一致）。
+  - CI と同じ wasi-sdk 34 で `libsqlite3_ic.a` を再生成し、ローカル 34 で
+    byte 完全一致を確認。
+  - `scripts/verify_prebuilt.sh` に設計 §14.2 のフォールバックを実装。byte
+    不一致時は SQLite version / build-flags / target / exported symbol を
+    検証して警告付きで通過し、CI がツールチェーン差で脆弱に落ちないようにした。
+  - `scripts/build_sqlite.sh` に WASI SDK major バージョンの警告を追加。
+- 検証: wasi-sdk 34 で `verify_prebuilt.sh` が byte 一致、wasi-sdk 30 では
+  semantic fallback で通過（警告）。committed archive は検証後も 34 製のまま
+  保持されることを確認（`9fe9d46d...1035`）。
+- 修正後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。

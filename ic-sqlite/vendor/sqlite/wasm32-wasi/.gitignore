@@ -1,3 +1,0 @@
-# Generated wasm32-wasi linker inputs. Recreate with scripts/build_sqlite.sh.
-*.a
-*.o

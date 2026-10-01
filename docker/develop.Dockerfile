@@ -67,10 +67,13 @@ ENV PATH=$PATH:/root/.cargo/bin
 RUN icp --version
 
 # wasi
+# Keep this in lockstep with docker/test.Dockerfile: the committed
+# libsqlite3_ic.a is rebuilt and byte-compared in CI with the test image's WASI
+# SDK, so a version drift here makes the archive look non-reproducible.
 # reference: https://github.com/ICPorts-labs/chico/blob/main/examples/HelloWorld/Dockerfile#L48-L59
 # https://github.com/WebAssembly/wasi-sdk/releases/latest
 WORKDIR /root
-ENV WASI_VERSION="30"
+ENV WASI_VERSION="34"
 ENV WASI_VERSION_FULL="$WASI_VERSION.0"
 RUN curl -L -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_VERSION}/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz
 RUN tar -xzf wasi-sdk.tar.gz
