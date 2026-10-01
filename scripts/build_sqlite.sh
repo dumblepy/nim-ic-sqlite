@@ -23,6 +23,22 @@ readonly ARCHIVE="${ARTIFACT_DIR}/libsqlite3_ic.a"
 readonly CC="${WASI_SDK_PATH}/bin/clang"
 readonly AR="${WASI_SDK_PATH}/bin/llvm-ar"
 
+# The committed archive is built with the same WASI SDK as
+# docker/test.Dockerfile so CI can byte-compare it. Warn (do not fail) when a
+# developer uses a different major version; verify_prebuilt.sh then falls back
+# to semantic checks.
+readonly REQUIRED_WASI_SDK_MAJOR="34"
+if [[ -f "${WASI_SDK_PATH}/VERSION" ]]; then
+  actual_wasi_version="$(head -n1 "${WASI_SDK_PATH}/VERSION")"
+  case "$actual_wasi_version" in
+    ${REQUIRED_WASI_SDK_MAJOR}.*) ;;
+    *)
+      echo "warning: pinned WASI SDK is ${REQUIRED_WASI_SDK_MAJOR}.x but found ${actual_wasi_version};" >&2
+      echo "warning: the archive may not be byte-reproducible in CI." >&2
+      ;;
+  esac
+fi
+
 [[ -x "$CC" ]] || { echo "WASI clang not found: $CC" >&2; exit 1; }
 [[ -x "$AR" ]] || { echo "WASI llvm-ar not found: $AR" >&2; exit 1; }
 [[ -f "$SQLITE_SOURCE" && -f "$SQLITE_VERSION_HEADER" ]] || {

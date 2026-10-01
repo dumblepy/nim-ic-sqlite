@@ -569,6 +569,15 @@ deterministic archiveが完全再現できる場合はbinary compareを行う。
 - exported symbol set
 - functional integration test
 
+実装上の注意（`scripts/verify_prebuilt.sh`）:
+
+- committed archive は `docker/test.Dockerfile` と同じ **wasi-sdk 34** で生成する。
+  `docker/develop.Dockerfile` も 34 に統一し、ドリフトを防ぐ。
+- binary compare が一致すれば byte 完全再現として成功。
+- 不一致の場合は上記の semantic checks にフォールバックし、警告を出して成功
+  させる（CI がツールチェーン差だけで落ちないようにする）。
+- `scripts/build_sqlite.sh` は WASI SDK major バージョンが 34 以外のとき警告する。
+
 ### 14.3 symbol audit
 
 例:

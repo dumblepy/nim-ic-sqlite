@@ -179,3 +179,23 @@ Nimble は Git URL＋ブランチ単位で `/root/.nimble/pkgcache/<url>_<ref>` 
   の再ビルド `cmp` と checksum で担保する。
 - LFS 撤回後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。
   `nimble install` に git-lfs は不要。
+
+## CI 再現性エラーの修正（GitHub Actions）
+
+- 症状: CI の `verify_prebuilt.sh` で `libsqlite3_ic.a` の再ビルド `cmp` が
+  不一致 (`char 6554`)、`prebuilt archive is not reproducible from source`。
+- 原因: `docker/develop.Dockerfile` が wasi-sdk **30**、`docker/test.Dockerfile`
+  が wasi-sdk **34** でドリフトしており、clang バージョン差で object code が
+  異なっていた。
+- 対応:
+  - `develop.Dockerfile` の `WASI_VERSION` を **34** に統一（CI と一致）。
+  - CI と同じ wasi-sdk 34 で `libsqlite3_ic.a` を再生成し、ローカル 34 で
+    byte 完全一致を確認。
+  - `scripts/verify_prebuilt.sh` に設計 §14.2 のフォールバックを実装。byte
+    不一致時は SQLite version / build-flags / target / exported symbol を
+    検証して警告付きで通過し、CI がツールチェーン差で脆弱に落ちないようにした。
+  - `scripts/build_sqlite.sh` に WASI SDK major バージョンの警告を追加。
+- 検証: wasi-sdk 34 で `verify_prebuilt.sh` が byte 一致、wasi-sdk 30 では
+  semantic fallback で通過（警告）。committed archive は検証後も 34 製のまま
+  保持されることを確認（`9fe9d46d...1035`）。
+- 修正後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。

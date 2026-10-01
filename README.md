@@ -37,10 +37,13 @@ WASI_SDK_PATH=/root/.wasi-sdk ./scripts/verify_prebuilt.sh
 The repository commits `vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a` together
 with its `manifest.json` and `SHA256SUMS`. `verify_prebuilt.sh` rebuilds the
 archive from `vendor/sqlite/sqlite3.c` and `vendor/sqlite/build-flags.txt` and
-checks that the result is byte-for-byte reproducible. The archive is only about
-1.1 MiB, so it is tracked as a normal Git object; no extra tooling is needed to
-install the package. The IC VFS shim and the SQLite helpers are shipped as C
-source and compiled during the consumer build, so no `.o` files are committed.
+checks that the result is byte-for-byte reproducible with the pinned WASI SDK
+(**wasi-sdk 34**, the version in `docker/test.Dockerfile`); with a different
+toolchain it falls back to a semantic check (version, flags, target, symbols).
+The archive is only about 1.1 MiB, so it is tracked as a normal Git object; no
+extra tooling is needed to install the package. The IC VFS shim and the SQLite
+helpers are shipped as C source and compiled during the consumer build, so no
+`.o` files are committed.
 
 ## Install
 
