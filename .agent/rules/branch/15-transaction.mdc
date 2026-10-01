@@ -1351,3 +1351,12 @@ README に成功例と2件目が失敗する例を記載し、既存キャニス
 - [x] キャニスター統合テスト成功
 
 検証: `testament --print --megatest:off p tests/test_example_canister.nim` が1/1成功（55.73秒）。実Wasm上でcommit、2件目失敗時のrollbackと既存値不変、upgrade後の永続化を確認。
+
+
+## 25. README 使用例の統一
+
+- [x] ユーザー依頼に従い、README の transaction 使用例をマクロ構文に統一。
+- [x] read-your-writes のコードをマクロ例に統合し、withUpdate callback の重複例を削除。
+- [x] 既存 withUpdate API の互換性と同期処理・Query lease の説明を維持。
+
+検証: README の `database.withUpdate(` 呼出し例は0件、`git diff --check` 成功。ドキュメント変更のためテスト再実行は不要。

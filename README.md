@@ -8,7 +8,7 @@ details stay internal to the library.
 ## What it provides
 
 - SQLite backed by IC stable memory through a custom VFS.
-- Atomic update operations and rollback through `withUpdate`.
+- Atomic update operations and rollback through `transaction(database, tx):`.
 - Versioned, idempotent migrations.
 - Prepared-statement binding for text, integers, floating-point values, booleans,
   blobs, `Option[T]`, and explicit `SqlValue` values.
@@ -317,7 +317,12 @@ let outcome = transaction(database, tx):
     NewUser(id: 2, name: "Grace", active: true))
   if not inserted.isOk:
     return Result[bool, DbError](isOk: false, error: inserted.error)
-  Result[bool, DbError](isOk: true, value: true)
+
+  let visible = tx.table("users").where("id", "=", 2).first(User)
+  if not visible.isOk:
+    return Result[bool, DbError](isOk: false, error: visible.error)
+
+  Result[bool, DbError](isOk: true, value: visible.value.isSome)
 ```
 
 Use `tx.exec`, `tx.execText`, `tx.execValues`, or `tx.table` inside the body.
@@ -333,31 +338,13 @@ Nested transactions are unsupported and return `dekInvalidState`. Ordinary
 both native and stable backends. This tightens the former native behavior;
 use the transaction connection instead.
 
-`withUpdate` remains available as the explicit callback API:
+A Query Builder created from `tx` uses the same SQLite transaction, so it
+can read rows written earlier in that transaction. Do not keep a `Query`
+derived from `tx` after the transaction body returns; executing it later
+returns `dekInvalidState`.
 
-Use `withUpdate` when several writes must commit or roll back together. A
-Query Builder created from `UpdateConnection` uses the same SQLite transaction,
-so it can read rows written earlier in that transaction.
-
-```nim
-let result = database.withUpdate(
-  proc(conn: var UpdateConnection): Result[bool, DbError] =
-    let inserted = conn.table("users").insert(
-      NewUser(id: 2, name: "Grace", active: true))
-    if not inserted.isOk:
-      return Result[bool, DbError](isOk: false, error: inserted.error)
-
-    let visible = conn.table("users").where("id", "=", 2).first(User)
-    if not visible.isOk:
-      return Result[bool, DbError](isOk: false, error: visible.error)
-
-    Result[bool, DbError](isOk: true, value: true)
-)
-```
-
-Returning an error or raising a catchable exception rolls the transaction back.
-Do not keep a `Query` derived from `UpdateConnection` after the `withUpdate`
-body returns; executing it later returns `dekInvalidState`.
+`withUpdate` remains available as the explicit callback API with the same
+transaction semantics.
 
 ## Resource limits and codecs
 

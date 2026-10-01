@@ -31,3 +31,12 @@
 設計: kv_crud の既存 kv 表に2行を INSERT。各操作の Result を検査し、2件目の制約違反時は body の error Result により1件目もrollbackする。DB操作は tx に限定、request解析とreplyはtransaction外。
 
 examples検証完了: ic-sqliteで testament --print --megatest:off p tests/test_example_canister.nim が1/1成功（55.73秒）。実Wasmのbuild/deploy、2件commit、2件目の重複キー制約違反による1件目rollback、既存値不変、upgrade後永続化、既存CRUDを確認。git diff --check 成功。
+
+## README 使用例の統一
+
+- [x] Transactions 節の withUpdate callback 使用例を transaction マクロに統合
+- [x] 同一 transaction 内の read-your-writes、Result 検査、Query 失効の説明を維持
+- [x] 機能一覧を transaction マクロ表記に更新
+- [x] README 全体の withUpdate 呼出し例がないことと git diff --check を確認
+
+ドキュメント変更のみ。既存 withUpdate API の互換性説明は維持する。
