@@ -8,7 +8,9 @@ backend       = "c"
 requires "nim >= 2.2.12"
 # The ICP backend is intentionally kept behind src/ic_sqlite/stable/.
 # Consumers building canisters provide nicp_cdk through their Nimble environment.
-requires "nicp_cdk >= 0.1.0"
+# nicp_cdk is not published to the Nimble registry, so pin it as a Git URL
+# dependency to keep `nimble install <this repo>` self-contained.
+requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
 
 task test, "Run the full test suite with Testament":
   exec "./scripts/test.sh"

@@ -48,3 +48,31 @@
 - ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`。
   SQLite の wasm32-wasip1 ビルド、テスト列挙、キャニスター deploy / CRUD /
   upgrade を含む統合テストまで成功。終了コード `0`。
+
+## Git URL + ブランチ指定インストールの検証（2026-10-01）
+
+指定コマンド:
+
+```sh
+nimble install https://github.com/dumblepy/nim-ic-sqlite@#17-fix-dir
+```
+
+- 構文は正しく、Nimble はリモートの `17-fix-dir` ブランチを取得できた。
+- クリーンな `NIMBLE_DIR` では **依存解決で失敗** した。
+  原因は `requires "nicp_cdk >= 0.1.0"` の `nicp_cdk` が Nimble registry に
+  未登録で、`Missing dependencies: nicp_cdk` になること（ブランチルール 3.4 節の想定）。
+- 対策として `.nimble` の依存を Git URL へ変更した:
+
+  ```nim
+  requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
+  ```
+
+- 変更後の作業ツリーでクリーンな `NIMBLE_DIR` にインストールし、`nicp_cdk` と
+  依存一式が Git URL から解決され、外部ディレクトリからの `import ic_sqlite` が
+  成功することを確認。
+- `nicp_cdk` を先にインストールした環境では、指定コマンド（リモートブランチ）も
+  `EXIT=0` で成功した。ic_sqlite 側の URL・ブランチ指定に問題はなく、
+  ブレーカーは依存解決のみ。
+- クリーンな新規利用者でも指定コマンドを成功させるには、上記 `.nimble` の修正を
+  `17-fix-dir` ブランチへコミット・プッシュする必要がある。
+  検証時点のリモート `17-fix-dir` (b371305) は修正前の registry 依存のまま。

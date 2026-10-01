@@ -131,6 +131,10 @@ requires "nicp_cdk >= 0.1.0"
 
 ただし `nicp_cdk >= 0.1.0` が Nimble の package registry から常に解決できることは、リリース前に実環境で確認すること。registry に登録しない運用なら Git URL dependency に固定する。
 
+**確認結果 (2026-10-01):** `nicp_cdk` は Nimble registry に未登録であり、クリーンな
+`NIMBLE_DIR` では `nimble install <ic_sqlite>@#17-fix-dir` が
+`Missing dependencies: nicp_cdk` で失敗する。したがって Git URL dependency に固定する。
+
 例:
 
 ```nim
@@ -477,6 +481,7 @@ nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
       `nimble install https://github.com/dumblepy/nim-ic-sqlite` へ更新
 - [x] CI / `.gitignore` / `AGENTS.md` の更新
 - [x] `./scripts/test.sh` による全検証
+- [x] `nimble install <URL>@#17-fix-dir` の検証と `nicp_cdk` の Git URL 依存化
 
 ### 検証結果
 
@@ -484,6 +489,11 @@ nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
 - ルートで `nimble install -y` が成功し、`bin` 未指定のため実行ファイルは生成されない。
 - 一時ディレクトリ（リポジトリ外）で `import ic_sqlite` をコンパイル・実行し `0.1.0` を確認。
 - ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`、終了コード `0`。
+- `nimble install https://github.com/dumblepy/nim-ic-sqlite@#17-fix-dir`:
+  - クリーンな `NIMBLE_DIR` では `nicp_cdk` が registry 未登録のため失敗（3.4 節）。
+  - `requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"` へ変更後は、
+    クリーンな `NIMBLE_DIR` でのインストールと外部 `import ic_sqlite` に成功。
+  - `nicp_cdk` を導入済みの環境では指定コマンド（リモートブランチ）も成功。
 
 ### 補足
 
