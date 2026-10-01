@@ -1,6 +1,6 @@
 import std/[options, unittest]
 import ic_sqlite
-import ic_sqlite/stable/backend
+import nicp_cdk/storage/stable_backend
 
 type PersistedItem = object
   id: int64

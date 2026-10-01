@@ -1,5 +1,6 @@
 import std/[options, unittest]
-import ic_sqlite/stable/[backend, superblock]
+import nicp_cdk/storage/stable_backend
+import ic_sqlite/stable/superblock
 
 suite "Superblock":
   let original = Superblock(formatVersion: SuperblockFormatVersion, sqlitePageSize: 16384,

@@ -2,8 +2,9 @@
 import std/[options, tables]
 import ./ffi/sqlite_api
 import ./ffi/vfs_exports
-import ./stable/[backend, superblock]
-import ./stable/memory_manager
+import nicp_cdk/storage/stable_backend
+import nicp_cdk/storage/memory_manager
+import ./stable/superblock
 import ./vfs/vfs
 import ./vfs/overlay
 import ./value
@@ -62,8 +63,6 @@ type
     dsmManaged
     ## SQLite owns the whole raw region (superblock at physical offset 0).
     dsmExclusive
-    ## Explicit legacy view after a wasi2ic `MGR` fixed prefix.
-    dsmLegacyFixedOffset
   DbStorage* = object
     ## Resolved storage target plus the mode it was selected with.  The fields
     ## stay private: callers select a mode through the constructors and cannot
@@ -157,18 +156,12 @@ proc managedDbStorage*(manager: MemoryManager; id: MemoryId): DbStorage =
 
 proc exclusiveDbStorage*(raw: StableBackend): DbStorage =
   ## SQLite owns the whole raw region.  The caller must guarantee no other
-  ## allocator (wasi2ic, IcStableSeq, ...) uses the same raw stable memory.
+  ## allocator (a `nicp_cdk` `MemoryManager`, `IcStableSeq`, ...) uses the same
+  ## raw stable memory.  Native tests and dedicated custom backends may use it;
+  ## the IC canister standard configuration uses `managedDbStorage` instead.
   if raw.isNil:
     raise newException(ValueError, "nil stable backend")
   DbStorage(mode: dsmExclusive, backend: raw)
-
-proc legacyWasi2icDbStorage*(raw: StableBackend): DbStorage =
-  ## **Explicit legacy opt-in.**  Reopens a SQLite image that a previous release
-  ## placed after the wasi2ic `MGR` fixed prefix (1025 pages).  Not for new
-  ## configurations; prefer `managedDbStorage` with a single owner allocator.
-  if raw.isNil:
-    raise newException(ValueError, "nil stable backend")
-  DbStorage(mode: dsmLegacyFixedOffset, backend: legacyWasi2icOffsetBackend(raw))
 
 proc storageMode*(storage: DbStorage): DbStorageMode {.inline.} = storage.mode
 
@@ -281,12 +274,12 @@ proc init*(db: var Db; backend: StableBackend; dbSize = 0'u64;
            config = defaultDbConfig();
            intent = doiOpenOrCreate): Result[bool, DbError] =
   ## Opens /main.db through the `icstable` VFS. The caller selects an
-  ## IcStableBackend in canisters or VecStableBackend in native tests.
+  ## `IcStableBackend` (usually wrapped by a `MemoryManager`) in canisters or a
+  ## `VecStableBackend` in native tests.
   ##
   ## The backend's logical offset 0 is the SQLite superblock: this proc never
-  ## inspects an `MGR` magic to move the backend. A previous release applied an
-  ## implicit 1025-page offset here; use `legacyWasi2icDbStorage` explicitly if
-  ## that legacy physical layout must be reopened.
+  ## inspects an `MGR` magic, applies an offset, or creates a `MemoryManager`.
+  ## Physical memory composition is entirely the caller's responsibility.
   if backend.isNil: return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "nil stable backend"))
   if not config.configIsValid:
     return Result[bool, DbError](isOk: false, error: DbError(code: -1, message: "invalid database resource limits"))
@@ -356,8 +349,8 @@ proc init*(db: var Db; storage: DbStorage; dbSize = 0'u64;
            config = defaultDbConfig();
            intent = doiOpenOrCreate): Result[bool, DbError] =
   ## Storage-mode entry point. The constructor has already resolved the
-  ## backend (managed `MemoryId`, exclusive raw region, or explicit legacy
-  ## offset), so the DB layer never guesses a layout from raw bytes.
+  ## backend (managed `MemoryId` or exclusive raw region), so the DB layer
+  ## never guesses a layout from raw bytes.
   db.init(storage.backend, dbSize = dbSize, config = config, intent = intent)
 
 when not defined(wasm32):

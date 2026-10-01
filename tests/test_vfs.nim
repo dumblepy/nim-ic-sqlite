@@ -1,5 +1,5 @@
 import std/unittest
-import ic_sqlite/stable/backend
+import nicp_cdk/storage/stable_backend
 import ic_sqlite/vfs/vfs
 
 suite "VFS registry":

@@ -1,6 +1,6 @@
 import std/unittest
 import ic_sqlite
-import ic_sqlite/stable/backend
+import nicp_cdk/storage/stable_backend
 
 suite "benchmark storage observations":
   test "SQLite virtual pages are reported independently from DB bytes":

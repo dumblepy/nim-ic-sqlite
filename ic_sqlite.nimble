@@ -14,8 +14,9 @@ installExt    = @["nim"]
 installDirs   = @["c", "vendor"]
 
 requires "nim >= 2.2.12"
-# The ICP backend is intentionally kept behind src/ic_sqlite/stable/.
-# Consumers building canisters provide nicp_cdk through their Nimble environment.
+# SQLite persistence depends on the nicp_cdk stable-memory infrastructure
+# (`StableBackend` / `MemoryManager` / `MemoryId`).  Consumers building
+# canisters provide nicp_cdk through their Nimble environment.
 # nicp_cdk is not published to the Nimble registry, so pin it as a Git URL
 # dependency to keep `nimble install <this repo>` self-contained.
 # requires "nicp_cdk >= 0.1.0"

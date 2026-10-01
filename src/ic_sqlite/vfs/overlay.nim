@@ -1,7 +1,8 @@
 ## Heap-resident write overlay. Logical DB offsets are translated to stable
 ## memory only when dirty pages are published after SQLite COMMIT succeeds.
 import std/[algorithm, sequtils, tables]
-import ../stable/[backend, superblock]
+import nicp_cdk/storage/stable_backend
+import ../stable/superblock
 
 when defined(benchmarkProfile):
   ## Benchmark-only overlay counters, compiled out of normal builds so the

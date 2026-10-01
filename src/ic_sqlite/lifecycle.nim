@@ -5,9 +5,9 @@
 ## wrong behaviour. The plain `initDatabase(db, backend, ...)` overload is kept
 ## as a compatibility shim and behaves as `doiOpenOrCreate`.
 import ./db
-import ./stable/backend
 import ./stable/superblock
-import ./stable/memory_manager
+import nicp_cdk/storage/stable_backend
+import nicp_cdk/storage/memory_manager
 
 proc initDatabase*(db: var Db; storage: DbStorage;
                    migrations: openArray[Migration] = [];

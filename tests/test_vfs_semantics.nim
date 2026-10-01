@@ -7,7 +7,8 @@
 import std/[options, unittest]
 import ic_sqlite
 import ic_sqlite/ffi/vfs_exports
-import ic_sqlite/stable/[backend, superblock]
+import nicp_cdk/storage/stable_backend
+import ic_sqlite/stable/superblock
 import ic_sqlite/vfs/overlay
 import ic_sqlite/vfs/vfs
 

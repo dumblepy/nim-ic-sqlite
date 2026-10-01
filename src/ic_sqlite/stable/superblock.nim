@@ -1,5 +1,6 @@
 import std/options
-import ./[backend, checksum]
+import nicp_cdk/storage/stable_backend
+import ./checksum
 
 const
   SuperblockMagic* = "NIMSQLV1"

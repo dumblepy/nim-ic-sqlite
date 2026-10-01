@@ -4,8 +4,8 @@ import nicp_cdk
 import nicp_cdk/ic0/ic0
 import std/tables
 import ic_sqlite
-import ic_sqlite/stable/backend as stable_backend
-import ic_sqlite/stable/ic_backend
+import nicp_cdk/storage/stable_backend as stable_backend
+import nicp_cdk/storage/memory_manager
 import ../../../shared/bench_spec
 
 type
@@ -112,6 +112,8 @@ var dbCleanCachePages = 0'u64
 var dbQueryReuse = false
 var dbStatementCache = false
 
+const SqliteMemoryId = newMemoryId(40'u8)
+
 when defined(benchmarkFailpoint):
   type FaultInjectingBackend = ref object of stable_backend.StableBackend
     inner: stable_backend.StableBackend
@@ -143,33 +145,42 @@ proc replyOk[T: object](value: T) =
 proc replyErr(message: string) =
   reply(newCandidVariant("Err", newCandidText(message)))
 
-proc ensureDatabase(): string =
-  if databaseReady: return ""
+proc openDatabase(isUpgrade: bool): string =
+  ## The benchmark boots through the WASI polyfill, so it places its own
+  ## `MemoryManager` after the reserved prefix and stores SQLite in one fixed
+  ## `MemoryId`.
   database.close()
   var config = defaultDbConfig()
   config.cleanCachePages = dbCleanCachePages
   config.queryConnectionReuse = dbQueryReuse
   config.statementCacheEnabled = dbStatementCache or defined(updateStatementCache)
   when defined(benchmarkFailpoint):
-    let opened = database.init(legacyWasi2icOffsetBackend(newFaultInjectingBackend()), config = config)
+    let base: stable_backend.StableBackend = newFaultInjectingBackend()
   else:
-    let base = if useMetricsBackend: newMetricsBackend() else: newIcStableBackend()
-    ## The benchmark canister boots through the WASI polyfill, so keep the same
-    ## explicit legacy fixed-offset layout this harness always measured.
-    let opened = database.init(legacyWasi2icOffsetBackend(base), config = config)
+    let base: stable_backend.StableBackend =
+      if useMetricsBackend: newMetricsBackend() else: newIcStableBackend()
+  let applicationMemory = newIcOffsetBackend(base)
+  let manager =
+    if isUpgrade: openExistingMemoryManagerStrict(applicationMemory)
+    else: createMemoryManagerStrict(applicationMemory)
+  let opened = database.init(managedDbStorage(manager, SqliteMemoryId), config = config)
   if not opened.isOk: return opened.error.message
   let schema = database.exec("CREATE TABLE IF NOT EXISTS bench (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID")
   if not schema.isOk: return schema.error.message
   databaseReady = true
   ""
 
+proc ensureDatabase(): string =
+  if databaseReady: return ""
+  openDatabase(true)
+
 proc canister_init() {.exportwasm.} =
-  let failure = ensureDatabase()
+  let failure = openDatabase(false)
   if failure.len > 0: ic0_trap(cast[int](failure.cstring), failure.len)
 
 proc canister_post_upgrade() {.exportwasm.} =
   databaseReady = false
-  let failure = ensureDatabase()
+  let failure = openDatabase(true)
   if failure.len > 0: ic0_trap(cast[int](failure.cstring), failure.len)
 
 proc report(rows: uint32; start, checksum: uint64): BenchReport =

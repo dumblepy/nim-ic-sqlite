@@ -199,3 +199,73 @@ Nimble は Git URL＋ブランチ単位で `/root/.nimble/pkgcache/<url>_<ref>` 
   semantic fallback で通過（警告）。committed archive は検証後も 34 製のまま
   保持されることを確認（`9fe9d46d...1035`）。
 - 修正後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。
+
+## 19-use-nicp_cdk-memory-management 実装（nicp_cdk MemoryManager 移行）
+
+最終ゴール: `nim-ic-sqlite` から独自の stable-memory allocator 実装を全て削除し、
+`nicp_cdk` の `StableBackend` / `MemoryManager` / `MemoryId` を唯一の正本として
+利用する。旧 DB・legacy API・互換経路は残さない。
+
+### 実施内容
+
+- [x] dependency: 作業ツリーの `nicp_cdk` submodule を `f0f46848d6417c8572bb4e5aa386f510c35ae9cf`
+      へ checkout（`storage/stable_backend.nim` / `storage/memory_manager.nim` facade と
+      `newIcOffsetBackend` を含む）。superproject の gitlink (`8c439ed`) 更新は未コミット。
+- [x] 削除: `src/ic_sqlite/stable/backend.nim`, `src/ic_sqlite/stable/ic_backend.nim`,
+      `src/ic_sqlite/stable/memory_manager.nim`, `tests/test_memory_manager.nim`,
+      `tests/test_stable_backend.nim`
+- [x] import を `nicp_cdk/storage/stable_backend` / `nicp_cdk/storage/memory_manager` へ変更
+      (`db.nim`, `lifecycle.nim`, `superblock.nim`, `vfs/vfs.nim`, `vfs/overlay.nim`, tests)
+- [x] `db.nim`: `DbStorageMode` を `dsmManaged` / `dsmExclusive` に限定し、
+      `legacyWasi2icDbStorage` を削除。`Db.init` は MGR 検出・自動 offset を行わない。
+- [x] `src/ic_sqlite.nim`: `memory_manager` の top-level re-export を削除
+      （利用側は `import nicp_cdk/storage/memory_manager` を明示。
+      design 17 の推奨どおり責務分離を明確化）。
+- [x] tests 再編: `tests/test_storage_mode.nim` を managed / exclusive / 拒否 intent /
+      foreign image に整理。`tests/test_memory_region.nim` を
+      `MemoryId` 共存テスト（T4）へ書き換え。`tests/test_managed_growth.nim` を追加
+      （T5 multi-bucket growth + reopen、T6 rollback 不変条件）。
+- [x] examples: `examples/kv_crud`, `examples/minimal_kv` を
+      `newIcStableBackend` → `newIcOffsetBackend` → `createMemoryManagerStrict` /
+      `openExistingMemoryManagerStrict` → `managedDbStorage` の managed 構成のみに変更。
+- [x] benchmarks: `benchmarks/comparison/nim_canister` を managed 構成へ変更。
+- [x] integration: `integration/consumer` に design §35 の
+      `managedDbStorage(manager, SqliteMemoryId)` スニペットを追加。
+- [x] CI guard: `scripts/test.sh` に design §37 の重複 allocator 実装検出
+      (`type (MemoryManager|StableBackend|VirtualStableBackend)` in `src/ic_sqlite`) を追加。
+- [x] docs: README / examples README を managed 構成のみに更新し、legacy 記述を削除。
+
+### 検証結果
+
+- `./scripts/test.sh` 全完走: `verify_prebuilt.sh` が
+  `verified byte-for-byte reproducible prebuilt archive` で通過、警告なし、
+  Testament `33 / 33` 成功、skip `0`、終了コード `0`。
+  旧 `17-fix-dir` 時点の `34` から、allocator unit test 2 件を削除し integration 1 件を
+  追加したため `33`。
+- WASI SDK: 開発コンテナの `/root/.wasi-sdk` が 30.0 だったため
+  `pinned WASI SDK is 34.x but found 30.0` 警告と semantic fallback になっていた。
+  wasi-sdk 34.0 (`clang 23.1.0-wasi-sdk`) を導入して置き換え、committed archive が
+  byte 完全一致で再現することを確認（`docker/test.Dockerfile` / `develop.Dockerfile`
+  の pin と一致）。
+- `tests/test_example_canister.nim` 成功: kv_crud を managed 構成で deploy / CRUD /
+  canister upgrade し、upgrade 後もデータを読めることを確認（T8）。
+- `examples/kv_crud`, `examples/minimal_kv`, `benchmarks/.../nim_canister` の
+  `nicp developmentBuild` 成功。
+- external consumer: `integration/consumer` を一時 dir へコピーし、
+  `nim c src/main.nim` 成功（`import nicp_cdk/storage/memory_manager` +
+  `import ic_sqlite` + `managedDbStorage`）。
+- `nimble check` 成功（`The package "ic_sqlite" is valid.`）。
+- source audit: `src/ic_sqlite/` に `type MemoryManager|StableBackend|VirtualStableBackend`
+  の独自定義なし。legacy シンボルは source / README から消えている。
+
+### 環境メモ
+
+- この開発コンテナには過去実験の `~/.nimble/pkgs2/nicp_cdk-*` /
+  `ic_sqlite-*` が複数残っており、facade を含まない古い版が選択されると
+  `cannot open file: nicp_cdk/storage/memory_manager` や
+  `ambiguous call: newMemoryId` になる。`./scripts/install.sh` と
+  `nimble install -y` の後、古い version dir を削除すると解消する
+  （CI の clean image では発生しない）。
+- submodule gitlink (`nicp_cdk`) の index 更新とコミットは `git add` 禁止のため未実施。
+  コミット時に `f0f4684` を記録すること。
+
