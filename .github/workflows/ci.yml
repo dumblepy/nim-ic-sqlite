@@ -40,6 +40,24 @@ jobs:
           set -euo pipefail
           docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
             set -euo pipefail
-            cd /application/ic-sqlite
+            cd /application
             ./scripts/test.sh
+          '
+
+      - name: Install package and compile external import smoke test
+        run: |
+          set -euo pipefail
+          docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
+            set -euo pipefail
+            cd /application
+            ./scripts/install.sh
+            nimble install -y
+            tmpdir="$(mktemp -d)"
+            cd "$tmpdir"
+            printf "import ic_sqlite\necho IcSqliteVersion\n" > main.nim
+            nim c -r main.nim
+            if command -v ic_sqlite >/dev/null 2>&1; then
+              echo "unexpected ic_sqlite executable installed" >&2
+              exit 1
+            fi
           '

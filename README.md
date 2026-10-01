@@ -38,13 +38,20 @@ This creates the SQLite archive and C shim objects under
 `vendor/sqlite/wasm32-wasi/`. The example canister configurations link from
 that directory, so they do not depend on transient files in `build/`.
 
-## Install for local development
+## Install
 
-Clone this repository and register the package with Nimble:
+Install the package directly from its Git repository:
+
+```sh
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+For local development, clone this repository and register the package with
+Nimble from the repository root:
 
 ```sh
 git clone --recurse-submodules https://github.com/dumblepy/nim-ic-sqlite.git
-cd nim-ic-sqlite/ic-sqlite
+cd nim-ic-sqlite
 nimble develop
 ```
 
@@ -421,7 +428,8 @@ to a single-allocator layout is a separate data-move operation.
 
 ## Testing
 
-Run the full suite from `ic-sqlite/` (after checking out the `nicp_cdk` submodule):
+Run the full suite from the repository root (after checking out the `nicp_cdk`
+submodule):
 
 ```sh
 ./scripts/test.sh
@@ -462,7 +470,7 @@ test container.
 ### Core KV paired measurement
 
 ```bash
-cd /application/ic-sqlite/benchmarks/comparison
+cd /application/benchmarks/comparison
 ./prepare_rust.sh
 nim c -d:release runner/main.nim
 NISQL_COMPARE_NIM_SHA=HEAD ./runner/main 5
@@ -540,7 +548,7 @@ so they are not treated as the exact update-execution fee.
 Initialize 5,000 rows, then run 100 cycles of 1,000 DELETE and 1,000 INSERT.
 
 ```bash
-cd /application/ic-sqlite/benchmarks/comparison
+cd /application/benchmarks/comparison
 ./prepare_rust.sh
 nim c -d:release -r runner/churn.nim
 nim c -d:release -r runner/validate.nim results/churn-<run-id>
@@ -558,7 +566,7 @@ Collect the shared read, write, multi-get, and growth profile metrics on a fresh
 canister.
 
 ```bash
-cd /application/ic-sqlite/benchmarks/comparison
+cd /application/benchmarks/comparison
 ./prepare_rust.sh
 NISQL_COMPARE_NIM_SHA=HEAD nim c -d:release -r runner/profile.nim
 ```

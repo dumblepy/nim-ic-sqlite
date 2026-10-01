@@ -1,42 +1,50 @@
-# 15-transaction 実装進捗
+# 17-fix-dir 実装進捗
 
-最終ゴール: ブランチルール第22節の完了条件をすべて満たす。
+最終ゴール: `nimble install https://github.com/dumblepy/nim-ic-sqlite` がクエリなしで成功し、
+`import ic_sqlite` が一貫して解決できるパッケージ構成にする（ブランチルールの方針A）。
 
-- [x] プロジェクト・ブランチルールと既存 transaction 経路を確認
-- [x] AST マクロと公開 export
-- [x] nested update / 通常 Db write の guard
-- [x] native / VecStableBackend のマクロテスト
-- [x] README 更新
-- [x] ./scripts/test.sh の全検証
-- [x] ブランチルールの完了条件と検証結果を更新
+## 進捗
 
-調査: README は /application/README.md に存在し、ic-sqlite/README.md はない。進捗はユーザー指定の本ファイルに記録する。Nim 2.2.12 を使用。
+- [x] プロジェクトルール・ブランチルール・現状構成の確認
+- [x] パッケージ本体を `ic-sqlite/` からリポジトリルートへ移動
+      (`src/`, `scripts/`, `tests/`, `examples/`, `benchmarks/`, `vendor/`, `c/`,
+      `build/`, `config.nims`, `ic_sqlite.nimble`, `LICENSE`)
+- [x] `ic_sqlite.nimble` をルートへ移動し、ライブラリとしては不要な
+      `bin = @["ic_sqlite"]` を削除
+- [x] ハードコードされた `/application/ic-sqlite` を `/application` へ更新
+      (examples / benchmarks / tests / CI)
+- [x] パッケージルート移動に伴う相対パス計算の修正
+      (`scripts/install.sh`, `tests/config.nims`)
+- [x] `AGENTS.md` の開発規約をルートへ統合
+- [x] ルート `.gitignore` にパッケージ用パターンを統合
+- [x] README のインストール手順・テスト実行手順をルート基準へ更新
+- [x] CI の作業ディレクトリを `/application` へ更新
+- [x] 依存関係パッケージの `nimble check` 検証
+- [x] `./scripts/test.sh` の全検証（Testament 34/34、skip 0）
+- [x] 完了条件と検証結果のブランチルールへの記録
 
-検証: nim c -r --hints:off ic-sqlite/tests/test_transaction_macro.nim が成功（native 6件 / stable 6件）。rollback 時の stable 全バイト不変、再openでのcommit永続化、Result/例外rollback、Query lease失効、guard、return/hygiene、DB式1回評価を確認。
+## 調査結果・設計まとめ
 
-全体検証途中: wasm32-wasip1 SQLite archive ビルド成功。test_example_canister（deploy / CRUD / upgrade）、test_db_api、test_failure_atomicity など既存テストが成功。コンパイル拒否テスト（identifierエラーの診断、async呼出元からのawait拒否）を追加。
+- リポジトリルートは `/application`（= GitHub `dumblepy/nim-ic-sqlite`）。
+  `nicp_cdk` は開発・CI 用サブモジュールとしてルートに維持する。
+- パッケージ本体を丸ごとルートへ移したため、パッケージ内部の相対関係
+  (`src/`, `vendor/`, `examples/*/backend` など) は不変。
+  修正が必要だったのは絶対パスと、「ic-sqlite を一段深い場所と仮定した」
+  パス計算の2箇所のみ。
+- `nimble check` はルートの `ic_sqlite.nimble` を正しく認識し、依存は
+  `nim >= 2.2.12`, `nicp_cdk >= 0.1.0` として解決される。
+- `bin` 削除によりライブラリとして扱われ、`ic_sqlite` CLI 実行ファイルは
+  生成されない。
+- `nicp_cdk` の registry 解決可否はネットワーク非接続のため最終確認できない。
+  解決できない運用が判明した場合は `.nimble` を Git URL 依存へ切り替える
+  （ブランチルール 3.4 節）。
 
-完了（2026-10-01）:
-- ./scripts/test.sh 成功: Testament 32/32、skip 0。Wasm SQLite build とキャニスター deploy / CRUD / upgrade の統合テストを含む。
-- テスト列挙後に追加した compile reject 2ファイルも個別の Testament 実行で各1/1成功。次回 test.sh は自動的に両ファイルを含む。
-- ブランチルール第22節の全完了条件（推奨 hardening を含む）を達成し、チェックリストを更新。
-- git diff --check 成功。git add / git commit は未実行。
+## 検証
 
-## examples transaction 追加
-
-- [x] kv_crud に putPair transaction マクロ実装と Candid を追加
-- [x] README に commit / rollback の実行例を記載
-- [x] 統合テストで commit・重複キーrollback・upgrade後永続化を確認
-
-設計: kv_crud の既存 kv 表に2行を INSERT。各操作の Result を検査し、2件目の制約違反時は body の error Result により1件目もrollbackする。DB操作は tx に限定、request解析とreplyはtransaction外。
-
-examples検証完了: ic-sqliteで testament --print --megatest:off p tests/test_example_canister.nim が1/1成功（55.73秒）。実Wasmのbuild/deploy、2件commit、2件目の重複キー制約違反による1件目rollback、既存値不変、upgrade後永続化、既存CRUDを確認。git diff --check 成功。
-
-## README 使用例の統一
-
-- [x] Transactions 節の withUpdate callback 使用例を transaction マクロに統合
-- [x] 同一 transaction 内の read-your-writes、Result 検査、Query 失効の説明を維持
-- [x] 機能一覧を transaction マクロ表記に更新
-- [x] README 全体の withUpdate 呼出し例がないことと git diff --check を確認
-
-ドキュメント変更のみ。既存 withUpdate API の互換性説明は維持する。
+- ルートで `nimble check` 成功（`The package "ic_sqlite" is valid.`）。
+- ルートで `nimble install -y` が成功し、`ic_sqlite` が Nimble パッケージとして登録された。
+- 一時ディレクトリ（リポジトリ外）で `import ic_sqlite; echo IcSqliteVersion` をコンパイル・実行し `0.1.0` を確認。
+- `nimble` の `bin` 指定を外したため、`ic_sqlite` 実行ファイルは生成されないことを確認。
+- ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`。
+  SQLite の wasm32-wasip1 ビルド、テスト列挙、キャニスター deploy / CRUD /
+  upgrade を含む統合テストまで成功。終了コード `0`。

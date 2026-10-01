@@ -1,0 +1,493 @@
+---
+description: 17-fix-dir ブランチでの開発時に読み込む
+alwaysApply: false
+---
+
+# nim-ic-sqlite: `nimble install` 対応設計書
+
+## 1. 目的
+
+以下のコマンドで GitHub リポジトリから `ic_sqlite` ライブラリを導入できる状態にする。
+
+```bash
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+あわせて、`.nimble` ファイルの配置、`srcDir`、`bin`、依存関係、インストール後の `import ic_sqlite` が一貫する構成に整理する。
+
+---
+
+## 2. 現状確認
+
+2026-10-01 時点のリポジトリは概ね次の構成になっている。
+
+```text
+nim-ic-sqlite/
+├── README.md
+├── design/
+├── docker/
+├── nicp_cdk/              # git submodule
+└── ic-sqlite/
+    ├── ic_sqlite.nimble
+    ├── src/
+    │   ├── ic_sqlite.nim
+    │   └── ic_sqlite/...
+    └── scripts/...
+```
+
+リポジトリ直下には `.nimble` ファイルがなく、Nimble パッケージ本体は `ic-sqlite/` サブディレクトリにある。
+
+現在の `ic-sqlite/ic_sqlite.nimble` は以下の内容になっている。
+
+```nim
+version       = "0.1.0"
+author        = "ic-sqlite contributors"
+description   = "SQLite VFS backed by Internet Computer stable memory"
+license       = "MIT"
+srcDir        = "src"
+backend       = "c"
+bin           = @["ic_sqlite"]
+
+requires "nim >= 2.2.12"
+requires "nicp_cdk >= 0.1.0"
+
+task test, "Run the full test suite with Testament":
+  exec "./scripts/test.sh"
+```
+
+公開エントリポイントは `ic-sqlite/src/ic_sqlite.nim` で、利用側の想定は次の通り。
+
+```nim
+import ic_sqlite
+```
+
+README でも現在は URL から直接 `nimble install` する方式ではなく、次の開発用手順が案内されている。
+
+```bash
+git clone --recurse-submodules https://github.com/dumblepy/nim-ic-sqlite.git
+cd nim-ic-sqlite/ic-sqlite
+nimble develop
+```
+
+---
+
+## 3. 問題点
+
+### 3.1 `.nimble` がリポジトリ直下にない
+
+Nimble は Git URL を直接指定してインストールできるが、パッケージがリポジトリのサブディレクトリにある場合は `?subdir=<path>` を付ける方式が公式に用意されている。
+
+現状構成のままなら、正しい直接インストールコマンドは次になる。
+
+```bash
+nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
+```
+
+したがって、ユーザーが希望しているクエリなしの
+
+```bash
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+を正式サポートするなら、Nimble パッケージのルートを Git リポジトリのルートと一致させるのが最も確実である。
+
+### 3.2 `bin = @["ic_sqlite"]` は削除すべき
+
+`bin` を指定すると Nimble はそのパッケージをバイナリパッケージとして扱い、`ic_sqlite.nim` を実行ファイルとしてビルド・インストールしようとする。
+
+`ic_sqlite` は CLI ではなくライブラリの公開モジュールなので、この指定は不要であり、むしろ意味が異なる。
+
+修正:
+
+```diff
+ srcDir        = "src"
+ backend       = "c"
+-bin           = @["ic_sqlite"]
+```
+
+### 3.3 `srcDir = "src"` は現在位置では正しい
+
+`.nimble` が `ic-sqlite/ic_sqlite.nimble` にあり、公開モジュールが `ic-sqlite/src/ic_sqlite.nim` にあるため、現在の
+
+```nim
+srcDir = "src"
+```
+
+は正しい。
+
+問題は `srcDir` ではなく、Nimble package root と Git repository root が一致していないことである。
+
+### 3.4 `nicp_cdk` の扱いを一本化する必要がある
+
+現状はリポジトリ直下に `nicp_cdk` git submodule がある一方、`.nimble` では
+
+```nim
+requires "nicp_cdk >= 0.1.0"
+```
+
+と Nimble dependency として宣言している。
+
+通常の `nimble install` の利用者に submodule 初期化を要求しない設計にするなら、ライブラリ依存は Nimble dependency として解決する方針に統一するのが望ましい。
+
+ただし `nicp_cdk >= 0.1.0` が Nimble の package registry から常に解決できることは、リリース前に実環境で確認すること。registry に登録しない運用なら Git URL dependency に固定する。
+
+例:
+
+```nim
+requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
+```
+
+タグ運用を行う場合は、タグと `.nimble` の version の整合も確認する。
+
+---
+
+## 4. 推奨設計
+
+### 方針A: パッケージをリポジトリ直下へ移動する — 推奨
+
+このリポジトリ自体が `nim-ic-sqlite` 専用であるため、Nimble package root を repository root に合わせる。
+
+推奨構成:
+
+```text
+nim-ic-sqlite/
+├── ic_sqlite.nimble
+├── README.md
+├── src/
+│   ├── ic_sqlite.nim
+│   └── ic_sqlite/
+│       └── ...
+├── scripts/
+│   └── test.sh
+├── tests/
+│   └── ...
+├── vendor/
+│   └── ...
+├── examples/
+│   └── ...
+├── design/
+├── docker/
+└── nicp_cdk/              # 必要なら開発・CI用 submodule として維持
+```
+
+つまり、現在 `ic-sqlite/` 配下にある package 本体を一段上へ移動する。
+
+この構成なら `.nimble` は次でよい。
+
+```nim
+version       = "0.1.0"
+author        = "ic-sqlite contributors"
+description   = "SQLite VFS backed by Internet Computer stable memory"
+license       = "MIT"
+srcDir        = "src"
+backend       = "c"
+
+requires "nim >= 2.2.12"
+requires "nicp_cdk >= 0.1.0"
+
+task test, "Run the full test suite with Testament":
+  exec "./scripts/test.sh"
+```
+
+重要点:
+
+- `ic_sqlite.nimble` を repository root に置く。
+- `src/` も repository root 直下へ移す。
+- `srcDir = "src"` はそのまま維持する。
+- `bin = @["ic_sqlite"]` は削除する。
+- `scripts/test.sh` など `.nimble` からの相対パスも package root 基準で成立させる。
+- C ソース、SQLite vendor ファイル、shim 等を相対参照している場合、それらも package root 移動後のパスに合わせる。
+
+この方式なら目標コマンドをそのまま使える。
+
+```bash
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+### 方針B: 現状のサブディレクトリ構成を維持する
+
+リポジトリを monorepo として維持したい場合は、ファイル移動を行わず公式の `subdir` 指定を使う。
+
+```bash
+nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
+```
+
+この場合の `.nimble` は現在位置のままでよいが、`bin` は削除する。
+
+```nim
+version       = "0.1.0"
+author        = "ic-sqlite contributors"
+description   = "SQLite VFS backed by Internet Computer stable memory"
+license       = "MIT"
+srcDir        = "src"
+backend       = "c"
+
+requires "nim >= 2.2.12"
+requires "nicp_cdk >= 0.1.0"
+
+task test, "Run the full test suite with Testament":
+  exec "./scripts/test.sh"
+```
+
+この方式では、クエリなしの元コマンドを正式なインストール方法にはできない。
+
+---
+
+## 5. 「root に .nimble だけ置き、srcDir を `ic-sqlite/src` にする」案について
+
+技術的には次のような wrapper package も考えられる。
+
+```nim
+srcDir = "ic-sqlite/src"
+```
+
+ただし推奨しない。
+
+理由:
+
+1. package root と source tree の対応が不自然になる。
+2. `scripts/`, `vendor/`, `examples/`、Cソース等の相対パス管理が複雑になる。
+3. Nimble のインストール後レイアウトとビルド時の相対参照を検証する項目が増える。
+4. repository が実質単一パッケージなら、一段深い package root を維持する利点が小さい。
+
+「元の URL だけで install 可能」が要件なら、方針Aのディレクトリ移動の方が単純で保守しやすい。
+
+---
+
+## 6. 修正手順
+
+方針Aを採用する場合の概念的な作業は次の通り。
+
+```bash
+# repository root で実行
+mv ic-sqlite/ic_sqlite.nimble ./ic_sqlite.nimble
+mv ic-sqlite/src ./src
+mv ic-sqlite/scripts ./scripts
+
+# 存在する場合のみ、package に属するものを移動
+mv ic-sqlite/tests ./tests
+mv ic-sqlite/examples ./examples
+mv ic-sqlite/vendor ./vendor
+```
+
+その後、空になった `ic-sqlite/` を削除する。
+
+```bash
+rmdir ic-sqlite
+```
+
+実際には package 内に他のファイル/ディレクトリがある可能性があるため、移動前に必ず確認する。
+
+```bash
+find ic-sqlite -maxdepth 2 -type f | sort
+```
+
+`.nimble` から次を削除する。
+
+```diff
+-bin = @["ic_sqlite"]
+```
+
+さらにソース内で `../vendor`, `../../vendor`, `ic-sqlite/...` 等の path をハードコードしていないか確認する。
+
+```bash
+grep -RInE 'ic-sqlite/|\.\./.*vendor|vendor/sqlite' \
+  --include='*.nim' --include='*.nims' --include='*.nimble' \
+  --include='*.sh' .
+```
+
+---
+
+## 7. 検証手順
+
+### 7.1 package metadata の検証
+
+repository root で実行する。
+
+```bash
+nimble check
+```
+
+次にローカルインストールを確認する。
+
+```bash
+nimble install
+```
+
+### 7.2 import の確認
+
+一時ディレクトリで以下を作る。
+
+`test_import.nim`:
+
+```nim
+import ic_sqlite
+
+echo IcSqliteVersion
+```
+
+実行:
+
+```bash
+nim c -r test_import.nim
+```
+
+少なくともモジュール探索が成功し、`ic_sqlite` が import できることを確認する。
+
+### 7.3 Git URL からのクリーンインストール
+
+既存の develop link やローカル checkout に依存して成功するのを防ぐため、可能ならクリーンな Nimble home で試験する。
+
+```bash
+TMP_NIMBLE_DIR="$(mktemp -d)"
+NIMBLE_DIR="$TMP_NIMBLE_DIR" \
+  nimble install https://github.com/dumblepy/nim-ic-sqlite -y
+```
+
+Nimble のバージョンによって環境変数/オプション名が異なる場合は、その環境でサポートされる isolated package directory を使う。
+
+インストール後に別ディレクトリから再度 import test を実行する。
+
+### 7.4 `bin` が生成されないことの確認
+
+ライブラリなので `ic_sqlite` という CLI executable が `$HOME/.nimble/bin` 等に生成されないことを確認する。
+
+```bash
+command -v ic_sqlite && echo "unexpected binary" || true
+```
+
+### 7.5 依存関係の確認
+
+`nicp_cdk` が registry dependency として解決できるか確認する。
+
+```bash
+nimble install nicp_cdk
+```
+
+これが解決できない場合は `.nimble` の dependency を Git URL に変更する。
+
+### 7.6 test task
+
+```bash
+nimble test
+```
+
+`./scripts/test.sh` が repository root から正常に動くことを確認する。
+
+---
+
+## 8. CI に追加すべきテスト
+
+GitHub Actions では、通常の source checkout 内での test だけでなく、**Git URL からの利用者視点の install test** を追加する。
+
+概念例:
+
+```yaml
+- name: Install package from Git URL
+  run: |
+    cd /tmp
+    nimble install https://github.com/dumblepy/nim-ic-sqlite -y
+
+- name: Compile external import smoke test
+  run: |
+    tmpdir="$(mktemp -d)"
+    cd "$tmpdir"
+    cat > main.nim <<'NIM'
+    import ic_sqlite
+    echo IcSqliteVersion
+    NIM
+    nim c -r main.nim
+```
+
+PR の checkout 自体を URL install したい場合は、default branch ではなく対象 commit/ref を指定できる形にして、CI が未マージ変更をテストするよう調整する。
+
+---
+
+## 9. 実行環境で今回確認できたこと / できなかったこと
+
+今回の実行環境でコマンドを実際に試した結果:
+
+```text
+nimble --version
+-> nimble: command not found
+
+nim --version
+-> nim: command not found
+
+git ls-remote https://github.com/dumblepy/nim-ic-sqlite.git HEAD
+-> Could not resolve host: github.com
+```
+
+したがって、この環境では実際の `nimble install` の最終成功/失敗までは再現できなかった。
+
+一方、GitHub 上の現在のファイルは確認できており、以下は確定している。
+
+- repository root に `.nimble` はない。
+- `ic-sqlite/ic_sqlite.nimble` が存在する。
+- その `srcDir` は `src`。
+- `ic-sqlite/src/ic_sqlite.nim` が公開 entry module。
+- `.nimble` に `bin = @["ic_sqlite"]` が入っている。
+- README の現行 install 手順は `cd nim-ic-sqlite/ic-sqlite && nimble develop`。
+
+---
+
+## 10. 結論
+
+目標が厳密に
+
+```bash
+nimble install https://github.com/dumblepy/nim-ic-sqlite
+```
+
+であるなら、**方針A: `ic-sqlite/` の package 本体を repository root に移す**ことを推奨する。
+
+最低限の修正は次の2点。
+
+```text
+1. ic-sqlite/ic_sqlite.nimble と src/, scripts/, vendor 等の package 本体を repository root へ移動
+2. ic_sqlite.nimble の `bin = @["ic_sqlite"]` を削除
+```
+
+`srcDir = "src"` は、package 本体を丸ごと root に移す設計なら変更不要である。
+
+ディレクトリを維持したいなら、URL を次に変更する。
+
+```bash
+nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
+```
+
+こちらが Nimble の公式な subdirectory package の指定方法であり、最小変更で済む。
+
+---
+
+## 11. 実装記録（2026-10-01）
+
+方針Aを採用し、パッケージ本体をリポジトリルートへ移動した。
+
+### 進捗
+
+- [x] `ic-sqlite/` 配下のパッケージ本体をルートへ移動
+      (`src/`, `scripts/`, `tests/`, `examples/`, `benchmarks/`, `vendor/`, `c/`,
+      `build/`, `config.nims`, `ic_sqlite.nimble`, `LICENSE`)
+- [x] `bin = @["ic_sqlite"]` を削除
+- [x] ハードコードされた `/application/ic-sqlite` を `/application` へ更新
+- [x] `scripts/install.sh` の `repository_root` をルート基準 (`..`) へ修正
+- [x] `tests/config.nims` の `nicp_cdk` 探索をルート基準へ修正
+- [x] README のインストール手順を
+      `nimble install https://github.com/dumblepy/nim-ic-sqlite` へ更新
+- [x] CI / `.gitignore` / `AGENTS.md` の更新
+- [x] `./scripts/test.sh` による全検証
+
+### 検証結果
+
+- `nimble check` 成功。
+- ルートで `nimble install -y` が成功し、`bin` 未指定のため実行ファイルは生成されない。
+- 一時ディレクトリ（リポジトリ外）で `import ic_sqlite` をコンパイル・実行し `0.1.0` を確認。
+- ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`、終了コード `0`。
+
+### 補足
+
+- パッケージ内部の相対パスは移動後も変わらないため、修正は絶対パスと
+  ルート位置を仮定した2箇所のパス計算に限定できた。
+- `nicp_cdk` の registry 解決可否はネットワーク非接続のため最終確認できない。
+  解決できない場合は 3.4 節に従い Git URL 依存へ切り替える。

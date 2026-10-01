@@ -1,6 +1,9 @@
 *
 !*.*
 !*/
+!LICENSE
 !makefile
 nimcache
 .diff
+/ic_sqlite
+/testresults/
