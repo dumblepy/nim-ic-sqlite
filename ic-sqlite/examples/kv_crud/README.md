@@ -9,7 +9,7 @@ Nim backend canister built with `nicp` and managed by `icp-cli`.
 
 - [`backend/`](./backend/): the Nim canister. `backend/src/main.nim` runs
   migrations on `init`/`post_upgrade` and exposes `put`, `get`, `update`,
-  `deleteValue`, `selectOne`, `createTable`, `greet`, and `migrationCount`.
+  `putPair`, `deleteValue`, `selectOne`, `createTable`, `greet`, and `migrationCount`.
   Its interface is [`backend/backend.did`](./backend/backend.did).
 - [`icp.yaml`](./icp.yaml): the `icp-cli` project definition (the `backend`
   canister and the `local` network/environment).
@@ -54,6 +54,37 @@ Upgrade in place to verify persistence:
 icp deploy backend -m upgrade -y
 icp canister call backend get '("hello")' --query
 ```
+
+## Transaction macro
+
+`putPair(key1, value1, key2, value2)` uses `transaction(database, tx):` to
+insert two new keys atomically. Its implementation is in
+[`backend/src/main.nim`](./backend/src/main.nim). Each INSERT checks its Result;
+returning an error Result rolls back both writes. Unlike `put`, `putPair` does
+not overwrite existing keys.
+
+A successful transaction commits both rows:
+
+```bash
+icp canister call backend putPair '("pair-a", "first", "pair-b", "second")'
+icp canister call backend get '("pair-a")' --query
+icp canister call backend get '("pair-b")' --query
+```
+
+These calls return `"ok"`, `"first"`, and `"second"`. Calling `putPair` with an
+existing second key demonstrates rollback after the first INSERT succeeds:
+
+```bash
+icp canister call backend putPair '("rolled-back", "discarded", "pair-b", "replacement")'
+icp canister call backend get '("rolled-back")' --query
+icp canister call backend get '("pair-b")' --query
+```
+
+The write returns `"error: ..."`; `rolled-back` remains `"not_found"` and
+`pair-b` still contains `"second"`. Committed rows also survive a canister
+upgrade. The body is synchronous, uses `tx` for DB operations, and finishes
+before the canister replies. Do not use `await` or inter-canister calls inside
+it. A `return` inside the body exits only that body.
 
 ## Local Backend Iteration
 

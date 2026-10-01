@@ -84,6 +84,32 @@ proc put() {.update.} =
     return
   reply("ok")
 
+proc putPair() {.update.} =
+  ## Both keys must be new. If either INSERT fails, neither row is committed.
+  let request = Request.new()
+  let setupError = ensureDatabase()
+  if setupError.len > 0:
+    reply("error: " & setupError)
+    return
+  let firstKey = request.getStr(0)
+  let firstValue = request.getStr(1)
+  let secondKey = request.getStr(2)
+  let secondValue = request.getStr(3)
+  let saved = transaction(database, tx):
+    let first = tx.execText("INSERT INTO kv(key, value) VALUES (?, ?)",
+      [firstKey, firstValue])
+    if not first.isOk:
+      return Result[bool, DbError](isOk: false, error: first.error)
+    let second = tx.execText("INSERT INTO kv(key, value) VALUES (?, ?)",
+      [secondKey, secondValue])
+    if not second.isOk:
+      return Result[bool, DbError](isOk: false, error: second.error)
+    Result[bool, DbError](isOk: true, value: true)
+  if saved.isOk:
+    reply("ok")
+  else:
+    reply("error: " & saved.error.message)
+
 proc get() {.query.} =
   let request = Request.new()
   let setupError = ensureDatabase()

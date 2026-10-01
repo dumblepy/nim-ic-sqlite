@@ -1,102 +1,42 @@
-# 13-fix-memory-management 自律実装進捗
+# 15-transaction 実装進捗
 
-対象ブランチ: `13-fix-memory-management`
-基準設計: `.agent/rules/branch/13-fix-memory-management.mdc`
-更新日: 2026-09-30
+最終ゴール: ブランチルール第22節の完了条件をすべて満たす。
 
-> 本ブランチの設計書は、SQLite が使う stable memory の所有範囲と `MemoryId` 選択を明示化し、
-> upgrade 時の誤初期化・異なる allocator 間の物理領域衝突を防ぐ。raw `MGR` を暗黙に検出して
-> 1025 ページ後方へずらす従来動作を廃止し、strict な manager API と明示的な storage mode /
-> open intent を導入する。on-stable byte layout (`MGR` v1 / SQLite superblock) は変更しない。
+- [x] プロジェクト・ブランチルールと既存 transaction 経路を確認
+- [x] AST マクロと公開 export
+- [x] nested update / 通常 Db write の guard
+- [x] native / VecStableBackend のマクロテスト
+- [x] README 更新
+- [x] ./scripts/test.sh の全検証
+- [x] ブランチルールの完了条件と検証結果を更新
 
-## 最終ゴール
+調査: README は /application/README.md に存在し、ic-sqlite/README.md はない。進捗はユーザー指定の本ファイルに記録する。Nim 2.2.12 を使用。
 
-`.agent/rules/branch/13-fix-memory-management.mdc` の PR-1〜PR-4 と受け入れテスト T01〜T15 を満たす。
+検証: nim c -r --hints:off ic-sqlite/tests/test_transaction_macro.nim が成功（native 6件 / stable 6件）。rollback 時の stable 全バイト不変、再openでのcommit永続化、Result/例外rollback、Query lease失効、guard、return/hygiene、DB式1回評価を確認。
 
-- `Db.init` から暗黙の `stableBackendAfterForeignManager()` 呼び出しを除去し、渡された backend の offset 0 をそのまま SQLite superblock とする。
-- `createMemoryManagerStrict` / `openExistingMemoryManagerStrict` で create/open を分離し、非空 raw を暗黙に初期化しない。
-- `DbOpenIntent` (createOnly / openExisting / openOrCreate) と `DbStorage` (managed / exclusive / legacy) を導入し、negative case で既存 byte を変更しない。
-- 1025 ページ固定 offset を推奨 API・例から外し、explicit legacy adapter に隔離する。
-- `MGR` header / SQLite superblock の byte layout、SQL API、publish 仕様を変更しない。
-- 全 native テストが通り、IC canister の init→update→upgrade→query が成立する。
+全体検証途中: wasm32-wasip1 SQLite archive ビルド成功。test_example_canister（deploy / CRUD / upgrade）、test_db_api、test_failure_atomicity など既存テストが成功。コンパイル拒否テスト（identifierエラーの診断、async呼出元からのawait拒否）を追加。
 
-## 作業ループ
+完了（2026-10-01）:
+- ./scripts/test.sh 成功: Testament 32/32、skip 0。Wasm SQLite build とキャニスター deploy / CRUD / upgrade の統合テストを含む。
+- テスト列挙後に追加した compile reject 2ファイルも個別の Testament 実行で各1/1成功。次回 test.sh は自動的に両ファイルを含む。
+- ブランチルール第22節の全完了条件（推奨 hardening を含む）を達成し、チェックリストを更新。
+- git diff --check 成功。git add / git commit は未実行。
 
-未完了の最上位タスクを依存順に一つ選び、以下を繰り返す。
+## examples transaction 追加
 
-1. 関連実装・テスト・設計上の不変条件を読み、変更範囲と回帰リスクを記録する。
-2. PR の単位（PR-1 → PR-2 → PR-3 → PR-4）で最小のまとまりを実装する。
-3. 該当する native unit test を追加・更新して実行する。Replica が必要な試験は再現コマンドを残す。
-4. 実行コマンド・結果・未実行理由を「実行記録」に追記してからチェックする。
-5. 依存する全タスクと回帰ゲートが通るまで次段階へ進まない。
+- [x] kv_crud に putPair transaction マクロ実装と Candid を追加
+- [x] README に commit / rollback の実行例を記載
+- [x] 統合テストで commit・重複キーrollback・upgrade後永続化を確認
 
-## 実装バックログと完了ゲート
+設計: kv_crud の既存 kv 表に2行を INSERT。各操作の Result を検査し、2件目の制約違反時は body の error Result により1件目もrollbackする。DB操作は tx に限定、request解析とreplyはtransaction外。
 
-### 0. 基準固定
+examples検証完了: ic-sqliteで testament --print --megatest:off p tests/test_example_canister.nim が1/1成功（55.73秒）。実Wasmのbuild/deploy、2件commit、2件目の重複キー制約違反による1件目rollback、既存値不変、upgrade後永続化、既存CRUDを確認。git diff --check 成功。
 
-- [x] baseline: `testament --megatest:off p 'tests/test_*.nim'` → **29/30 PASS**。既知失敗は `test_example_canister.nim`（local IC network 未起動、`./scripts/test.sh` では起動される）。
-- [x] 変更対象の現状確認: `db.nim` の `sqliteStableBackend`→`stableBackendAfterForeignManager`、`memory_manager.nim` の `initMemoryManager`、`lifecycle.nim` の同一 init/post_upgrade。
+## README 使用例の統一
 
-### 1. PR-1: strict manager と安全性テスト（API 非破壊）
+- [x] Transactions 節の withUpdate callback 使用例を transaction マクロに統合
+- [x] 同一 transaction 内の read-your-writes、Result 検査、Query 失効の説明を維持
+- [x] 機能一覧を transaction マクロ表記に更新
+- [x] README 全体の withUpdate 呼出し例がないことと git diff --check を確認
 
-- [x] `createMemoryManagerStrict`: raw size 0 のみ許可、非空は書き換えず `ValueError`。
-- [x] `openExistingMemoryManagerStrict`: size 0 / 全ゼロ / 非 MGR / 破損で失敗。
-- [x] `initMemoryManager` を compat と明示、`initMemoryManagerCompat` alias 追加。
-- [x] `tests/test_memory_manager.nim`: T01/T01b/T02/T03/T04 と bucket 非交差 T10・fixture 照合 T14 を追加。
-- [x] README の allocator 所有権 / `MemoryId` 固定契約（PR-4 で実施）。
-
-### 2. PR-2: DB の明示 storage mode と init intent
-
-- [x] `DbOpenIntent` / `DbStorageMode` / `DbStorage` と `managedDbStorage` / `exclusiveDbStorage` / `legacyWasi2icDbStorage` を追加。
-- [x] `DbErrorKind` に `dekStorageMode` / `dekMissingDatabase` を追加。
-- [x] `Db.init` に `intent` を追加し、superblock 判定から実書込の前に intent を検証。
-- [x] `db.nim` の `sqliteStableBackend` を削除し、backend の論理 offset 0 をそのまま使用。
-- [x] `lifecycle.nim`: `initDatabase(storage, intent)` / `initDatabaseManaged` / `initDatabaseExclusive` を追加。`reopenDatabaseAfterUpgrade` は `doiOpenExisting`。
-- [x] `tests/test_storage_mode.nim`: T05/T06/T07/T08/T09/T13/T15。
-
-### 3. PR-3: wasi2ic 連携 / 旧配置の隔離
-
-- [x] `stableBackendAfterForeignManager` を `legacyWasi2icOffsetBackend` に改名し、旧名を deprecated alias 化。
-- [x] legacy 利用は `legacyWasi2icDbStorage` の明示 opt-in のみ。`Db.init` からの暗黙適用を撤去。
-- [x] `tests/test_memory_region.nim` を explicit legacy backend へ更新（T11）。
-
-### 4. PR-4: サンプル・ドキュメント・統合試験
-
-- [x] `README.md`: Exclusive / Managed の推奨例を分離。`120` は新規例、既存 ID 変更禁止、intent を明記。
-- [x] `examples/kv_crud/` / `examples/minimal_kv/` を explicit intent（init=createOnly / post_upgrade=openExisting）へ更新。wasi2ic 前提のため explicit legacy adapter を使用。
-- [x] 統合試験 `test_example_canister.nim` は `./scripts/test.sh`（local network 起動）で実行することを明記。
-- [x] 移行ガイド・Release note 相当（README の breaking change 節）を追加。
-
-## 受け入れテスト対応
-
-| ID | 実装/テスト |
-|---|---|
-| T01 / T01b | `test_memory_manager.nim` strict create / open |
-| T02 | `test_memory_manager.nim` 非空全ゼロを拒否・不変 |
-| T03 | `test_memory_manager.nim` 未知 magic / 破損 MGR を拒否・不変 |
-| T04 | `test_memory_manager.nim` id 255 拒否 |
-| T05 / T06 / T07 | `test_storage_mode.nim` 同一 base+ID 再開 / openExisting / 誤 id 拒否 |
-| T08 | `test_storage_mode.nim` raw MGR を Db.init に直接渡すと失敗 |
-| T09 | `test_storage_mode.nim` VirtualStableBackend を明示使用 |
-| T10 | `test_memory_manager.nim` interleaved buckets（既存拡張） |
-| T11 | `test_memory_region.nim` explicit legacy backend |
-| T12 | strict create/open が raw MGR を拒否（共有 manager を提供しない） |
-| T13 | `test_storage_mode.nim` init→update→(upgrade)→query |
-| T14 | `test_memory_manager.nim` MGR fixture 照合 |
-| T15 | `test_storage_mode.nim` 全 negative case で sentinel 不変 |
-
-## 実行記録
-
-| 日付 | 作業 | コマンド | 結果 |
-|---|---|---|---|
-| 2026-09-30 | baseline | `cd ic-sqlite && testament --megatest:off p 'tests/test_*.nim'` | 29/30 PASS（known: network 未起動） |
-| 2026-09-30 | 実装後 全 native + 統合 | `cd ic-sqlite && testament --megatest:off p 'tests/test_*.nim'` | **31/31 PASS**（local IC network 起動済み・`test_example_canister.nim` 含む） |
-| 2026-09-30 | example wasm build | `cd example && nicp developmentBuild` | 成功 |
-| 2026-09-30 | example を examples/kv_crud へ移動 | `mv ic-sqlite/example ic-sqlite/examples/kv_crud`、`example.nimble`→`kv_crud.nimble`、参照パス更新 | 移動後 `test_example_canister.nim` が **PASS** |
-| 2026-09-30 | minimal_kv wasm build | `cd examples/minimal_kv && nicp developmentBuild` | Nim コンパイル成功。candid metadata で `.did` 名不一致（既存・本改修外） |
-
-## 現在の未確定事項
-
-- wasi2ic と共通 allocator を共有する managed API は本 PR では提供しない（設計 4.2 の C: 新規採用停止）。
-- `examples/minimal_kv` の `nicp developmentBuild` は `minimal_kv.did` と `backend.did` の名前不一致で停止する。本改修とは無関係な既存サンプル設定差。
-
+ドキュメント変更のみ。既存 withUpdate API の互換性説明は維持する。
