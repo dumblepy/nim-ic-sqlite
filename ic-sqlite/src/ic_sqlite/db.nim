@@ -457,6 +457,9 @@ proc execTextRaw(db: var Db; sql: string; values: openArray[string]): Result[int
 proc exec*(db: var Db; sql: string): Result[int, DbError] =
   ## Executes a SQL statement inside the canister. For SELECT statements,
   ## SQLite evaluates the query and this returns the SQLite changes count (0).
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[int, DbError](isOk: false,
+      error: DbError(code: -1, message: "ordinary write is forbidden during withUpdate", kind: dekInvalidState))
   if db.raw.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized"))
   if sql.len == 0: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "SQL must not be empty"))
   if uint64(sql.len) > db.config.maxSqlBytes: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "SQL exceeds maxSqlBytes"))
@@ -473,6 +476,9 @@ proc exec*(db: var Db; sql: string): Result[int, DbError] =
 proc execText*(db: var Db; sql: string; values: openArray[string]): Result[int, DbError] =
   ## Executes one statement with TEXT values bound by SQLite.  This is the
   ## safe building block for canister APIs that accept caller-provided text.
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[int, DbError](isOk: false,
+      error: DbError(code: -1, message: "ordinary write is forbidden during withUpdate", kind: dekInvalidState))
   if db.raw.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized"))
   if sql.len == 0: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "SQL must not be empty"))
   if uint64(sql.len) > db.config.maxSqlBytes: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "SQL exceeds maxSqlBytes"))
@@ -494,6 +500,9 @@ proc invalidateCachedStatement(statement: var Statement)
 
 proc execValues*(db: var Db; sql: string; values: openArray[SqlValue]): Result[int, DbError] =
   ## Typed prepared execution using the same overlay/publish path as execText.
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[int, DbError](isOk: false,
+      error: DbError(code: -1, message: "ordinary write is forbidden during withUpdate", kind: dekInvalidState))
   if db.raw.isNil: return Result[int, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized", kind: dekInvalidState))
   let begun = db.beginStableOperation()
   if not begun.isOk: return Result[int, DbError](isOk: false, error: begun.error)
@@ -1070,6 +1079,9 @@ proc withUpdate*[T](db: var Db;
                    ): Result[T, DbError] =
   ## The closure is synchronous by type. Do not make inter-canister calls from
   ## it: one invocation is one SQLite transaction and one IC update message.
+  if not db.currentUpdate.isNil and db.currentUpdate.active:
+    return Result[T, DbError](isOk: false,
+      error: DbError(code: -1, message: "nested update transaction is not supported", kind: dekInvalidState))
   if db.raw.isNil:
     return Result[T, DbError](isOk: false, error: DbError(code: -1, message: "database is not initialized"))
   let begun = db.beginStableOperation()

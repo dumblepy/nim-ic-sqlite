@@ -62,11 +62,25 @@ suite "example canister integration":
     expectText(call("update", "(\"alpha\", \"second\")"), "ok")
     expectText(call("get", "(\"alpha\")", query = true), "second")
 
+    # Exercise the transaction macro in the actual Wasm canister, including
+    # a failure on the second INSERT after the first INSERT has succeeded.
+    expectText(call("putPair", "(\"pair-a\", \"first\", \"pair-b\", \"second\")"), "ok")
+    expectText(call("get", "(\"pair-a\")", query = true), "first")
+    expectText(call("get", "(\"pair-b\")", query = true), "second")
+    let rolledBack = call("putPair", "(\"rolled-back\", \"discarded\", \"pair-b\", \"replacement\")")
+    check rolledBack.contains("error: ")
+    expectText(call("get", "(\"rolled-back\")", query = true), "not_found")
+    expectText(call("get", "(\"pair-b\")", query = true), "second")
+
     ## An upgrade reopens SQLite from stable memory and reruns migrations.
     ## The migration ledger must remain idempotent and data must survive.
     discard runExample("icp deploy backend -m upgrade -y")
     expectText(call("migrationCount", "()", query = true), "2")
     expectText(call("get", "(\"alpha\")", query = true), "second")
+
+    expectText(call("get", "(\"pair-a\")", query = true), "first")
+    expectText(call("get", "(\"pair-b\")", query = true), "second")
+    expectText(call("get", "(\"rolled-back\")", query = true), "not_found")
 
     expectText(call("deleteValue", "(\"alpha\")"), "ok")
     expectText(call("get", "(\"alpha\")", query = true), "not_found")

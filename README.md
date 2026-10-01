@@ -307,6 +307,34 @@ The builder also supports `orWhere`, `whereGroup`, `whereIn`, `whereNotIn`,
 
 ## Transactions
 
+Use `transaction(database, tx):` with `import ic_sqlite` for synchronous
+transactions. It delegates to `withUpdate` and returns the body's
+`Result[T, DbError]`, including arbitrary result types.
+
+```nim
+let outcome = transaction(database, tx):
+  let inserted = tx.table("users").insert(
+    NewUser(id: 2, name: "Grace", active: true))
+  if not inserted.isOk:
+    return Result[bool, DbError](isOk: false, error: inserted.error)
+  Result[bool, DbError](isOk: true, value: true)
+```
+
+Use `tx.exec`, `tx.execText`, `tx.execValues`, or `tx.table` inside the body.
+Check operation Results explicitly: ignored errors do not automatically roll
+back. An error Result returned from the body or a `CatchableError` rolls back;
+catchable exceptions become `DbError(kind: dekInvalidState)`. A `return` exits
+only the transaction body, and execution resumes after the macro call.
+
+The body must be synchronous: do not use `await` or inter-canister calls.
+Nested transactions are unsupported and return `dekInvalidState`. Ordinary
+`Db.exec`, `Db.execText`, and `Db.execValues` (including writes through
+`database.table`) now also return `dekInvalidState` during an active update on
+both native and stable backends. This tightens the former native behavior;
+use the transaction connection instead.
+
+`withUpdate` remains available as the explicit callback API:
+
 Use `withUpdate` when several writes must commit or roll back together. A
 Query Builder created from `UpdateConnection` uses the same SQLite transaction,
 so it can read rows written earlier in that transaction.

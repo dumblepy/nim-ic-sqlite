@@ -1,0 +1,1353 @@
+---
+description: 15-transaction ブランチでの開発時に読み込む
+alwaysApply: false
+---
+
+# `nim-ic-sqlite` transaction マクロ実装方針設計書
+
+## 進捗
+
+- [x] プロジェクトルール・実装・Nim 2.2.12 の確認
+- [x] transaction マクロ、identifier 検証、公開 export
+- [x] nested update / 通常 Db.exec* の guard
+- [x] native / VecStableBackend 各6件のテスト
+- [x] README Transactions 節の更新
+- [x] ./scripts/test.sh による全体検証
+
+## 調査結果・設計まとめ
+
+- README の実際の配置は `/application/README.md`。第11・18節の `ic-sqlite/README.md` ではなく、既存の Transactions 節を更新する。
+- 進捗はユーザー指定の `/application/.agent/progress.mdc` と本ルール内で管理する。
+- Nim 2.2.12 で `auto` 戻り値の同期 closure をコンパイル・実行確認済み。`withUpdate(database, bodyProc)` を quote 内で直接束縛し、唯一の既存 transaction engine に委譲する。
+- ネスト拒否と通常 write 拒否は `currentUpdate.active` による guard とし、新たな transaction 状態は追加しない。
+- stable rollback は row/page数に加えて stable memory 全バイトの不変性と再open後の状態も検証する。commit は再open後の永続化を確認する。
+
+## 1. 目的
+
+`dumblepy/nim-ic-sqlite` に、`nim-allographer` の `transaction` マクロ／テンプレートの使い勝手を参考にした transaction 構文を追加する。
+
+ただし、`nim-ic-sqlite` では既に `Db.withUpdate` が以下を一元管理しているため、transaction マクロ自身は `BEGIN` / `COMMIT` / `ROLLBACK` を直接実行しない。
+
+- SQLite の `BEGIN IMMEDIATE`
+- heap overlay の開始・破棄・publish
+- `COMMIT` / `ROLLBACK`
+- stable memory publish
+- `TransactionLease` の生成・失効
+- statement cache の transaction 終了時 reset
+- `CatchableError` 発生時の rollback と `DbError` 化
+- commit/publish 失敗時の処理
+
+transaction マクロは **`withUpdate` の構文糖衣として実装し、既存の transaction 実行経路を一切二重化しない**。
+
+---
+
+## 2. 調査基準
+
+### 対象
+
+- `dumblepy/nim-ic-sqlite`
+  - 調査時 main: `f73ab70eb7983fcccd638dde4163502ef6ed3737`
+  - 2026-09-30
+- `dumblepy/nim-allographer`
+  - 調査時 main: `a4ef1b47f56401acc422432681dcfeee4b94c91b`
+  - 2026-04-04
+
+### 主な参照ファイル
+
+`nim-ic-sqlite`
+
+- `ic-sqlite/src/ic_sqlite.nim`
+- `ic-sqlite/src/ic_sqlite/db.nim`
+- `ic-sqlite/src/ic_sqlite/query_builder.nim`
+- `ic-sqlite/tests/test_db_api.nim`
+- `ic-sqlite/tests/test_query_transaction.nim`
+- `ic-sqlite/tests/test_failure_atomicity.nim`
+- `ic-sqlite/tests/test_query_stable.nim`
+- `.agent/rules/project.mdc`
+- `ic-sqlite/AGENTS.md`
+
+`nim-allographer`
+
+- `src/allographer/query_builder/models/sqlite/sqlite_transaction.nim`
+- `tests/sqlite/test_transaction.nim`
+- `example/transaction.nim`
+
+### 参照 URL
+
+- https://github.com/dumblepy/nim-ic-sqlite
+- https://github.com/dumblepy/nim-ic-sqlite/blob/f73ab70eb7983fcccd638dde4163502ef6ed3737/ic-sqlite/src/ic_sqlite/db.nim
+- https://github.com/dumblepy/nim-ic-sqlite/blob/f73ab70eb7983fcccd638dde4163502ef6ed3737/ic-sqlite/src/ic_sqlite/query_builder.nim
+- https://github.com/dumblepy/nim-allographer/blob/a4ef1b47f56401acc422432681dcfeee4b94c91b/src/allographer/query_builder/models/sqlite/sqlite_transaction.nim
+- https://github.com/dumblepy/nim-allographer/blob/a4ef1b47f56401acc422432681dcfeee4b94c91b/tests/sqlite/test_transaction.nim
+
+---
+
+## 3. 現状整理
+
+### 3.1 `nim-allographer` の transaction
+
+参照実装は概ね次の処理をマクロ展開している。
+
+```nim
+block:
+  rdb.begin().await
+  try:
+    callback
+    rdb.commit().await
+  except DbError, CatchableError:
+    rdb.rollback().await
+```
+
+実装上は `callback.repr` を文字列化し、indent・文字列結合後に `parseStmt()` している。
+
+特徴:
+
+- `transaction(rdb):` という簡潔な構文。
+- transaction 内でも同じ `rdb` を利用する。
+- async transaction。
+- body の例外を捕捉して rollback する。
+- transaction 状態は `SqliteConnections` 側に保持される。
+- Query Builder は transaction 中の接続を内部状態から選択する。
+
+### 3.2 `nim-ic-sqlite` の transaction
+
+`nim-ic-sqlite` では既に次の API が存在する。
+
+```nim
+proc withUpdate*[T](
+  db: var Db;
+  body: proc(conn: var UpdateConnection): Result[T, DbError] {.closure.}
+): Result[T, DbError]
+```
+
+概略フロー:
+
+```text
+Db.withUpdate
+  |
+  +-- beginStableOperation()
+  |     +-- stable backend の場合 beginOverlay()
+  |
+  +-- BEGIN IMMEDIATE
+  |
+  +-- TransactionLease(active = true)
+  |
+  +-- UpdateConnection(db, lease)
+  |
+  +-- body(conn)
+  |     |
+  |     +-- Result error ----> ROLLBACK
+  |     |
+  |     +-- CatchableError --> ROLLBACK -> DbError
+  |
+  +-- COMMIT
+  |
+  +-- finishStableOperation(publish = true)
+  |     +-- overlay publish
+  |     +-- lastTxId 更新
+  |     +-- superblock 永続化
+  |
+  +-- lease 無効化
+```
+
+したがって transaction マクロが `BEGIN` / `COMMIT` / `ROLLBACK` を再実装すると、stable-memory overlay と SQLite transaction のライフサイクルが分離し、設計上の不整合を起こす。
+
+---
+
+## 4. 設計原則
+
+### TXM-001: `withUpdate` を唯一の transaction engine とする
+
+transaction マクロは必ず `Db.withUpdate` に展開する。
+
+**MUST NOT**
+
+```nim
+db.exec("BEGIN")
+...
+db.exec("COMMIT")
+```
+
+のような独自 transaction 制御を行わない。
+
+理由:
+
+- `beginStableOperation()` / `finishStableOperation()` を迂回してはいけない。
+- stable memory publish は SQLite COMMIT 後にのみ実行される必要がある。
+- irreversible publish failure の `ic0_trap` 処理を維持する必要がある。
+- `TransactionLease` と statement cache の終了処理を維持する必要がある。
+
+### TXM-002: transaction 用 connection を明示する
+
+推奨 public API:
+
+```nim
+transaction(db, tx):
+  ...
+```
+
+body 内の DB 操作には `tx: var UpdateConnection` を使用する。
+
+```nim
+transaction(db, tx):
+  let inserted = tx.table("users").insert(user)
+  ...
+```
+
+`nim-allographer` と同じ次の形は MVP では採用しない。
+
+```nim
+transaction(db):
+  db.table("users").insert(user)
+```
+
+理由は `nim-ic-sqlite` の Query Builder が transaction scope を `TransactionLease` で明示的に保持する設計だからである。
+
+```nim
+proc table*(conn: var UpdateConnection; name: string; alias = ""): Query =
+  Query(
+    owner: conn.ownerDb(),
+    updateScope: conn.transactionLease(),
+    ...
+  )
+```
+
+`Db.table()` から生成した `Query` には `updateScope` が設定されない。
+
+transaction 用 connection を明示することで、通常 DB 操作と transaction-scoped 操作を型レベル／API レベルで区別する。
+
+### TXM-003: body は同期処理とする
+
+transaction body は `withUpdate` と同じく同期 proc とする。
+
+```nim
+transaction(db, tx):
+  ...
+```
+
+の展開先は同期 closure であり、`await` を許可しない。
+
+これはプロジェクトルール `NISQL-TXN-004` と一致する。
+
+IC update message 内で transaction を開始した後に inter-canister call を行い、await をまたいで transaction を保持する設計は採用しない。
+
+### TXM-004: `Result[T, DbError]` の意味を維持する
+
+transaction マクロは `withUpdate` の戻り値をそのまま返す。
+
+```nim
+Result[T, DbError]
+```
+
+成功:
+
+```nim
+Result[T, DbError](isOk: true, value: ...)
+```
+
+失敗:
+
+```nim
+Result[T, DbError](isOk: false, error: ...)
+```
+
+body が error Result を返した場合は rollback される。
+
+### TXM-005: 例外処理をマクロ側で重複実装しない
+
+マクロ自身に `try` / `except` は生成しない。
+
+`withUpdate` が既に `CatchableError` を捕捉し、
+
+```nim
+DbError(
+  code: -1,
+  message: error.msg,
+  kind: dekInvalidState
+)
+```
+
+として返す。
+
+transaction マクロはこの意味論を変更しない。
+
+### TXM-006: AST を直接生成する
+
+`nim-allographer` のような
+
+```nim
+callback.repr
+parseStmt(...)
+```
+
+方式は採用しない。
+
+`std/macros` の `quote do` と `genSym` を使用して AST を直接生成する。
+
+理由:
+
+- ソースコードを文字列化して再 parse する必要がない。
+- indentation に依存しない。
+- コメント・literal・複雑な AST に対して壊れにくい。
+- hygiene を管理しやすい。
+- Nim 2.x を主対象とする現行プロジェクトに適している。
+
+---
+
+## 5. 提案 API
+
+### 5.1 基本形
+
+```nim
+let outcome = transaction(db, tx):
+  let inserted = tx.execText(
+    "INSERT INTO users(id, name) VALUES (?, ?)",
+    ["1", "Ada"]
+  )
+
+  if not inserted.isOk:
+    return Result[bool, DbError](
+      isOk: false,
+      error: inserted.error
+    )
+
+  Result[bool, DbError](
+    isOk: true,
+    value: true
+  )
+```
+
+### 5.2 Query Builder
+
+```nim
+let outcome = transaction(db, tx):
+  let inserted = tx
+    .table("users")
+    .insert(NewUser(id: 1, name: "Ada"))
+
+  if not inserted.isOk:
+    return Result[bool, DbError](
+      isOk: false,
+      error: inserted.error
+    )
+
+  let visible = tx
+    .table("users")
+    .where("id", "=", 1)
+    .first(User)
+
+  if not visible.isOk:
+    return Result[bool, DbError](
+      isOk: false,
+      error: visible.error
+    )
+
+  Result[bool, DbError](
+    isOk: true,
+    value: visible.value.isSome
+  )
+```
+
+### 5.3 任意型の値を返す
+
+`withUpdate[T]` の generic 性を失わないことを推奨する。
+
+```nim
+let outcome = transaction(db, tx):
+  let row = tx.table("users").find(1'i64, User)
+
+  if not row.isOk:
+    return Result[Option[User], DbError](
+      isOk: false,
+      error: row.error
+    )
+
+  Result[Option[User], DbError](
+    isOk: true,
+    value: row.value
+  )
+```
+
+transaction マクロを `Result[bool, DbError]` 固定にすると、既存の `withUpdate[T]` より表現力が下がるため避ける。
+
+---
+
+## 6. マクロ展開方針
+
+### 6.1 概念コード
+
+実装イメージ:
+
+```nim
+import std/macros
+import ./db
+
+macro transaction*(db: typed; tx: untyped; body: untyped): untyped =
+  if tx.kind != nnkIdent:
+    error("transaction connection must be an identifier", tx)
+
+  let bodyProc = genSym(nskProc, "transactionBody")
+
+  result = quote do:
+    block:
+      proc `bodyProc`(`tx`: var UpdateConnection): auto {.closure.} =
+        `body`
+
+      `db`.withUpdate(`bodyProc`)
+```
+
+これは設計用のコードスケッチであり、実装時には Nim 2.2.12 で macro 展開・`auto` return type・closure calling convention をコンパイル確認する。
+
+### 6.2 期待される展開
+
+入力:
+
+```nim
+transaction(database, tx):
+  Result[bool, DbError](isOk: true, value: true)
+```
+
+概念上:
+
+```nim
+block:
+  proc transactionBody(
+    tx: var UpdateConnection
+  ): Result[bool, DbError] {.closure.} =
+    Result[bool, DbError](isOk: true, value: true)
+
+  database.withUpdate(transactionBody)
+```
+
+### 6.3 `return` の意味
+
+body は生成された closure の中に入るため、
+
+```nim
+return Result[bool, DbError](...)
+```
+
+は **transaction body から return** する。
+
+呼び出し元 proc から return するわけではない。
+
+この点は README と API doc に明示する。
+
+---
+
+## 7. Allographer 方式をそのまま採用しない理由
+
+### 7.1 transaction 状態の持ち方が異なる
+
+Allographer:
+
+```text
+SqliteConnections
+  |
+  +-- isInTransaction
+  +-- transactionConn
+```
+
+同じ `rdb` オブジェクトから Query を生成しても、内部状態を見て transaction connection が選択される。
+
+`nim-ic-sqlite`:
+
+```text
+Db
+ |
+ +-- normal Query
+
+UpdateConnection
+ |
+ +-- TransactionLease
+ |
+ +-- transaction-scoped Query
+```
+
+transaction scope が明示的な別型である。
+
+したがって API もこの型分離を維持する。
+
+### 7.2 async モデルが異なる
+
+Allographer:
+
+```nim
+rdb.begin().await
+...
+rdb.commit().await
+```
+
+`nim-ic-sqlite`:
+
+```nim
+withUpdate(proc(conn: var UpdateConnection): Result[T, DbError] = ...)
+```
+
+同期 transaction が設計要件である。
+
+### 7.3 stable memory publish が存在する
+
+Allographer の SQLite transaction は通常の DB connection transaction である。
+
+`nim-ic-sqlite` はさらに
+
+```text
+SQLite COMMIT
+    ↓
+heap overlay publish
+    ↓
+stable memory
+    ↓
+superblock update
+```
+
+という durability protocol を持つ。
+
+transaction マクロが SQL transaction だけを操作してはいけない。
+
+---
+
+## 8. エラー・rollback 仕様
+
+### 8.1 body が error Result を返す
+
+```nim
+Result[T, DbError](isOk: false, error: err)
+```
+
+結果:
+
+1. `ROLLBACK`
+2. stable overlay discard
+3. transaction lease invalidation
+4. 同じ error Result を transaction 呼び出し元へ返す
+
+### 8.2 body が `CatchableError` を raise
+
+結果:
+
+1. `ROLLBACK`
+2. stable overlay discard
+3. `DbError(kind = dekInvalidState)` に変換
+4. transaction 呼び出し元へ error Result を返す
+
+マクロ側で再 raise はしない。
+
+### 8.3 `COMMIT` が失敗
+
+既存 `withUpdate` の処理を利用する。
+
+1. `COMMIT` error
+2. `ROLLBACK` を試行
+3. overlay discard
+4. commit error を返す
+
+### 8.4 stable publish 中の不可逆エラー
+
+既存 `finishStableOperation()` の設計を維持する。
+
+publish 開始後に rollback 不能な failure が発生した場合は `trapPublishFailure()` を経由し、IC message rollback に委ねる。
+
+マクロ側では捕捉しない。
+
+---
+
+## 9. ネスト transaction
+
+### 9.1 MVP では非対応
+
+以下はサポートしない。
+
+```nim
+transaction(db, outerTx):
+  transaction(db, innerTx):
+    ...
+```
+
+SAVEPOINT を利用した nested transaction は今回のスコープ外とする。
+
+### 9.2 現状の挙動
+
+stable backend:
+
+- outer transaction で overlay が active。
+- inner `withUpdate` の `beginStableOperation()` が
+  `"a stable database operation is already active"` で失敗する。
+
+native `:memory:`:
+
+- stable overlay がない。
+- inner `BEGIN IMMEDIATE` が SQLite の nested BEGIN として失敗する。
+
+つまり現状でも実質的に nested transaction は拒否されるが、backend によりエラー発生位置が異なる。
+
+### 9.3 推奨 hardening
+
+`withUpdate` 冒頭に明示的な guard を追加することを推奨する。
+
+概念:
+
+```nim
+if not db.currentUpdate.isNil and db.currentUpdate.active:
+  return Result[T, DbError](
+    isOk: false,
+    error: DbError(
+      code: -1,
+      message: "nested update transaction is not supported",
+      kind: dekInvalidState
+    )
+  )
+```
+
+これにより native / stable backend の挙動を統一できる。
+
+これは transaction マクロ自体の必須条件ではないが、同一変更で入れる価値が高い。
+
+---
+
+## 10. transaction 内で `Db` を直接使用する問題
+
+### 10.1 問題
+
+次のコードは推奨しない。
+
+```nim
+transaction(db, tx):
+  discard db.table("users").insert(user)
+  ...
+```
+
+`db.table()` から生成された Query は `TransactionLease` を持たない。
+
+さらに現状の direct write API:
+
+- `Db.exec`
+- `Db.execText`
+- `Db.execValues`
+
+は stable backend では active overlay によって拒否されるが、native `:memory:` backend では `beginStableOperation()` が no-op のため、既存 SQLite transaction の中で偶然成功する可能性がある。
+
+この結果、
+
+```text
+native test では成功
+stable backend では失敗
+```
+
+という不整合が起こり得る。
+
+### 10.2 API ルール
+
+transaction body 内の DB 操作は原則として `tx` を使用する。
+
+```nim
+transaction(db, tx):
+  tx.exec(...)
+  tx.execText(...)
+  tx.execValues(...)
+  tx.table(...)
+```
+
+### 10.3 推奨 hardening
+
+同一変更で、通常 `Db` write API に active update guard を追加することを推奨する。
+
+対象:
+
+```nim
+Db.exec
+Db.execText
+Db.execValues
+```
+
+active `currentUpdate` がある場合:
+
+```nim
+DbError(
+  code: -1,
+  message: "ordinary write is forbidden during withUpdate",
+  kind: dekInvalidState
+)
+```
+
+を返す。
+
+これにより Query Builder の
+
+```nim
+db.table(...).insert(...)
+```
+
+も `executeWrite -> Db.execValues` を経由して一貫して拒否できる。
+
+`withQuery` は既に active `withUpdate` 中の通常 query を拒否しているため、この hardening と整合する。
+
+---
+
+## 11. 変更ファイル案
+
+### 必須
+
+```text
+ic-sqlite/
+├── src/
+│   ├── ic_sqlite.nim
+│   └── ic_sqlite/
+│       └── transaction.nim        # 新規
+└── tests/
+    └── test_transaction_macro.nim # 新規
+```
+
+### `src/ic_sqlite/transaction.nim`
+
+責務:
+
+- `transaction*` macro のみを定義。
+- `std/macros` と `./db` のみに依存。
+- transaction runtime logic は持たない。
+
+### `src/ic_sqlite.nim`
+
+追加:
+
+```nim
+import ic_sqlite/transaction
+export transaction
+```
+
+公開 API の正規入口を `import ic_sqlite` のまま維持する。
+
+### `tests/test_transaction_macro.nim`
+
+macro 固有の構文・展開・rollback/commit を検証する。
+
+### 推奨追加変更
+
+```text
+ic-sqlite/src/ic_sqlite/db.nim
+```
+
+- nested `withUpdate` の明示 guard。
+- active update 中の direct `Db.exec*` guard。
+
+---
+
+## 12. テスト設計
+
+### T01: macro で commit できる
+
+```nim
+let result = transaction(db, tx):
+  let inserted = tx.execText(...)
+  if not inserted.isOk:
+    return Result[bool, DbError](isOk: false, error: inserted.error)
+  Result[bool, DbError](isOk: true, value: true)
+
+check result.isOk
+```
+
+transaction 後に row が存在すること。
+
+### T02: error Result で rollback
+
+transaction 内で INSERT 後、
+
+```nim
+Result[bool, DbError](
+  isOk: false,
+  error: DbError(message: "rollback")
+)
+```
+
+を返す。
+
+transaction 後に INSERT row が存在しないこと。
+
+### T03: `CatchableError` で rollback
+
+transaction 内:
+
+```nim
+raise newException(ValueError, "intentional")
+```
+
+期待:
+
+- transaction result は `isOk == false`
+- `error.kind == dekInvalidState`
+- INSERT row は存在しない
+
+### T04: transaction 内 read-your-writes
+
+```nim
+transaction(db, tx):
+  tx.table(...).insert(...)
+  tx.table(...).first(...)
+```
+
+commit 前に同じ transaction から row が見えること。
+
+### T05: transaction から返した Query は失効する
+
+既存 `test_query_transaction.nim` と同じく transaction 中に作った Query を外へ保持し、transaction 終了後:
+
+```nim
+stale.first(...)
+stale.delete()
+```
+
+が `dekInvalidState` になること。
+
+### T06: generic return value
+
+```nim
+let result = transaction(db, tx):
+  Result[int64, DbError](isOk: true, value: 42)
+```
+
+期待:
+
+```nim
+result.isOk
+result.value == 42
+```
+
+これにより transaction macro が `withUpdate[T]` の generic 性を維持していることを確認する。
+
+### T07: tx 引数は identifier のみ
+
+以下を compile-time error にする。
+
+```nim
+transaction(db, tx.field):
+  ...
+```
+
+エラーメッセージ:
+
+```text
+transaction connection must be an identifier
+```
+
+### T08: nested transaction 拒否
+
+hardening を入れる場合:
+
+```nim
+transaction(db, outerTx):
+  let nested = transaction(db, innerTx):
+    ...
+```
+
+nested result:
+
+```nim
+not nested.isOk
+nested.error.kind == dekInvalidState
+```
+
+### T09: stable backend で rollback
+
+`newVecStableBackend()` を使用する。
+
+既存 `test_failure_atomicity.nim` と同じ観点で、
+
+- row が rollback される
+- stable backend の page 数が rollback 前後で変化しない
+
+ことを確認する。
+
+### T10: stable backend で commit
+
+`newVecStableBackend()` を使用し transaction commit 後に DB を close/reopen。
+
+row が再 open 後も存在すること。
+
+### T11: direct Db write guard
+
+hardening を入れる場合:
+
+```nim
+transaction(db, tx):
+  let invalid = db.execText(...)
+  check not invalid.isOk
+  check invalid.error.kind == dekInvalidState
+  Result[bool, DbError](isOk: true, value: true)
+```
+
+native / stable の双方で同じ結果になること。
+
+---
+
+## 13. native / stable のテスト範囲
+
+transaction macro は少なくとも 2 系統で確認する。
+
+### native `initMemoryForTest`
+
+目的:
+
+- macro syntax
+- compile-time expansion
+- generic return
+- Query Builder API
+- exception / Result rollback
+- lease invalidation
+
+### `VecStableBackend`
+
+目的:
+
+- overlay 開始
+- rollback 時 overlay discard
+- commit 時 publish
+- close / reopen 後の durability
+- nested operation guard
+- direct `Db` write guard
+
+macro の correctness を native test のみで判断しない。
+
+---
+
+## 14. async について
+
+### 方針
+
+async transaction は実装しない。
+
+以下は対象外:
+
+```nim
+transaction(db, tx):
+  let remote = await someCanisterCall()
+  ...
+```
+
+理由:
+
+- `withUpdate` body が同期 closure として定義されている。
+- project rule `NISQL-TXN-004` が transaction 中の `await` / inter-canister call を禁止している。
+- update message の中断点をまたいで heap overlay と SQLite transaction を保持しないことが durability 設計上重要。
+
+macro 側で文字列ベースの `await` 検出は実装しない。
+
+生成される同期 proc の型チェックに任せる。
+
+---
+
+## 15. Query Builder との関係
+
+`UpdateConnection.table()` は transaction lease を Query に埋め込む。
+
+```text
+transaction
+    |
+    +-- UpdateConnection
+           |
+           +-- transactionLease
+                  |
+                  +-- Query.updateScope
+```
+
+SELECT:
+
+```text
+Query.get/first
+  |
+  +-- updateScope != nil
+         |
+         +-- withUpdateQueryRead()
+                |
+                +-- write connection を borrowed read として使用
+```
+
+WRITE:
+
+```text
+Query.insert/update/delete
+  |
+  +-- executeWrite()
+         |
+         +-- updateScope != nil
+                |
+                +-- execValuesInTransaction()
+```
+
+そのため transaction macro から Query Builder を使用するときは必ず `tx.table(...)` を起点とする。
+
+---
+
+## 16. statement cache との関係
+
+`withUpdate` は transaction 終了時に:
+
+```nim
+db.resetCachedUpdateStatements()
+```
+
+を実行し、その後 lease を inactive にする。
+
+transaction macro はこの処理を変更しない。
+
+macro 内で独自の `defer` や statement finalize 処理は追加しない。
+
+transaction 外へ漏れた cached statement / Query の安全性は既存 `TransactionLease` に委ねる。
+
+---
+
+## 17. 公開 API と互換性
+
+### 17.1 既存 API
+
+既存:
+
+```nim
+db.withUpdate(...)
+```
+
+は削除・非推奨化しない。
+
+transaction macro は追加 API とする。
+
+### 17.2 推奨の位置付け
+
+低レベル／明示 API:
+
+```nim
+db.withUpdate(...)
+```
+
+高レベル／構文糖衣:
+
+```nim
+transaction(db, tx):
+  ...
+```
+
+両者は同一 runtime semantics を持つ。
+
+### 17.3 semver
+
+`transaction` macro の追加だけなら additive change。
+
+ただし direct `Db.exec*` の active transaction guard を同時導入する場合、これまで native backend 上で偶然動いていた misuse を拒否するため、behavioral tightening として CHANGELOG/README に記載する。
+
+---
+
+## 18. 実装手順
+
+### Step 1: macro module を追加
+
+作成:
+
+```text
+src/ic_sqlite/transaction.nim
+```
+
+内容:
+
+- `import std/macros`
+- `import ./db`
+- `macro transaction*`
+
+### Step 2: AST validation
+
+最低限:
+
+- `tx` が identifier であること。
+- エラー時は `macros.error()` で利用箇所を指すこと。
+
+MVP では body 内容を解析して SQL API や `await` を判定しない。
+
+### Step 3: `withUpdate` closure を生成
+
+`genSym` で衝突しない内部 proc symbol を作る。
+
+body の戻り値から `Result[T, DbError]` を推論させる。
+
+### Step 4: public export
+
+`src/ic_sqlite.nim`:
+
+```nim
+import ic_sqlite/transaction
+export transaction
+```
+
+### Step 5: macro tests
+
+`tests/test_transaction_macro.nim` を追加。
+
+まず native tests で T01-T08。
+
+### Step 6: stable tests
+
+`VecStableBackend` で T09-T10。
+
+### Step 7: safety hardening
+
+推奨:
+
+- nested `withUpdate` guard
+- direct `Db.exec*` guard
+
+追加後に T08/T11 を native/stable 双方で確認。
+
+### Step 8: README 更新
+
+現在の `## Transactions` に macro 例を追加する。
+
+`withUpdate` は詳細 API として残す。
+
+### Step 9: full test
+
+既存のプロジェクト手順:
+
+```sh
+./scripts/test.sh
+```
+
+を実行し、native Testament + wasm build + integration test に regression がないことを確認する。
+
+---
+
+## 19. 実装時の注意点
+
+### 19.1 macro hygiene
+
+内部変数名を固定文字列にしない。
+
+NG:
+
+```nim
+proc transactionBody(...)
+```
+
+をそのまま AST に埋める。
+
+OK:
+
+```nim
+let bodyProc = genSym(nskProc, "transactionBody")
+```
+
+### 19.2 DB expression の評価回数
+
+`db` 式を複数回展開しない。
+
+例えば将来:
+
+```nim
+transaction(getDatabase(), tx):
+```
+
+のような式を許可する場合に副作用が重複しない設計にする。
+
+ただし `withUpdate` が `var Db` を要求するため、実運用では mutable lvalue を基本とする。
+
+### 19.3 body を文字列化しない
+
+以下は使用しない。
+
+- `.repr`
+- `strformat`
+- `indent`
+- `parseStmt`
+
+### 19.4 `except:` を追加しない
+
+`Defect` を含むあらゆる exception を macro で捕捉しない。
+
+runtime exception policy は `withUpdate` に一元化する。
+
+### 19.5 hidden transaction state を増やさない
+
+macro のために `Db` へ新しい `isInTransaction` boolean を追加しない。
+
+既存の `currentUpdate: TransactionLease` が transaction state の source of truth である。
+
+---
+
+## 20. 採用しない案
+
+### A. Allographer のコードをほぼコピー
+
+```nim
+db.begin()
+try:
+  body
+  db.commit()
+except:
+  db.rollback()
+```
+
+**不採用。**
+
+stable overlay protocol を迂回する。
+
+### B. callback を `.repr` して `parseStmt`
+
+**不採用。**
+
+AST を直接扱えるため不要。
+
+### C. `transaction(db): db.table(...)`
+
+**MVP では不採用。**
+
+`Db` と `UpdateConnection` の型分離を壊すか、body AST の危険な identifier rewrite が必要になる。
+
+### D. macro が DB Result を自動 unwrap
+
+例:
+
+```nim
+transaction(db, tx):
+  tx.table(...).insert(...)
+  tx.table(...).update(...)
+```
+
+を自動的に「どれかが error なら rollback」にする方式。
+
+**MVP では不採用。**
+
+理由:
+
+- どの expression を transaction operation とみなすか曖昧。
+- `Result` を意図的に検査して継続するコードを壊す。
+- AST rewrite が複雑になる。
+- runtime semantics が source code から見えにくくなる。
+
+### E. nested transaction を SAVEPOINT に変換
+
+**今回対象外。**
+
+stable overlay が transaction 単位で 1 個という現設計との整合を別途検討する必要がある。
+
+---
+
+## 21. 将来拡張
+
+MVP 完了後に必要であれば以下を別設計で検討する。
+
+### 21.1 Result propagation helper
+
+例えば:
+
+```nim
+transaction(db, tx):
+  txTry tx.table(...).insert(...)
+  txTry tx.table(...).update(...)
+  ok(true)
+```
+
+のような helper。
+
+transaction macro 本体とは分離する。
+
+### 21.2 SAVEPOINT
+
+SQLite nested transaction 相当が必要な場合:
+
+```sql
+SAVEPOINT ...
+ROLLBACK TO ...
+RELEASE ...
+```
+
+を検討する。
+
+ただし outermost transaction の stable overlay は 1 個のままとし、SAVEPOINT は SQLite logical transaction 内だけで完結させる必要がある。
+
+### 21.3 transaction mode
+
+将来的に必要なら:
+
+```nim
+transaction(db, tx, mode = Immediate):
+```
+
+のような API を検討できる。
+
+現時点では `withUpdate` の `BEGIN IMMEDIATE` を固定で維持する。
+
+---
+
+## 22. 完了条件
+
+以下をすべて満たした時点で transaction macro 実装を完了とする。
+
+- [x] `transaction(db, tx):` が `import ic_sqlite` のみで利用できる。
+- [x] transaction macro は `Db.withUpdate` のみを呼び出し、SQL transaction を直接制御しない。
+- [x] `Result[T, DbError]` の generic return が維持される。
+- [x] success 時に commit される。
+- [x] error Result 時に rollback される。
+- [x] `CatchableError` 時に rollback される。
+- [x] transaction 中の Query Builder read-your-writes が動作する。
+- [x] transaction 終了後の escaped Query が `dekInvalidState` になる。
+- [x] native backend の tests が通る。
+- [x] `VecStableBackend` の commit/rollback tests が通る。
+- [x] existing `withUpdate` tests が regression なしで通る。
+- [x] `./scripts/test.sh` が通る。
+- [x] README の Transactions 節に macro の利用例と同期 transaction 制約が記載される。
+
+推奨 hardening を同一変更に含める場合:
+
+- [x] nested transaction が native/stable の双方で `dekInvalidState` になる。
+- [x] active transaction 中の direct `Db.exec*` が native/stable の双方で拒否される。
+
+---
+
+### 最終検証結果（2026-10-01）
+
+- `./scripts/test.sh` 成功、Testament 32/32、skip 0。Wasm SQLite ビルドとキャニスター deploy / CRUD / upgrade 統合テストを含む。
+- 同スクリプトのテスト列挙開始後に追加した `test_transaction_async.nim` と `test_transaction_identifier.nim` は、それぞれ `testament --print --megatest:off p tests/<filename>` で別途成功（各1/1）。両ファイルは今後の `./scripts/test.sh` でも自動列挙される。
+- `test_transaction_macro.nim` は native 6件、stable 6件が成功。既存 withUpdate / Query Builder / statement cache のテストにも回帰なし。
+- `git diff --check` 成功。`git add` / `git commit` は実行しない。
+
+## 23. 結論
+
+実装の中心方針は次の通り。
+
+```text
+Allographer から借りるもの
+  = transaction(...): という利用体験
+
+Allographer から借りないもの
+  = begin/commit/rollback の直接展開
+  = async/await
+  = callback.repr + parseStmt
+  = 同一 DB object に transaction state を隠蔽する方式
+
+nim-ic-sqlite で維持するもの
+  = withUpdate
+  = UpdateConnection
+  = TransactionLease
+  = stable overlay
+  = Result[T, DbError]
+```
+
+したがって最小かつ安全な実装は、
+
+```nim
+transaction(db, tx):
+  # tx: var UpdateConnection
+  ...
+  Result[T, DbError](...)
+```
+
+を compile-time AST で `db.withUpdate(...)` に変換する薄い macro とする。
+
+transaction の correctness は macro ではなく、既存 `withUpdate` を唯一の runtime transaction engine とすることで保証する。
+
+## 24. examples への追加実装
+
+ユーザーの追加依頼により `examples/kv_crud` に `putPair(key1, value1, key2, value2)` を追加する。
+既存 kv 表に2行を同期 transaction で INSERT し、各 Result を検査する。キーは両方とも新規であることを要求し、2件目の重複キー制約違反を error Result として返して全体をrollbackする。リクエストの解析と reply は body の外に置く。
+README に成功例と2件目が失敗する例を記載し、既存キャニスター統合テストで双方の結果とupgrade後の永続化を検証する。
+
+- [x] putPair実装 / Candid / README
+- [x] キャニスター統合テスト成功
+
+検証: `testament --print --megatest:off p tests/test_example_canister.nim` が1/1成功（55.73秒）。実Wasm上でcommit、2件目失敗時のrollbackと既存値不変、upgrade後の永続化を確認。
