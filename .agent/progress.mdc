@@ -76,3 +76,20 @@ nimble install https://github.com/dumblepy/nim-ic-sqlite@#17-fix-dir
 - クリーンな新規利用者でも指定コマンドを成功させるには、上記 `.nimble` の修正を
   `17-fix-dir` ブランチへコミット・プッシュする必要がある。
   検証時点のリモート `17-fix-dir` (b371305) は修正前の registry 依存のまま。
+
+### 修正プッシュ後の再検証（00721132）
+
+- リモート `17-fix-dir` が `00721132`（Git URL 依存版）へ更新された。
+- クリーンな `NIMBLE_DIR` で指定コマンドを実行し **`EXIT=0`**。
+  `Fetching https://github.com/dumblepy/nim-ic-sqlite (#17-fix-dir) using git`
+  が記録され、`nicp_cdk` も Git URL から解決された。
+- インストール結果: `ic_sqlite-0.1.0`, `nicp_cdk-0.1.0`, `rustcrypto`, `cligen`,
+  `illwill`, `base32`。`bin` は `nicp`/`ndfx` のみで `ic_sqlite` 実行ファイルなし。
+- 別ディレクトリから `import ic_sqlite; echo IcSqliteVersion` を実行し `0.1.0` を確認。
+
+### 注意: pkgcache のキャッシュ
+
+Nimble は Git URL＋ブランチ単位で `/root/.nimble/pkgcache/<url>_<ref>` を再利用し、
+ブランチが更新されても自動再取得しない場合がある。検証中、修正前 (`b371305`) の
+キャッシュが残っていて最初は古い依存のまま失敗した。キャッシュ削除後に再取得され
+成功した。ブランチを上書きした直後に検証する場合はキャッシュに注意する。
