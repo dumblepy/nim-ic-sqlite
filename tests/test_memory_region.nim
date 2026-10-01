@@ -1,74 +1,52 @@
-import std/unittest
+## Coexistence test (design 19-use-nicp_cdk-memory-management, task T4).
+##
+## A single `MemoryManager` hosts an application-owned sentinel structure in one
+## `MemoryId` and SQLite in another. Updating SQLite must never touch the other
+## `MemoryId`'s bytes or its allocation.
+import std/[options, unittest]
+import nicp_cdk/storage/memory_manager
 import ic_sqlite
-import ic_sqlite/stable/backend
 
-# `ic-stable-structures` MemoryManager 0.7 layout. This fixture owns the
-# first physical bucket (pages 1..128) through MemoryId 7. It is deliberately
-# a complete, reloadable MGR image rather than only a three-byte magic prefix.
-const
-  MgrHeaderSize = 2080
-  MgrAllocationTableSize = 32768
-  MgrBucketSizePages = 128'u64
-  MgrOwnerId = 7'u8
-  MgrUnallocated = 255'u8
-  MgrMemorySizesOffset = 40
+suite "MemoryManager coexistence":
+  test "SQLite update leaves another MemoryId untouched":
+    let raw = newVecStableBackend()
+    var manager = createMemoryManagerStrict(raw)
 
-proc putLe64(bytes: var openArray[byte]; offset: int; value: uint64) =
-  for index in 0 ..< 8:
-    bytes[offset + index] = byte((value shr (index * 8)) and 0xff)
+    const Sentinels = [byte 0xA5, 0x5A, 0x19, 0xE7, 0x00, 0xFF, 0x42, 0x24]
+    const SentinelMemory = 7'u8
+    const SqliteMemory = 8'u8
 
-proc writeValidMgrFixture(raw: StableBackend) =
-  # Header page plus one 128-page bucket is the minimum valid backing size.
-  check raw.grow(1 + MgrBucketSizePages)
-  var header = newSeq[byte](MgrHeaderSize)
-  header[0 .. 2] = [byte('M'), byte('G'), byte('R')]
-  header[3] = 1 # layout version
-  header[4] = 1 # one allocated bucket, little endian u16
-  header[6] = byte(MgrBucketSizePages) # bucket size, little endian u16
-  header.putLe64(MgrMemorySizesOffset + int(MgrOwnerId) * 8, 1)
-  raw.write(0, unsafeAddr header[0], uint64(header.len))
-
-  var allocations = newSeq[byte](MgrAllocationTableSize)
-  for index in 0 ..< allocations.len: allocations[index] = MgrUnallocated
-  allocations[0] = MgrOwnerId
-  raw.write(uint64(MgrHeaderSize), unsafeAddr allocations[0], uint64(allocations.len))
-
-proc checkValidMgrFixture(raw: StableBackend) =
-  check raw.sizePages >= 1 + MgrBucketSizePages
-  var header = newSeq[byte](MgrHeaderSize)
-  raw.read(0, addr header[0], uint64(header.len))
-  check header[0 .. 2] == [byte('M'), byte('G'), byte('R')]
-  check header[3] == 1
-  check header[4] == 1 and header[5] == 0
-  check header[6] == byte(MgrBucketSizePages) and header[7] == 0
-  check header[MgrMemorySizesOffset + int(MgrOwnerId) * 8] == 1
-  var allocations = newSeq[byte](MgrAllocationTableSize)
-  raw.read(uint64(MgrHeaderSize), addr allocations[0], uint64(allocations.len))
-  check allocations[0] == MgrOwnerId
-  for index in 1 ..< allocations.len: check allocations[index] == MgrUnallocated
-
-suite "MemoryManager stable-memory isolation":
-  test "SQLite preserves a valid MGR owner's bucket":
-    let raw: StableBackend = newVecStableBackend()
-    raw.writeValidMgrFixture()
-    raw.checkValidMgrFixture()
-
-    # Physical page 1 is bucket 0's payload. The explicit legacy adapter gives
-    # SQLite a view starting at page 1025; `Db.init` itself never applies this
-    # offset implicitly anymore.
-    let sentinel = [byte 0xA5, 0x5A, 0x19, 0xE7]
-    raw.write(StablePageSize, unsafeAddr sentinel[0], uint64(sentinel.len))
+    let sentinel = manager.getMemory(newMemoryId(SentinelMemory))
+    check sentinel.grow(1)
+    sentinel.write(0, unsafeAddr Sentinels[0], uint64(Sentinels.len))
+    let sentinelPagesBefore = sentinel.sizePages
+    let allocatedBefore = manager.allocatedBucketCount
 
     var database: Db
-    check database.init(legacyWasi2icOffsetBackend(raw)).isOk
-    check database.exec("CREATE TABLE isolated (key TEXT PRIMARY KEY, value TEXT)").isOk
-    check database.execText("INSERT INTO isolated(key, value) VALUES (?, ?)", ["a", "b"]).isOk
+    check database.initDatabaseManaged(manager, newMemoryId(SqliteMemory),
+      [Migration(version: 1,
+        sql: "CREATE TABLE isolated (key TEXT PRIMARY KEY, value TEXT)")],
+      doiCreateOnly).isOk
+    check database.execText("INSERT INTO isolated(key, value) VALUES (?, ?)",
+      ["a", "b"]).isOk
     database.close()
 
-    # SQLite growth crossed the reserved 1025-page prefix without changing
-    # either the MGR metadata or the independently owned bucket.
-    check raw.sizePages > 1025
-    raw.checkValidMgrFixture()
-    var after: array[4, byte]
-    raw.read(StablePageSize, addr after[0], uint64(after.len))
-    check after == sentinel
+    # SQLite allocated its own bucket(s) without disturbing the sentinel memory.
+    check manager.allocatedBucketCount >= allocatedBefore
+    check manager.memorySizePages(newMemoryId(SentinelMemory)) == sentinelPagesBefore
+    var after: array[Sentinels.len, byte]
+    sentinel.read(0, addr after[0], uint64(after.len))
+    check after == Sentinels
+
+    # Reopen the manager and both memories survive.
+    manager = openExistingMemoryManagerStrict(raw)
+    var reopened: Db
+    check reopened.initDatabaseManaged(manager, newMemoryId(SqliteMemory), [],
+      doiOpenExisting).isOk
+    let row = reopened.queryOneText("SELECT value FROM isolated WHERE key = ?", ["a"])
+    check row.isOk and row.value.isSome and row.value.get == "b"
+    reopened.close()
+    let sentinel2 = manager.getMemory(newMemoryId(SentinelMemory))
+    var after2: array[Sentinels.len, byte]
+    sentinel2.read(0, addr after2[0], uint64(after2.len))
+    check after2 == Sentinels

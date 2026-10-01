@@ -1,34 +1,43 @@
 import nicp_cdk
 import nicp_cdk/ic0/ic0
+import nicp_cdk/storage/memory_manager
 import std/options
 import ic_sqlite
-import ic_sqlite/stable/ic_backend
 
 var database: Db
 var databaseReady = false
 
-const migrations = [
-  Migration(version: 1,
-    sql: "CREATE TABLE kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"),
-  Migration(version: 2,
-    sql: "CREATE INDEX kv_value_idx ON kv(value)")
-]
+const
+  SqliteMemoryId = newMemoryId(40'u8)
+  migrations = [
+    Migration(version: 1,
+      sql: "CREATE TABLE kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"),
+    Migration(version: 2,
+      sql: "CREATE INDEX kv_value_idx ON kv(value)")
+  ]
 
 proc greet() {.query.} =
   let request = Request.new()
   reply("Hello, " & request.getStr(0) & "!")
 
-proc initializeDatabase(intent: DbOpenIntent) =
+proc initializeDatabase(isUpgrade: bool) =
   ## Both lifecycle hooks recreate transient SQLite/VFS state from the stable
   ## image. A failure must reject install/upgrade rather than leave a canister
   ## that might later overwrite a foreign stable-memory image.
   ##
-  ## This example boots through the WASI polyfill, which owns the `MGR` prefix
-  ## at raw stable-memory offset 0. `legacyWasi2icDbStorage` is the explicit
-  ## opt-in that keeps that fixed physical layout. A new canister should instead
-  ## create one `MemoryManager` and pass `managedDbStorage(manager, id)`.
+  ## The application owns one `MemoryManager` placed after the WASI-reserved
+  ## prefix and stores SQLite in a single fixed `MemoryId`. `SqliteMemoryId` is
+  ## part of the application's stable schema: never change it after a deploy.
   database.close()
-  let storage = legacyWasi2icDbStorage(newIcStableBackend())
+  let raw = newIcStableBackend()
+  let applicationMemory = newIcOffsetBackend(raw)
+  let manager =
+    if isUpgrade:
+      openExistingMemoryManagerStrict(applicationMemory)
+    else:
+      createMemoryManagerStrict(applicationMemory)
+  let storage = managedDbStorage(manager, SqliteMemoryId)
+  let intent = if isUpgrade: doiOpenExisting else: doiCreateOnly
   let initialized = database.initDatabase(storage, migrations, intent)
   if not initialized.isOk:
     let message = "ic-sqlite initialization failed: " & initialized.error.message
@@ -36,14 +45,14 @@ proc initializeDatabase(intent: DbOpenIntent) =
   databaseReady = true
 
 proc canister_init() {.exportwasm.} =
-  initializeDatabase(doiCreateOnly)
+  initializeDatabase(false)
 
 proc canister_post_upgrade() {.exportwasm.} =
-  initializeDatabase(doiOpenExisting)
+  initializeDatabase(true)
 
 proc ensureDatabase(): string =
   if databaseReady: return ""
-  initializeDatabase(doiOpenExisting)
+  initializeDatabase(true)
   ""
 
 proc selectOne() {.update.} =

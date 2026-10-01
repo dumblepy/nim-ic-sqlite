@@ -1,6 +1,6 @@
 import std/[options, strutils, unittest]
 import ic_sqlite
-import ic_sqlite/stable/backend
+import nicp_cdk/storage/stable_backend
 
 type Item = object
   name: string

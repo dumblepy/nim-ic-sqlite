@@ -16,9 +16,10 @@ Nim backend canister built with `nicp` and managed by `icp-cli`.
 
 The canister stores its SQLite image in stable memory. `init` uses
 `doiCreateOnly` and `post_upgrade` uses `doiOpenExisting`, so an upgrade only
-reopens the existing image and never silently creates a new database. Because
-the canister boots through the WASI polyfill, it selects the explicit
-`legacyWasi2icDbStorage` adapter rather than an implicit offset.
+reopens the existing image and never silently creates a new database. The
+application owns one `nicp_cdk` `MemoryManager` placed after the WASI-reserved
+prefix and stores SQLite in a fixed `SqliteMemoryId` (see
+[`backend/src/main.nim`](./backend/src/main.nim)).
 
 ## Build and Deploy
 

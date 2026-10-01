@@ -1,5 +1,6 @@
 import std/[strutils, tables]
-import ../stable/[backend, superblock]
+import nicp_cdk/storage/stable_backend
+import ../stable/superblock
 import ./[lock, overlay, temp_file]
 
 const

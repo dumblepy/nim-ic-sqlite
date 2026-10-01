@@ -1,6 +1,6 @@
 import std/[options, unittest]
 import ic_sqlite
-import ic_sqlite/stable/backend
+import nicp_cdk/storage/stable_backend
 
 suite "benchmark transaction failure":
   test "body error rolls back both SQLite rows and stable publish":

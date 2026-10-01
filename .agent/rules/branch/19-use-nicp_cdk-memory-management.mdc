@@ -1,0 +1,1387 @@
+---
+description: 19-use-nicp_cdk-memory-management ブランチでの開発時に読み込む
+alwaysApply: false
+---
+# nim-ic-sqlite: nicp_cdk MemoryManager 導入設計書
+
+## 進捗
+
+- [x] Phase 1: dependency update（作業ツリーの `nicp_cdk` は `f0f4684` を checkout 済み。superproject の gitlink 更新は未コミット）
+- [x] Phase 2: backend removal（`stable/backend.nim` / `stable/ic_backend.nim` 削除、全 import を `nicp_cdk/storage/stable_backend` へ）
+- [x] Phase 3: MemoryManager removal（`stable/memory_manager.nim` 削除、`db.nim` / `lifecycle.nim` を CDK 型へ、`src/ic_sqlite.nim` の re-export を整理）
+- [x] Phase 4: legacy removal（`legacyWasi2icDbStorage` / `dsmLegacyFixedOffset` / `Wasi2icReservedStablePages` / 旧 test 削除）
+- [x] Phase 5: examples（`kv_crud` / `minimal_kv` を managed mode のみへ。`nicp developmentBuild` 成功）
+- [x] Phase 6: tests（allocator unit test 削除、managed integration test 追加。T1-T8 を native / canister で検証）
+- [x] Phase 7: CI / docs（重複実装 guard を `scripts/test.sh` に追加、README 更新、external consumer compile 検証）
+
+検証: `./scripts/test.sh` 全完走（Testament `33/33`、skip `0`、終了コード `0`。canister deploy / CRUD / upgrade 含む）。詳細は `/application/.agent/progress.mdc`。
+
+未コミット（`git add` 禁止のため）: `nicp_cdk` submodule の gitlink は index 上 `8c439ed` のまま。作業ツリーは `f0f4684`。コミット時に gitlink 更新が必要。
+
+## 1. 目的
+
+`dumblepy/nim-ic-sqlite` の stable-memory 管理を、`dumblepy/nicp_cdk` に実装済みの `StableBackend` / `MemoryManager` / `MemoryId` へ完全移行する。
+
+本変更では既存 DB・旧 stable-memory layout・legacy API・互換 shim を一切維持しない。
+
+最終状態では `nim-ic-sqlite` 内に独自の stable-memory allocator 実装を残さず、`nicp_cdk` を唯一の正本とする。
+
+```text
+nicp_cdk
+  ├─ StableBackend
+  ├─ IcStableBackend
+  ├─ OffsetStableBackend
+  ├─ VecStableBackend
+  ├─ MemoryId
+  ├─ MemoryManager
+  └─ VirtualStableBackend
+          │
+          ▼
+nim-ic-sqlite
+  ├─ DbStorage
+  ├─ NIMSQLV1 superblock
+  ├─ SQLite VFS
+  ├─ overlay
+  ├─ transaction
+  ├─ migration
+  └─ query API
+```
+
+---
+
+## 2. 対象リビジョン
+
+設計時点:
+
+### nicp_cdk
+
+```text
+repository: dumblepy/nicp_cdk
+branch:     main
+commit:     f0f46848d6417c8572bb4e5aa386f510c35ae9cf
+```
+
+### nim-ic-sqlite
+
+```text
+repository: dumblepy/nim-ic-sqlite
+branch:     main
+commit:     3928963d27bbd211007b7bce3fe37a5b199a78d1
+```
+
+`nim-ic-sqlite` の `nicp_cdk` submodule は新しい MemoryManager 実装を含む revision へ更新する。
+
+---
+
+## 3. 設計原則
+
+### 3.1 stable-memory 基盤は nicp_cdk のみ
+
+以下は `nicp_cdk` の責務とする。
+
+- `StableBackend`
+- `IcStableBackend`
+- `OffsetStableBackend`
+- `VecStableBackend`
+- `MemoryId`
+- `MemoryManager`
+- `VirtualStableBackend`
+- `MGR` format
+- bucket allocation
+- MemoryId validation
+- manager create/open
+- stable-memory bounds validation
+- WASI reserved-prefix 用 backend
+
+`nim-ic-sqlite` では再実装しない。
+
+### 3.2 SQLite は MemoryManager の consumer
+
+SQLite は application が作成した `MemoryManager` と `MemoryId` を受け取る。
+
+```nim
+let storage =
+  managedDbStorage(
+    manager,
+    SqliteMemoryId
+  )
+```
+
+SQLite 自身は physical stable-memory offset を管理しない。
+
+### 3.3 互換性は維持しない
+
+以下は完全削除する。
+
+- 旧 DB layout
+- direct page-1025 SQLite layout
+- `legacyWasi2icDbStorage`
+- `legacyWasi2icOffsetBackend`
+- `stableBackendAfterForeignManager`
+- `Wasi2icReservedStablePages`
+- `initMemoryManager`
+- `initMemoryManagerCompat`
+- compatibility re-export shim
+- deprecated path
+- old import compatibility
+- old DB migration code
+
+旧 DB を reopen する機能も実装しない。
+
+---
+
+## 4. 最終 stable-memory layout
+
+WASI polyfill を使う通常の canister では以下のみをサポートする。
+
+```text
+IC raw stable memory
+│
+├─ pages 0 .. 1024
+│    IC / WASI reserved region
+│
+└─ page 1025 ...
+     │
+     └─ nicp_cdk.newIcOffsetBackend(raw)
+          │
+          └─ application MemoryManager ("MGR")
+               │
+               ├─ MemoryId 32 -> application stable structure
+               ├─ MemoryId 33 -> application stable structure
+               └─ MemoryId 40 -> SQLite
+                                    │
+                                    ├─ offset 0
+                                    │    NIMSQLV1 superblock
+                                    │
+                                    └─ offset 64 KiB+
+                                         SQLite DB image
+```
+
+WASI polyfill を使用しない場合:
+
+```text
+IC raw stable memory
+      │
+      └─ MemoryManager
+           │
+           └─ SQLite MemoryId
+                └─ NIMSQLV1 + SQLite
+```
+
+---
+
+## 5. 唯一の初期化フロー
+
+### 5.1 fresh install
+
+```text
+newIcStableBackend
+→ newIcOffsetBackend
+→ createMemoryManagerStrict
+→ managedDbStorage
+→ initDatabase(..., doiCreateOnly)
+```
+
+### 5.2 post_upgrade
+
+```text
+newIcStableBackend
+→ newIcOffsetBackend
+→ openExistingMemoryManagerStrict
+→ managedDbStorage
+→ initDatabase(..., doiOpenExisting)
+```
+
+これ以外の stable-memory initialization path は用意しない。
+
+---
+
+## 6. 推奨 public API 使用例
+
+```nim
+import nicp_cdk
+import nicp_cdk/ic0/ic0
+import nicp_cdk/storage/memory_manager
+import ic_sqlite
+
+var
+  manager: MemoryManager
+  database: Db
+
+const
+  SqliteMemoryId = newMemoryId(40'u8)
+
+const migrations = [
+  Migration(
+    version: 1,
+    sql: """
+      CREATE TABLE kv (
+        key TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL
+      )
+    """
+  )
+]
+
+proc initializeStorage(isUpgrade: bool) =
+  database.close()
+
+  let raw =
+    newIcStableBackend()
+
+  let applicationStableMemory =
+    newIcOffsetBackend(raw)
+
+  manager =
+    if isUpgrade:
+      openExistingMemoryManagerStrict(
+        applicationStableMemory
+      )
+    else:
+      createMemoryManagerStrict(
+        applicationStableMemory
+      )
+
+  let storage =
+    managedDbStorage(
+      manager,
+      SqliteMemoryId
+    )
+
+  let intent =
+    if isUpgrade:
+      doiOpenExisting
+    else:
+      doiCreateOnly
+
+  let opened =
+    database.initDatabase(
+      storage,
+      migrations,
+      intent
+    )
+
+  if not opened.isOk:
+    let message =
+      "SQLite initialization failed: " &
+      opened.error.message
+
+    ic0_trap(
+      cast[int](message.cstring),
+      message.len
+    )
+
+proc canister_init() {.exportwasm.} =
+  initializeStorage(false)
+
+proc canister_post_upgrade() {.exportwasm.} =
+  initializeStorage(true)
+```
+
+---
+
+## 7. MemoryId policy
+
+SQLite library は特定の MemoryId を予約しない。
+
+MemoryId は application stable schema の一部とする。
+
+例:
+
+```nim
+# storage_ids.nim
+
+const
+  UsersMemoryId* =
+    newMemoryId(32'u8)
+
+  AuditMemoryId* =
+    newMemoryId(33'u8)
+
+  SqliteMemoryId* =
+    newMemoryId(40'u8)
+```
+
+ルール:
+
+- `255` は使用しない
+- deploy 後に ID の意味を変更しない
+- 同じ ID を別データ構造に再利用しない
+- ID 定義を repository ごとに散在させない
+- application 内で1か所にまとめる
+
+---
+
+## 8. nim-ic-sqlite から削除する実装
+
+### 8.1 backend
+
+削除:
+
+```text
+src/ic_sqlite/stable/backend.nim
+```
+
+このファイル自体を削除する。
+
+re-export facade も残さない。
+
+以後は:
+
+```nim
+import nicp_cdk/storage/stable_backend
+```
+
+のみ使用する。
+
+### 8.2 IC backend
+
+削除:
+
+```text
+src/ic_sqlite/stable/ic_backend.nim
+```
+
+独自 `IcStableBackend` を完全に廃止する。
+
+以後:
+
+```nim
+import nicp_cdk/storage/stable_backend
+```
+
+から `newIcStableBackend()` を利用する。
+
+### 8.3 MemoryManager
+
+削除:
+
+```text
+src/ic_sqlite/stable/memory_manager.nim
+```
+
+以下のすべてを削除する。
+
+```text
+MemoryManagerMagic
+MemoryManagerLayoutVersion
+MaxNumMemories
+MaxNumBuckets
+UnallocatedBucketMarker
+DefaultBucketSizeInPages
+MemoryManagerHeaderBytes
+
+MemoryId
+MemoryManager
+VirtualStableBackend
+
+createMemoryManagerStrict
+openExistingMemoryManagerStrict
+initMemoryManager
+initMemoryManagerCompat
+
+growMemory
+getMemory
+VirtualStableBackend.read
+VirtualStableBackend.write
+VirtualStableBackend.grow
+```
+
+---
+
+## 9. 削除する legacy API
+
+以下は source から完全削除する。
+
+```nim
+legacyWasi2icDbStorage
+legacyWasi2icOffsetBackend
+stableBackendAfterForeignManager
+initMemoryManager
+initMemoryManagerCompat
+```
+
+以下の enum value も削除する。
+
+```nim
+dsmLegacyFixedOffset
+```
+
+以下の constant も削除する。
+
+```nim
+Wasi2icReservedStablePages
+```
+
+互換 alias は作らない。
+
+---
+
+## 10. DbStorage の最終設計
+
+最終的な `DbStorageMode`:
+
+```nim
+type
+  DbStorageMode* = enum
+    dsmManaged
+    dsmExclusive
+```
+
+`dsmLegacyFixedOffset` は削除。
+
+### 10.1 managed
+
+標準。
+
+```nim
+proc managedDbStorage*(
+  manager: MemoryManager,
+  id: MemoryId
+): DbStorage =
+  if manager.isNil:
+    raise newException(
+      ValueError,
+      "nil memory manager"
+    )
+
+  DbStorage(
+    mode: dsmManaged,
+    backend: manager.getMemory(id)
+  )
+```
+
+### 10.2 exclusive
+
+native test や特殊用途のため残してよい。
+
+```nim
+proc exclusiveDbStorage*(
+  backend: StableBackend
+): DbStorage
+```
+
+ただし canister 標準構成には使わない。
+
+---
+
+## 11. `Db.init` の責務
+
+`Db.init` は渡された `StableBackend` をそのまま SQLite storage として扱う。
+
+禁止:
+
+- MGR magic の検出
+- automatic offset
+- WASI prefix inference
+- MemoryManager creation
+- MemoryId selection
+- legacy format detection
+
+SQLite は physical memory composition を知らない。
+
+---
+
+## 12. `DbOpenIntent`
+
+維持:
+
+```nim
+type
+  DbOpenIntent* = enum
+    doiCreateOnly
+    doiOpenExisting
+    doiOpenOrCreate
+```
+
+ただし canister lifecycle の標準では:
+
+```text
+canister_init
+  -> doiCreateOnly
+
+canister_post_upgrade
+  -> doiOpenExisting
+```
+
+のみ使用する。
+
+`doiOpenOrCreate` は low-level / native convenience として残してよいが、
+production example では使用しない。
+
+---
+
+## 13. `db.nim` の変更
+
+変更前:
+
+```nim
+import ./stable/[backend, superblock]
+import ./stable/memory_manager
+```
+
+変更後:
+
+```nim
+import nicp_cdk/storage/stable_backend
+import nicp_cdk/storage/memory_manager
+import ./stable/superblock
+```
+
+削除:
+
+```nim
+legacyWasi2icDbStorage
+```
+
+`DbStorageMode`:
+
+```nim
+type
+  DbStorageMode* = enum
+    dsmManaged
+    dsmExclusive
+```
+
+---
+
+## 14. `lifecycle.nim` の変更
+
+変更前:
+
+```nim
+import ./db
+import ./stable/backend
+import ./stable/superblock
+import ./stable/memory_manager
+```
+
+変更後:
+
+```nim
+import ./db
+import ./stable/superblock
+import nicp_cdk/storage/stable_backend
+import nicp_cdk/storage/memory_manager
+```
+
+維持:
+
+```nim
+initDatabase
+initDatabaseManaged
+initDatabaseExclusive
+reopenDatabaseAfterUpgrade
+```
+
+ただし `initDatabaseManaged` の型は `nicp_cdk.MemoryManager` / `nicp_cdk.MemoryId` を直接受け取る。
+
+---
+
+## 15. `superblock.nim` の変更
+
+変更前:
+
+```nim
+import ./[backend, checksum]
+```
+
+変更後:
+
+```nim
+import nicp_cdk/storage/stable_backend
+import ./checksum
+```
+
+SQLite 固有の `NIMSQLV1` format は変更しない。
+
+---
+
+## 16. VFS layer の変更
+
+対象:
+
+```text
+src/ic_sqlite/vfs/vfs.nim
+src/ic_sqlite/vfs/overlay.nim
+src/ic_sqlite/vfs/*
+```
+
+local backend import をすべて:
+
+```nim
+import nicp_cdk/storage/stable_backend
+```
+
+へ変更する。
+
+VFS のロジック自体は変更しない。
+
+---
+
+## 17. `src/ic_sqlite.nim` の変更
+
+現行の:
+
+```nim
+import ic_sqlite/stable/memory_manager
+export memory_manager
+```
+
+は削除。
+
+必要なら直接:
+
+```nim
+import nicp_cdk/storage/memory_manager
+export memory_manager
+```
+
+として `import ic_sqlite` だけでも `MemoryId` / `MemoryManager` を使えるようにしてよい。
+
+ただし型の正本は `nicp_cdk` のみ。
+
+より責務を明確にするなら top-level export 自体をやめ、
+
+```nim
+import ic_sqlite
+import nicp_cdk/storage/memory_manager
+```
+
+を必須にしてもよい。
+
+推奨は後者。
+
+理由:
+
+SQLite と stable-memory allocator の責務分離が明確になる。
+
+---
+
+## 18. 推奨 import style
+
+application:
+
+```nim
+import nicp_cdk
+import nicp_cdk/storage/memory_manager
+import ic_sqlite
+```
+
+禁止:
+
+```nim
+import ic_sqlite/stable/backend
+import ic_sqlite/stable/ic_backend
+import ic_sqlite/stable/memory_manager
+```
+
+これらの module は削除する。
+
+---
+
+## 19. submodule
+
+`nim-ic-sqlite` repository の:
+
+```text
+nicp_cdk
+```
+
+gitlink を新 MemoryManager revision へ更新する。
+
+少なくとも:
+
+```text
+f0f46848d6417c8572bb4e5aa386f510c35ae9cf
+```
+
+以降を利用する。
+
+---
+
+## 20. nimble dependency
+
+現行:
+
+```nim
+requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
+```
+
+MemoryManager API を含む正式 version が付いた時点で最低 version を引き上げる。
+
+例:
+
+```nim
+requires "https://github.com/dumblepy/nicp_cdk >= 0.2.0"
+```
+
+version 未確定なら submodule pin を CI の正本とする。
+
+---
+
+## 21. tests/config.nims
+
+現在の:
+
+```nim
+switch(
+  "path",
+  icSqliteRoot / "nicp_cdk" / "src"
+)
+```
+
+は維持する。
+
+repository に pin された `nicp_cdk` を必ず使う。
+
+---
+
+## 22. 削除する test
+
+### 22.1 `tests/test_memory_manager.nim`
+
+MemoryManager implementation test は全削除する。
+
+以下は `nicp_cdk` の責務。
+
+- MGR header serialization
+- allocation table
+- bucket allocation
+- MemoryId validation
+- corruption validation
+- bucket cache
+- physical bucket mapping
+- virtual memory bounds
+- raw backend behavior
+
+SQLite repository で重複 test を持たない。
+
+### 22.2 `tests/test_stable_backend.nim`
+
+generic backend test は削除する。
+
+以下は `nicp_cdk` の test suite に任せる。
+
+- VecStableBackend
+- OffsetStableBackend
+- IcStableBackend
+- grow / read / write
+- bounds
+
+---
+
+## 23. 新規/再編する integration test
+
+### T1: managed DB fresh create
+
+```text
+VecStableBackend
+→ createMemoryManagerStrict
+→ MemoryId 40
+→ SQLite create
+→ migration
+→ insert
+→ query
+```
+
+### T2: manager reopen
+
+```text
+create
+→ insert
+→ Db close
+→ MemoryManager object破棄
+→ openExistingMemoryManagerStrict
+→ same MemoryId
+→ doiOpenExisting
+→ query succeeds
+```
+
+### T3: wrong MemoryId
+
+```text
+SQLite = MemoryId 40
+open MemoryId 41 with doiOpenExisting
+→ dekMissingDatabase
+→ MemoryId 41 remains empty
+```
+
+### T4: coexistence
+
+```text
+MemoryId 32 = sentinel data
+MemoryId 40 = SQLite
+
+SQLite update
+→ MemoryId 32 unchanged
+```
+
+### T5: growth
+
+大量 insert により SQLite virtual memory が複数 bucket に成長する。
+
+その後 reopen して全レコードを検証。
+
+### T6: transaction rollback
+
+DB growth が発生する可能性がある状態でも rollback 後に SQLite logical state が変化しない。
+
+### T7: migrations
+
+upgrade reopen 後に `__nim_ic_sqlite_migrations` が維持される。
+
+### T8: canister upgrade
+
+```text
+install
+→ insert
+→ upgrade
+→ query
+```
+
+---
+
+## 24. `tests/test_storage_mode.nim`
+
+legacy test を全削除する。
+
+削除対象例:
+
+```text
+legacy 1025-page layout requires explicit adapter
+raw legacy DB reopen
+Wasi2icReservedStablePages
+```
+
+残す:
+
+- managed create
+- managed reopen
+- wrong MemoryId
+- exclusive mode
+- rejected open intent
+- foreign SQLite image rejection
+
+---
+
+## 25. examples の変更
+
+以下を新 managed layout のみにする。
+
+```text
+examples/kv_crud
+examples/minimal_kv
+```
+
+旧:
+
+```nim
+let storage =
+  legacyWasi2icDbStorage(
+    newIcStableBackend()
+  )
+```
+
+は削除。
+
+新:
+
+```nim
+let raw =
+  newIcStableBackend()
+
+let applicationMemory =
+  newIcOffsetBackend(raw)
+
+manager =
+  createMemoryManagerStrict(
+    applicationMemory
+  )
+
+let storage =
+  managedDbStorage(
+    manager,
+    SqliteMemoryId
+  )
+```
+
+upgrade では strict open。
+
+---
+
+## 26. README
+
+README から以下を完全削除する。
+
+- legacy wasi2ic layout
+- page 1025 direct SQLite
+- `legacyWasi2icDbStorage`
+- `legacyWasi2icOffsetBackend`
+- backward compatibility
+- existing DB reopen path
+- old MemoryManager import path
+
+README に存在する stable-memory architecture は新方式のみとする。
+
+---
+
+## 27. README の標準構成
+
+```text
+raw stable memory
+  │
+  ├─ IC reserved region
+  │
+  └─ application region
+       │
+       └─ nicp_cdk MemoryManager
+            │
+            ├─ MemoryId A
+            ├─ MemoryId B
+            └─ SQLite MemoryId
+                 │
+                 └─ NIMSQLV1 + SQLite
+```
+
+---
+
+## 28. README の初期化例
+
+fresh install:
+
+```nim
+let raw =
+  newIcStableBackend()
+
+let stable =
+  newIcOffsetBackend(raw)
+
+manager =
+  createMemoryManagerStrict(stable)
+
+discard database.initDatabase(
+  managedDbStorage(
+    manager,
+    SqliteMemoryId
+  ),
+  migrations,
+  doiCreateOnly
+)
+```
+
+post upgrade:
+
+```nim
+let raw =
+  newIcStableBackend()
+
+let stable =
+  newIcOffsetBackend(raw)
+
+manager =
+  openExistingMemoryManagerStrict(stable)
+
+discard database.initDatabase(
+  managedDbStorage(
+    manager,
+    SqliteMemoryId
+  ),
+  migrations,
+  doiOpenExisting
+)
+```
+
+---
+
+## 29. VFS / overlay
+
+変更しない。
+
+`StableBackend` implementation が:
+
+```text
+ic_sqlite implementation
+```
+
+から:
+
+```text
+nicp_cdk implementation
+```
+
+へ変わるだけ。
+
+維持:
+
+- VFS page mapping
+- dirty overlay
+- publish
+- rollback
+- SQLite pager integration
+- zero extent
+- query connection
+- statement cache
+
+---
+
+## 30. NIMSQLV1
+
+SQLite virtual memory の内部 layout:
+
+```text
+offset 0
+  NIMSQLV1 superblock
+
+offset 65536+
+  SQLite pages
+```
+
+変更しない。
+
+MGR はその外側の layer。
+
+```text
+MGR
+└─ MemoryId
+    └─ NIMSQLV1
+        └─ SQLite
+```
+
+---
+
+## 31. transaction semantics
+
+変更しない。
+
+```text
+BEGIN IMMEDIATE
+→ overlay write
+→ COMMIT
+→ stable publish
+```
+
+stable publish target が `nicp_cdk.VirtualStableBackend` になる。
+
+---
+
+## 32. MemoryManager grow と transaction
+
+MemoryManager の capacity allocation は SQLite transaction の外側の infrastructure operation とする。
+
+SQLite rollback が発生しても MemoryId の capacity が増えたままになることは許容する。
+
+ただし committed SQLite state は変化してはならない。
+
+この invariant を integration test で維持する。
+
+---
+
+## 33. exclusive mode
+
+`exclusiveDbStorage` は library-level low-level API として残せる。
+
+用途:
+
+- native tests
+- dedicated custom backend
+- application が明示的に isolation を保証する場合
+
+ただし IC canister example / README の標準構成には使用しない。
+
+---
+
+## 34. build / dependency
+
+### `ic_sqlite.nimble`
+
+`nicp_cdk` dependency を必須にする。
+
+### `scripts/install.sh`
+
+submodule の `nicp_cdk` を install する現在の流れを維持する。
+
+### CI
+
+recursive submodule checkout を維持。
+
+---
+
+## 35. external consumer test
+
+consumer 側:
+
+```nim
+import nicp_cdk/storage/memory_manager
+import ic_sqlite
+
+const
+  SqliteMemoryId =
+    newMemoryId(40'u8)
+
+proc buildStorage(
+  manager: MemoryManager
+): DbStorage =
+  managedDbStorage(
+    manager,
+    SqliteMemoryId
+  )
+```
+
+これが compile できること。
+
+---
+
+## 36. source audit
+
+導入完了時に以下が存在しないことを確認する。
+
+```text
+src/ic_sqlite/stable/backend.nim
+src/ic_sqlite/stable/ic_backend.nim
+src/ic_sqlite/stable/memory_manager.nim
+```
+
+また source tree 内に:
+
+```text
+type MemoryManager
+type MemoryId
+type StableBackend
+type VirtualStableBackend
+```
+
+の独自定義がないこと。
+
+---
+
+## 37. grep-based CI guard
+
+必要なら CI に追加:
+
+```sh
+if grep -R   -E 'type[[:space:]]+(MemoryManager|StableBackend|VirtualStableBackend)'   src/ic_sqlite; then
+  echo "duplicate stable-memory implementation found"
+  exit 1
+fi
+```
+
+目的は将来の再重複を防ぐこと。
+
+---
+
+## 38. error model
+
+MemoryManager layer:
+
+```text
+nicp_cdk exception
+```
+
+SQLite layer:
+
+```text
+DbError
+```
+
+責務を混ぜない。
+
+例:
+
+```text
+MGR corrupt
+→ openExistingMemoryManagerStrict fails
+
+MemoryId empty
+→ doiOpenExisting => dekMissingDatabase
+
+SQLite image corrupt
+→ DbError
+```
+
+---
+
+## 39. lifecycle error
+
+`canister_init` / `canister_post_upgrade` で storage initialization に失敗した場合は trap する。
+
+部分的に `databaseReady = true` にしない。
+
+---
+
+## 40. observability
+
+SQLite:
+
+```nim
+storageStats(db)
+```
+
+を維持。
+
+MemoryManager stats が必要なら application 側で:
+
+```nim
+manager.memorySizePages(id)
+manager.memoryBucketCount(id)
+manager.allocatedBucketCount
+```
+
+を取得する。
+
+SQLite library が manager-wide ownership を持たないため、manager metrics を `Db` に埋め込まない。
+
+---
+
+## 41. performance
+
+algorithm は基本的に現行 SQLite MemoryManager と同じため、大幅な performance change は想定しない。
+
+確認対象:
+
+- query latency
+- update latency
+- stable read/write volume
+- bucket boundary crossing
+- DB growth
+- upgrade reopen
+- transaction commit
+
+---
+
+## 42. 実装フェーズ
+
+### Phase 1: dependency update
+
+- `nicp_cdk` submodule 更新
+- Nimble dependency確認
+- build 成功
+
+### Phase 2: backend removal
+
+- `stable/backend.nim` 削除
+- `stable/ic_backend.nim` 削除
+- imports を `nicp_cdk` へ変更
+- compile
+
+### Phase 3: MemoryManager removal
+
+- `stable/memory_manager.nim` 削除
+- `db.nim` を CDK型へ変更
+- `lifecycle.nim` を CDK型へ変更
+- `src/ic_sqlite.nim` export 整理
+
+### Phase 4: legacy removal
+
+- `legacyWasi2icDbStorage` 削除
+- `dsmLegacyFixedOffset` 削除
+- old constants 削除
+- old tests 削除
+- old docs 削除
+
+### Phase 5: examples
+
+- `kv_crud` を managed mode のみに変更
+- `minimal_kv` を managed mode のみに変更
+
+### Phase 6: tests
+
+- allocator unit tests 削除
+- SQLite integration tests 再構成
+- upgrade test
+- wrong MemoryId test
+- coexistence test
+- growth test
+
+### Phase 7: CI / docs
+
+- consumer compile
+- canister deploy
+- canister upgrade
+- README更新
+- duplicate implementation guard
+
+---
+
+## 43. 完了条件
+
+- [x] `nicp_cdk` submodule が新 MemoryManager revision を指す
+- [x] `src/ic_sqlite/stable/backend.nim` が存在しない
+- [x] `src/ic_sqlite/stable/ic_backend.nim` が存在しない
+- [x] `src/ic_sqlite/stable/memory_manager.nim` が存在しない
+- [x] `MemoryManager` は `nicp_cdk` の型のみ
+- [x] `MemoryId` は `nicp_cdk` の型のみ
+- [x] `StableBackend` は `nicp_cdk` の型のみ
+- [x] `VirtualStableBackend` は `nicp_cdk` の型のみ
+- [x] `legacyWasi2icDbStorage` が存在しない
+- [x] `legacyWasi2icOffsetBackend` が存在しない
+- [x] `stableBackendAfterForeignManager` が存在しない
+- [x] `dsmLegacyFixedOffset` が存在しない
+- [x] `Wasi2icReservedStablePages` が SQLite repository に存在しない
+- [x] `initMemoryManager` が SQLite repository に存在しない
+- [x] `initMemoryManagerCompat` が SQLite repository に存在しない
+- [x] README に legacy 説明が存在しない
+- [x] examples に legacy API 使用が存在しない
+- [x] fresh install が成功する
+- [x] SQLite create が成功する
+- [x] migrations が成功する
+- [x] transaction tests が成功する
+- [x] SQLite MemoryId が複数 bucket に grow できる
+- [x] post_upgrade で manager を strict reopen できる
+- [x] post_upgrade で SQLite を existing-only reopen できる
+- [x] wrong MemoryId が fail-closed する
+- [x] canister upgrade 後もデータを読める
+- [x] other MemoryId と SQLite が共存できる
+- [x] external consumer compile が成功する
+- [x] duplicate allocator implementation が repository に存在しない
+
+---
+
+## 44. 非目標
+
+今回の変更では以下を実装しない。
+
+- 既存 DB migration
+- legacy stable-memory import
+- old page-1025 SQLite reopen
+- raw image relocation
+- backward compatibility
+- deprecated API
+- migration shim
+- automatic layout detection
+- MemoryId auto assignment
+- cross-storage transaction
+- MemoryManager format の変更
+
+---
+
+## 45. 最終設計
+
+最終状態は以下の1種類のみ。
+
+```text
+IC raw stable memory
+        │
+        ├─ IC/WASI reserved region
+        │
+        └─ application region
+               │
+               ▼
+         nicp_cdk MemoryManager
+               │
+               ├─ MemoryId A
+               ├─ MemoryId B
+               └─ SQLite MemoryId
+                       │
+                       ▼
+                  NIMSQLV1
+                       │
+                       ▼
+                    SQLite
+```
+
+`nim-ic-sqlite` は stable-memory allocation を一切実装しない。
+
+`nicp_cdk` が storage infrastructure、`nim-ic-sqlite` が SQLite persistence engine という責務分離を固定する。
+
+旧実装・旧DB・legacy API・互換経路はすべて削除し、新規 architecture のみを repository に残す。
