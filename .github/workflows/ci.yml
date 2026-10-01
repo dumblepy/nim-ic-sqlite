@@ -61,3 +61,19 @@ jobs:
               exit 1
             fi
           '
+
+      - name: Compile dummy consumer canister against the installed package
+        run: |
+          set -euo pipefail
+          docker compose -f compose.test.yaml run --rm --no-TTY app bash -lc '
+            set -euo pipefail
+            cd /application
+            ./scripts/install.sh
+            nimble install -y
+            workdir="$(mktemp -d)"
+            cp -r integration/consumer/. "$workdir"
+            cd "$workdir"
+            # No SQLite include path, shim path, or archive path is set here:
+            # the installed package must supply them through its linkage module.
+            nim c src/main.nim
+          '

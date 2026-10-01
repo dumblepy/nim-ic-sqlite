@@ -1,0 +1,11 @@
+{
+  "package": "ic_sqlite",
+  "package_version": "0.1.0",
+  "sqlite_version": "3.53.4",
+  "target": "wasm32-wasip1",
+  "archive": "libsqlite3_ic.a",
+  "build_profile": "ic-canister",
+  "threadsafe": false,
+  "wal": false,
+  "fts5": true
+}

@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Build the pinned SQLite amalgamation for the ICP wasm32-wasip1 (WASI
-# preview 1) target. wasi-sdk >= 30 deprecates the old `wasm32-wasi` triple.
+# preview 1) target.
+#
+# Only the SQLite static archive `libsqlite3_ic.a` is a distribution artifact
+# (17-fix-dir branch rule section 2 and 10).  The IC-specific C shim and the
+# SQLite helpers are shipped as C source and compiled by the consumer build
+# through `src/ic_sqlite/ffi/linkage.nim`, so this script does not build them
+# into the artifact directory.
 set -euo pipefail
 
-readonly SQLITE_VERSION="3.53.4"
+readonly SQLITE_VERSION_HEADER="vendor/sqlite/sqlite3.h"
 readonly SQLITE_SOURCE="vendor/sqlite/sqlite3.c"
-readonly SQLITE_HEADER="vendor/sqlite/sqlite3.h"
-# Keep target-specific link inputs beside the vendored amalgamation.  This
-# mirrors the vendor-first layout used by nim-rustcrypto and gives canister
-# config.nims one stable directory to reference.
-readonly ARTIFACT_DIR="vendor/sqlite/wasm32-wasi"
+readonly BUILD_FLAGS_FILE="vendor/sqlite/build-flags.txt"
+
+# Keep the target name identical to the clang triple used by the canister
+# build.  `wasm32-wasi` and `wasm32-wasip1` must not be mixed (section 5.1).
+readonly TARGET="wasm32-wasip1"
+readonly ARTIFACT_DIR="vendor/sqlite/${TARGET}"
+readonly ARCHIVE="${ARTIFACT_DIR}/libsqlite3_ic.a"
 
 : "${WASI_SDK_PATH:?WASI_SDK_PATH must point to a WASI SDK installation}"
 readonly CC="${WASI_SDK_PATH}/bin/clang"
@@ -17,58 +25,70 @@ readonly AR="${WASI_SDK_PATH}/bin/llvm-ar"
 
 [[ -x "$CC" ]] || { echo "WASI clang not found: $CC" >&2; exit 1; }
 [[ -x "$AR" ]] || { echo "WASI llvm-ar not found: $AR" >&2; exit 1; }
-[[ -f "$SQLITE_SOURCE" && -f "$SQLITE_HEADER" ]] || {
-  echo "SQLite ${SQLITE_VERSION} amalgamation is missing from vendor/sqlite" >&2
+[[ -f "$SQLITE_SOURCE" && -f "$SQLITE_VERSION_HEADER" ]] || {
+  echo "SQLite amalgamation is missing from vendor/sqlite" >&2
   exit 1
 }
-grep -Fq "#define SQLITE_VERSION        \"${SQLITE_VERSION}\"" "$SQLITE_HEADER" || {
-  echo "vendor/sqlite does not contain SQLite ${SQLITE_VERSION}" >&2
+[[ -f "$BUILD_FLAGS_FILE" ]] || {
+  echo "SQLite build flags are missing: $BUILD_FLAGS_FILE" >&2
   exit 1
 }
 
+# Read the pinned SQLite version from the vendored header.
+smatch="$(grep -F '#define SQLITE_VERSION ' "$SQLITE_VERSION_HEADER" | head -n1)"
+SQLITE_VERSION="$(printf '%s' "$smatch" | sed -E 's/.*"([^"]+)".*/\1/')"
+[[ -n "$SQLITE_VERSION" ]] || { echo "cannot parse SQLite version" >&2; exit 1; }
+
+# Merge build-flags.txt into -D<flag> arguments.
+defines=()
+while IFS= read -r line; do
+  line="${line%%#*}"
+  line="$(printf '%s' "$line" | tr -d '[:space:]')"
+  [[ -z "$line" ]] && continue
+  defines+=("-D${line}")
+done < "$BUILD_FLAGS_FILE"
+[[ ${#defines[@]} -gt 0 ]] || { echo "no build flags found" >&2; exit 1; }
+
 mkdir -p "$ARTIFACT_DIR"
+
+# Compile the intermediate object outside the artifact directory so it is never
+# distributed by `nimble install` (only the archive belongs there).
+OBJ_DIR="$(mktemp -d)"
+trap 'rm -rf "$OBJ_DIR"' EXIT
+
 "$CC" \
-  --target=wasm32-wasip1 \
+  "--target=${TARGET}" \
   -Os \
   -std=c99 \
   -c "$SQLITE_SOURCE" \
-  -o "$ARTIFACT_DIR/sqlite3.o" \
-  -DSQLITE_CORE \
-  -DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
-  -DSQLITE_ENABLE_API_ARMOR \
-  -DSQLITE_ENABLE_FTS5 \
-  -DSQLITE_USE_URI \
-  -DSQLITE_OS_OTHER=1 \
-  -DSQLITE_THREADSAFE=0 \
-  -DSQLITE_OMIT_WAL \
-  -DSQLITE_TEMP_STORE=3 \
-  -DSQLITE_OMIT_LOCALTIME \
-  -DSQLITE_OMIT_DEPRECATED \
-  -DSQLITE_OMIT_LOAD_EXTENSION \
-  -DSQLITE_OMIT_SHARED_CACHE \
-  -DSQLITE_DEFAULT_MEMSTATUS=0
+  -o "${OBJ_DIR}/sqlite3.o" \
+  "${defines[@]}"
 
-"$AR" rcs "$ARTIFACT_DIR/libsqlite3_ic.a" "$ARTIFACT_DIR/sqlite3.o"
+# `rcsD` selects llvm-ar deterministic mode so the archive is reproducible.
+"$AR" rcsD "$ARCHIVE" "${OBJ_DIR}/sqlite3.o"
 
-# Canister config.nims links these objects from ARTIFACT_DIR next to the SQLite
-# archive. They must use the same wasm32-wasip1 target; host-compiled objects
-# cannot be linked into a canister wasm module.
-"$CC" \
-  --target=wasm32-wasip1 \
-  -Os \
-  -std=c99 \
-  -Ivendor/sqlite \
-  -Ic \
-  -c c/ic_sqlite_vfs_shim.c \
-  -o "$ARTIFACT_DIR/ic_sqlite_vfs_shim.o"
+# Refresh the checksum manifest (section 13).
+(
+  cd "$ARTIFACT_DIR"
+  sha256sum "libsqlite3_ic.a" > SHA256SUMS
+)
 
-"$CC" \
-  --target=wasm32-wasip1 \
-  -Os \
-  -std=c99 \
-  -Ivendor/sqlite \
-  -Ic \
-  -c c/sqlite_helpers.c \
-  -o "$ARTIFACT_DIR/sqlite_helpers.o"
+# Refresh the artifact metadata (section 12).  package_version is read from the
+# Nimble manifest so the archive and the package stay in lockstep.
+package_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' ic_sqlite.nimble | head -n1)"
+[[ -n "$package_version" ]] || package_version="0.0.0"
+cat > "${ARTIFACT_DIR}/manifest.json" <<JSON
+{
+  "package": "ic_sqlite",
+  "package_version": "${package_version}",
+  "sqlite_version": "${SQLITE_VERSION}",
+  "target": "${TARGET}",
+  "archive": "libsqlite3_ic.a",
+  "build_profile": "ic-canister",
+  "threadsafe": false,
+  "wal": false,
+  "fts5": true
+}
+JSON
 
-echo "built $ARTIFACT_DIR/libsqlite3_ic.a and C shims (SQLite ${SQLITE_VERSION}, wasm32-wasip1)"
+echo "built ${ARCHIVE} (SQLite ${SQLITE_VERSION}, ${TARGET})"

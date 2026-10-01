@@ -5,13 +5,15 @@ This directory vendors SQLite 3.53.4 from the official
 [`SHA3-256`](./SHA3-256).  Only `sqlite3.c` and `sqlite3.h` are needed by this
 library.
 
-Rebuild the wasm32-wasi link inputs with:
+Rebuild the wasm32-wasip1 link inputs with:
 
 ```sh
 WASI_SDK_PATH=/root/.wasi-sdk ./scripts/build_sqlite.sh
 ```
 
-The build writes `sqlite3.o`, `libsqlite3_ic.a`, `ic_sqlite_vfs_shim.o`, and
-`sqlite_helpers.o` to [`wasm32-wasi/`](./wasm32-wasi/). These generated files
-are intentionally ignored by Git; canister `config.nims` files link only from
-that target-specific directory.
+The build writes the prebuilt `libsqlite3_ic.a`, `manifest.json`, and
+`SHA256SUMS` to [`wasm32-wasip1/`](./wasm32-wasip1/). The archive is a committed
+distribution artifact (about 1.1 MiB). The SQLite compile flags are pinned in
+[`build-flags.txt`](./build-flags.txt). The IC VFS shim and the SQLite helpers
+are not built here: they are compiled by the consumer build through
+`src/ic_sqlite/ffi/linkage.nim`.

@@ -1,14 +1,10 @@
 import std/os
 
+# SQLite include paths, C shim compilation, and the prebuilt archive are set up
+# by ic_sqlite/ffi/linkage.nim when `import ic_sqlite` is used.
 let icSqliteRoot = "/application"
-let sqliteWasiArtifacts = icSqliteRoot / "vendor" / "sqlite" / "wasm32-wasi"
 switch("path", icSqliteRoot / "src")
 switch("path", "/application/nicp_cdk/src")
-switch("passC", "-I" & icSqliteRoot / "vendor/sqlite")
-switch("passC", "-I" & icSqliteRoot / "c")
-switch("passL", sqliteWasiArtifacts / "libsqlite3_ic.a")
-switch("passL", sqliteWasiArtifacts / "ic_sqlite_vfs_shim.o")
-switch("passL", sqliteWasiArtifacts / "sqlite_helpers.o")
 
 --mm: "orc"
 --threads: "off"

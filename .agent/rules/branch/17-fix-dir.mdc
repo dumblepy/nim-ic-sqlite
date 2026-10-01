@@ -3,505 +3,1014 @@ description: 17-fix-dir ブランチでの開発時に読み込む
 alwaysApply: false
 ---
 
-# nim-ic-sqlite: `nimble install` 対応設計書
+# nim-ic-sqlite C成果物 配布・リンク設計書
 
 ## 1. 目的
 
-以下のコマンドで GitHub リポジトリから `ic_sqlite` ライブラリを導入できる状態にする。
+本設計書は、`nim-ic-sqlite` を利用するNimアプリケーションからSQLiteを呼び出せるようにするため、C言語由来の以下の成果物をどのように生成・配布・取得・リンクするかを定義する。
 
-```bash
-nimble install https://github.com/dumblepy/nim-ic-sqlite
-```
+対象成果物:
 
-あわせて、`.nimble` ファイルの配置、`srcDir`、`bin`、依存関係、インストール後の `import ic_sqlite` が一貫する構成に整理する。
+- `libsqlite3_ic.a`
+- `ic_sqlite_vfs_shim.o`
+- `sqlite_helpers.o`
+
+本設計書は、Nimbleパッケージそのものの配置や `nimble install` のpackage root設計とは分離して扱う。
 
 ---
 
-## 2. 現状確認
+## 2. 結論
 
-2026-10-01 時点のリポジトリは概ね次の構成になっている。
+推奨方式は以下とする。
+
+1. `libsqlite3_ic.a` は **prebuilt artifactとして `nim-ic-sqlite` リポジトリ内に同梱する**。
+2. `ic_sqlite_vfs_shim.o` と `sqlite_helpers.o` は **配布しない**。
+3. `ic_sqlite_vfs_shim.c` と `sqlite_helpers.c` をNimble packageに含め、consumer applicationのビルド時にコンパイルする。
+4. consumer application側に個別の絶対パス設定を書かせず、`ic-sqlite` 内部のNim moduleからC compile/link設定を行う。
+5. GitHub Releaseには、同じ `libsqlite3_ic.a` とmetadata/checksumを補助的に公開する。
+6. Git branch / tag / commitでNimble dependencyを取得した場合でも、そのGit revisionに対応するNim source、C source、prebuilt SQLite archiveが必ず同時に取得される構成にする。
+7. CIで `libsqlite3_ic.a` の再現ビルドとchecksum一致を検証し、source・compile flags・archiveの不整合を防ぐ。
+
+---
+
+## 3. 背景
+
+`nim-ic-sqlite` はNimコードだけでは完結しない。
+
+SQLite本体はCで実装されており、ICP canister向けWASMビルドでは少なくとも以下が必要になる。
 
 ```text
-nim-ic-sqlite/
-├── README.md
-├── design/
-├── docker/
-├── nicp_cdk/              # git submodule
-└── ic-sqlite/
-    ├── ic_sqlite.nimble
-    ├── src/
-    │   ├── ic_sqlite.nim
-    │   └── ic_sqlite/...
-    └── scripts/...
+Nim application
+    |
+    v
+nim-ic-sqlite
+    |
+    +-- SQLite static library
+    |     libsqlite3_ic.a
+    |
+    +-- IC-specific VFS C shim
+    |     ic_sqlite_vfs_shim.c
+    |
+    +-- SQLite helper C functions
+          sqlite_helpers.c
 ```
 
-リポジトリ直下には `.nimble` ファイルがなく、Nimble パッケージ本体は `ic-sqlite/` サブディレクトリにある。
+現在のビルドスクリプトでは、これらを `wasm32-wasip1` 向けに生成している。
 
-現在の `ic-sqlite/ic_sqlite.nimble` は以下の内容になっている。
+SQLite本体は約数MB規模のCソースであり、consumerごとに毎回ビルドするコストが高い。
+
+一方、`ic_sqlite_vfs_shim.c` と `sqlite_helpers.c` は小規模であり、consumer build時にコンパイルしても負荷は小さい。
+
+この違いを利用して、SQLite本体だけをprebuiltとし、shim/helperはsource distributionとする。
+
+---
+
+## 4. 設計原則
+
+### 4.1 Git revisionとbinary artifactを一致させる
+
+最重要要件は以下である。
+
+```text
+Git revision
+   |
+   +-- Nim source
+   +-- C shim source
+   +-- SQLite header
+   +-- SQLite build flags
+   +-- libsqlite3_ic.a
+```
+
+すべて同じGit revisionに属すること。
+
+例えば以下でfeature branchをインストールした場合、
+
+```bash
+nimble install "https://github.com/dumblepy/nim-ic-sqlite@#feature/foo"
+```
+
+そのbranchに対応した `libsqlite3_ic.a` が取得されなければならない。
+
+したがって、GitHub Releaseだけを唯一のbinary distribution sourceにしてはならない。
+
+---
+
+### 4.2 consumerに手動downloadを要求しない
+
+以下のような操作は原則として不要にする。
+
+```bash
+ic-sqlite downloadLibs
+```
+
+```bash
+curl -L .../libsqlite3_ic.a
+```
+
+```bash
+export IC_SQLITE_LIB_PATH=...
+```
+
+また、consumer側 `config.nims` に以下のような絶対パスを書かせない。
 
 ```nim
-version       = "0.1.0"
-author        = "ic-sqlite contributors"
-description   = "SQLite VFS backed by Internet Computer stable memory"
-license       = "MIT"
-srcDir        = "src"
-backend       = "c"
-bin           = @["ic_sqlite"]
-
-requires "nim >= 2.2.12"
-requires "nicp_cdk >= 0.1.0"
-
-task test, "Run the full test suite with Testament":
-  exec "./scripts/test.sh"
+switch("passL", "/root/.ic-sqlite/libsqlite3_ic.a")
 ```
 
-公開エントリポイントは `ic-sqlite/src/ic_sqlite.nim` で、利用側の想定は次の通り。
+consumerは原則として、
 
 ```nim
 import ic_sqlite
 ```
 
-README でも現在は URL から直接 `nimble install` する方式ではなく、次の開発用手順が案内されている。
-
-```bash
-git clone --recurse-submodules https://github.com/dumblepy/nim-ic-sqlite.git
-cd nim-ic-sqlite/ic-sqlite
-nimble develop
-```
+するだけで必要なlink configurationが有効になることを目標とする。
 
 ---
 
-## 3. 問題点
+### 4.3 build artifactとsource artifactを分ける
 
-### 3.1 `.nimble` がリポジトリ直下にない
+3つのC由来成果物をすべてprebuiltとして配る必要はない。
 
-Nimble は Git URL を直接指定してインストールできるが、パッケージがリポジトリのサブディレクトリにある場合は `?subdir=<path>` を付ける方式が公式に用意されている。
+推奨分類:
 
-現状構成のままなら、正しい直接インストールコマンドは次になる。
-
-```bash
-nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
-```
-
-したがって、ユーザーが希望しているクエリなしの
-
-```bash
-nimble install https://github.com/dumblepy/nim-ic-sqlite
-```
-
-を正式サポートするなら、Nimble パッケージのルートを Git リポジトリのルートと一致させるのが最も確実である。
-
-### 3.2 `bin = @["ic_sqlite"]` は削除すべき
-
-`bin` を指定すると Nimble はそのパッケージをバイナリパッケージとして扱い、`ic_sqlite.nim` を実行ファイルとしてビルド・インストールしようとする。
-
-`ic_sqlite` は CLI ではなくライブラリの公開モジュールなので、この指定は不要であり、むしろ意味が異なる。
-
-修正:
-
-```diff
- srcDir        = "src"
- backend       = "c"
--bin           = @["ic_sqlite"]
-```
-
-### 3.3 `srcDir = "src"` は現在位置では正しい
-
-`.nimble` が `ic-sqlite/ic_sqlite.nimble` にあり、公開モジュールが `ic-sqlite/src/ic_sqlite.nim` にあるため、現在の
-
-```nim
-srcDir = "src"
-```
-
-は正しい。
-
-問題は `srcDir` ではなく、Nimble package root と Git repository root が一致していないことである。
-
-### 3.4 `nicp_cdk` の扱いを一本化する必要がある
-
-現状はリポジトリ直下に `nicp_cdk` git submodule がある一方、`.nimble` では
-
-```nim
-requires "nicp_cdk >= 0.1.0"
-```
-
-と Nimble dependency として宣言している。
-
-通常の `nimble install` の利用者に submodule 初期化を要求しない設計にするなら、ライブラリ依存は Nimble dependency として解決する方針に統一するのが望ましい。
-
-ただし `nicp_cdk >= 0.1.0` が Nimble の package registry から常に解決できることは、リリース前に実環境で確認すること。registry に登録しない運用なら Git URL dependency に固定する。
-
-**確認結果 (2026-10-01):** `nicp_cdk` は Nimble registry に未登録であり、クリーンな
-`NIMBLE_DIR` では `nimble install <ic_sqlite>@#17-fix-dir` が
-`Missing dependencies: nicp_cdk` で失敗する。したがって Git URL dependency に固定する。
-
-例:
-
-```nim
-requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
-```
-
-タグ運用を行う場合は、タグと `.nimble` の version の整合も確認する。
+| Artifact | 配布方式 | 理由 |
+|---|---|---|
+| `libsqlite3_ic.a` | prebuilt | SQLite本体のcompile costが高い |
+| `ic_sqlite_vfs_shim.o` | 配布しない | 小さい。C sourceからbuild可能 |
+| `sqlite_helpers.o` | 配布しない | 小さい。C sourceからbuild可能 |
+| `ic_sqlite_vfs_shim.c/.h` | source distribution | Nim側ABIとの同期が重要 |
+| `sqlite_helpers.c/.h` | source distribution | Nim側FFIとの同期が重要 |
+| `sqlite3.h` | source distribution | compile時headerとして必要 |
 
 ---
 
-## 4. 推奨設計
+## 5. 推奨repository構成
 
-### 方針A: パッケージをリポジトリ直下へ移動する — 推奨
-
-このリポジトリ自体が `nim-ic-sqlite` 専用であるため、Nimble package root を repository root に合わせる。
-
-推奨構成:
+`nim-ic-sqlite` package rootから見て以下とする。
 
 ```text
 nim-ic-sqlite/
 ├── ic_sqlite.nimble
-├── README.md
 ├── src/
 │   ├── ic_sqlite.nim
 │   └── ic_sqlite/
+│       ├── ffi/
+│       │   ├── sqlite_api.nim
+│       │   ├── vfs_exports.nim
+│       │   └── linkage.nim
 │       └── ...
-├── scripts/
-│   └── test.sh
-├── tests/
-│   └── ...
+│
+├── c/
+│   ├── ic_sqlite_vfs_shim.c
+│   ├── ic_sqlite_vfs_shim.h
+│   ├── sqlite_helpers.c
+│   └── sqlite_helpers.h
+│
 ├── vendor/
-│   └── ...
-├── examples/
-│   └── ...
-├── design/
-├── docker/
-└── nicp_cdk/              # 必要なら開発・CI用 submodule として維持
+│   └── sqlite/
+│       ├── sqlite3.c
+│       ├── sqlite3.h
+│       ├── build-flags.txt
+│       └── wasm32-wasip1/
+│           ├── libsqlite3_ic.a
+│           ├── manifest.json
+│           └── SHA256SUMS
+│
+├── scripts/
+│   ├── build_sqlite.sh
+│   ├── verify_prebuilt.sh
+│   └── package_prebuilt.sh
+│
+└── .github/
+    └── workflows/
+        ├── ci.yml
+        └── release.yml
 ```
 
-つまり、現在 `ic-sqlite/` 配下にある package 本体を一段上へ移動する。
+### 5.1 target directory名
 
-この構成なら `.nimble` は次でよい。
+現在のビルドtargetが
 
-```nim
-version       = "0.1.0"
-author        = "ic-sqlite contributors"
-description   = "SQLite VFS backed by Internet Computer stable memory"
-license       = "MIT"
-srcDir        = "src"
-backend       = "c"
-
-requires "nim >= 2.2.12"
-requires "nicp_cdk >= 0.1.0"
-
-task test, "Run the full test suite with Testament":
-  exec "./scripts/test.sh"
+```text
+wasm32-wasip1
 ```
 
-重要点:
+であるなら、artifact directory名も
 
-- `ic_sqlite.nimble` を repository root に置く。
-- `src/` も repository root 直下へ移す。
-- `srcDir = "src"` はそのまま維持する。
-- `bin = @["ic_sqlite"]` は削除する。
-- `scripts/test.sh` など `.nimble` からの相対パスも package root 基準で成立させる。
-- C ソース、SQLite vendor ファイル、shim 等を相対参照している場合、それらも package root 移動後のパスに合わせる。
-
-この方式なら目標コマンドをそのまま使える。
-
-```bash
-nimble install https://github.com/dumblepy/nim-ic-sqlite
+```text
+vendor/sqlite/wasm32-wasip1/
 ```
 
-### 方針B: 現状のサブディレクトリ構成を維持する
+に統一する。
 
-リポジトリを monorepo として維持したい場合は、ファイル移動を行わず公式の `subdir` 指定を使う。
-
-```bash
-nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
-```
-
-この場合の `.nimble` は現在位置のままでよいが、`bin` は削除する。
-
-```nim
-version       = "0.1.0"
-author        = "ic-sqlite contributors"
-description   = "SQLite VFS backed by Internet Computer stable memory"
-license       = "MIT"
-srcDir        = "src"
-backend       = "c"
-
-requires "nim >= 2.2.12"
-requires "nicp_cdk >= 0.1.0"
-
-task test, "Run the full test suite with Testament":
-  exec "./scripts/test.sh"
-```
-
-この方式では、クエリなしの元コマンドを正式なインストール方法にはできない。
+`wasm32-wasi` と `wasm32-wasip1` が混在すると、将来的にtargetの意味が曖昧になるため避ける。
 
 ---
 
-## 5. 「root に .nimble だけ置き、srcDir を `ic-sqlite/src` にする」案について
+## 6. `libsqlite3_ic.a` の配布方式
 
-技術的には次のような wrapper package も考えられる。
+### 6.1 repositoryにcommitする
 
-```nim
-srcDir = "ic-sqlite/src"
+`libsqlite3_ic.a` は生成物ではあるが、consumer dependencyとして必要な正式なdistribution artifactとしてGit管理する。
+
+例:
+
+```text
+vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
 ```
 
-ただし推奨しない。
+`.gitignore` で全 `.a` を除外するのではなく、対象archiveだけを例外扱いにする。
+
+例:
+
+```gitignore
+vendor/sqlite/wasm32-wasip1/*.o
+vendor/sqlite/wasm32-wasip1/*.a
+
+!vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+#### 6.1.1 Git LFS は使わない
+
+archive は約 1.1 MiB と小さく、再生成も可能だが、通常の Git object として
+追跡する。理由:
+
+- `nimble install` は Git URL 依存を `git clone` で取得する。Git LFS を使うと
+  consumer 環境に `git-lfs`（smudge 有効化）を前提として要求することになり、
+  「追加ツール無しで install」という目標を損なう。
+- 1.1 MiB は Git LFS を必要とするサイズではない。
+- LFS は install 時の network 取得を増やし、offline / 再現性を弱める。
+
+したがって `.gitattributes` による LFS 指定は行わず、`libsqlite3_ic.a` を
+通常の blob として commit する。CI は `verify_prebuilt.sh` で再現ビルドと
+checksum を検証する。
+
+### 6.2 repository同梱を推奨する理由
+
+GitHub Releaseだけからdownloadする方式では、以下が難しい。
+
+- feature branch
+- development branch
+- arbitrary commit
+- pull request build
+- unreleased tag
+
+一方、repositoryにarchiveを含めれば、
+
+```text
+Nim source revision
+SQLite archive revision
+C shim revision
+```
+
+がGitにより一体として固定される。
+
+---
+
+## 7. shim/helper objectをprebuiltしない理由
+
+現在のC shimはSQLite本体と比較して小さい。
+
+これらを `.o` として配布すると、以下のABI整合性を管理する必要がある。
+
+```text
+Nim FFI declarations
+        |
+        +-- ic_sqlite_vfs_shim.o
+        |
+        +-- sqlite_helpers.o
+```
+
+Nim側のFFI interfaceを修正した際、prebuilt `.o` の更新を忘れるとlink-timeまたはruntime failureにつながる。
+
+そのため、
+
+```text
+.c source + .h
+```
+
+をpackageに含め、consumer build時にcompileする。
+
+これにより、Git revision内のNim sourceとC sourceの一致が自然に保証される。
+
+---
+
+## 8. consumer applicationでのリンク方式
+
+### 8.1 package内部からlink設定する
+
+consumer側の `config.nims` に設定を要求するのではなく、`ic-sqlite` package内部にlinkage専用moduleを設ける。
+
+例:
+
+```text
+src/ic_sqlite/ffi/linkage.nim
+```
+
+概念コード:
+
+```nim
+import std/os
+
+const ffiDir = currentSourcePath().parentDir
+const packageRoot = ffiDir.parentDir.parentDir.parentDir
+
+const sqliteDir = packageRoot / "vendor" / "sqlite"
+const cDir = packageRoot / "c"
+const artifactDir = sqliteDir / "wasm32-wasip1"
+
+when defined(wasm32):
+  {.passC: "-I" & sqliteDir.}
+  {.passC: "-I" & cDir.}
+
+  {.compile: cDir / "ic_sqlite_vfs_shim.c".}
+  {.compile: cDir / "sqlite_helpers.c".}
+
+  {.passL: artifactDir / "libsqlite3_ic.a".}
+```
+
+実際の `currentSourcePath()` からpackage rootまでの `parentDir` 数は、最終repository layoutに合わせてテストで固定する。
+
+### 8.2 `ic_sqlite.nim` から内部importする
+
+公開entry point:
+
+```nim
+import ic_sqlite/ffi/linkage
+```
+
+を内部的に行う。
+
+consumer側は単に、
+
+```nim
+import ic_sqlite
+```
+
+とする。
+
+### 8.3 `nimble path` への依存を避ける
+
+library内部から
+
+```bash
+nimble path ic_sqlite
+```
+
+を実行してinstall pathを取得する方式は推奨しない。
 
 理由:
 
-1. package root と source tree の対応が不自然になる。
-2. `scripts/`, `vendor/`, `examples/`、Cソース等の相対パス管理が複雑になる。
-3. Nimble のインストール後レイアウトとビルド時の相対参照を検証する項目が増える。
-4. repository が実質単一パッケージなら、一段深い package root を維持する利点が小さい。
+- subprocess dependencyになる
+- Nimble installation stateに依存する
+- 同packageの複数versionが存在するとambiguityが発生し得る
+- Git checkoutから直接buildする場合との挙動差が増える
 
-「元の URL だけで install 可能」が要件なら、方針Aのディレクトリ移動の方が単純で保守しやすい。
-
----
-
-## 6. 修正手順
-
-方針Aを採用する場合の概念的な作業は次の通り。
-
-```bash
-# repository root で実行
-mv ic-sqlite/ic_sqlite.nimble ./ic_sqlite.nimble
-mv ic-sqlite/src ./src
-mv ic-sqlite/scripts ./scripts
-
-# 存在する場合のみ、package に属するものを移動
-mv ic-sqlite/tests ./tests
-mv ic-sqlite/examples ./examples
-mv ic-sqlite/vendor ./vendor
-```
-
-その後、空になった `ic-sqlite/` を削除する。
-
-```bash
-rmdir ic-sqlite
-```
-
-実際には package 内に他のファイル/ディレクトリがある可能性があるため、移動前に必ず確認する。
-
-```bash
-find ic-sqlite -maxdepth 2 -type f | sort
-```
-
-`.nimble` から次を削除する。
-
-```diff
--bin = @["ic_sqlite"]
-```
-
-さらにソース内で `../vendor`, `../../vendor`, `ic-sqlite/...` 等の path をハードコードしていないか確認する。
-
-```bash
-grep -RInE 'ic-sqlite/|\.\./.*vendor|vendor/sqlite' \
-  --include='*.nim' --include='*.nims' --include='*.nimble' \
-  --include='*.sh' .
-```
+`currentSourcePath()` 基準なら、実際にimportされたpackage revision自身のpathを取得できる。
 
 ---
 
-## 7. 検証手順
+## 9. `config.nims` の役割
 
-### 7.1 package metadata の検証
+package rootの `config.nims` にconsumer link設定を依存させない。
 
-repository root で実行する。
+package repository自身のtest/build用 `config.nims` は維持してよいが、consumer distribution contractには含めない。
+
+理由:
+
+dependency packageの `config.nims` がconsumer projectに自動伝播することを前提にすると、build contextによって挙動が変わるため。
+
+link configurationは、importされるNim module内のpragmaで明示する。
+
+---
+
+## 10. build process
+
+### 10.1 SQLite archive生成
+
+`scripts/build_sqlite.sh` はSQLite本体だけのarchive生成を主目的とする。
+
+概念例:
 
 ```bash
-nimble check
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SQLITE_VERSION="3.53.4"
+readonly TARGET="wasm32-wasip1"
+readonly OUT_DIR="vendor/sqlite/${TARGET}"
+
+: "${WASI_SDK_PATH:?WASI_SDK_PATH is required}"
+
+CC="${WASI_SDK_PATH}/bin/clang"
+AR="${WASI_SDK_PATH}/bin/llvm-ar"
+
+mkdir -p "${OUT_DIR}/obj"
+
+"${CC}" \
+  --target="${TARGET}" \
+  -Os \
+  -std=c99 \
+  -c vendor/sqlite/sqlite3.c \
+  -o "${OUT_DIR}/obj/sqlite3.o" \
+  -DSQLITE_CORE \
+  -DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
+  -DSQLITE_ENABLE_API_ARMOR \
+  -DSQLITE_ENABLE_FTS5 \
+  -DSQLITE_USE_URI \
+  -DSQLITE_OS_OTHER=1 \
+  -DSQLITE_THREADSAFE=0 \
+  -DSQLITE_OMIT_WAL \
+  -DSQLITE_TEMP_STORE=3 \
+  -DSQLITE_OMIT_LOCALTIME \
+  -DSQLITE_OMIT_DEPRECATED \
+  -DSQLITE_OMIT_LOAD_EXTENSION \
+  -DSQLITE_OMIT_SHARED_CACHE \
+  -DSQLITE_DEFAULT_MEMSTATUS=0
+
+"${AR}" rcsD \
+  "${OUT_DIR}/libsqlite3_ic.a" \
+  "${OUT_DIR}/obj/sqlite3.o"
 ```
 
-次にローカルインストールを確認する。
+`llvm-ar rcsD` のdeterministic modeを利用し、CIでbinary reproducibilityを検証しやすくする。
+
+---
+
+## 11. build flagsの一元管理
+
+compile flagsをshell script内に直接重複記述し続けるのではなく、可能であれば
+
+```text
+vendor/sqlite/build-flags.txt
+```
+
+へ分離する。
+
+例:
+
+```text
+SQLITE_CORE
+SQLITE_DEFAULT_FOREIGN_KEYS=1
+SQLITE_ENABLE_API_ARMOR
+SQLITE_ENABLE_FTS5
+SQLITE_USE_URI
+SQLITE_OS_OTHER=1
+SQLITE_THREADSAFE=0
+SQLITE_OMIT_WAL
+SQLITE_TEMP_STORE=3
+SQLITE_OMIT_LOCALTIME
+SQLITE_OMIT_DEPRECATED
+SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_OMIT_SHARED_CACHE
+SQLITE_DEFAULT_MEMSTATUS=0
+```
+
+build scriptはこれを読み、
 
 ```bash
-nimble install
+-D<flag>
 ```
 
-### 7.2 import の確認
+へ変換する。
 
-一時ディレクトリで以下を作る。
+これにより、SQLite compile configurationそのものをversion-controlled metadataとして扱える。
 
-`test_import.nim`:
+---
+
+## 12. artifact metadata
+
+`manifest.json` を配置する。
+
+例:
+
+```json
+{
+  "package": "ic_sqlite",
+  "package_version": "0.1.0",
+  "sqlite_version": "3.53.4",
+  "target": "wasm32-wasip1",
+  "archive": "libsqlite3_ic.a",
+  "build_profile": "ic-canister",
+  "threadsafe": false,
+  "wal": false,
+  "fts5": true
+}
+```
+
+必要であれば以下も追加する。
+
+```json
+{
+  "wasi_sdk_version": "30.0",
+  "clang_version": "...",
+  "llvm_ar_version": "...",
+  "source_commit": "..."
+}
+```
+
+ただしGit checkout時には `source_commit` とarchive自体が同一commit内にあるため、commit hashは必須ではない。
+
+---
+
+## 13. checksum
+
+以下を生成する。
+
+```text
+vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+例:
+
+```text
+<sha256>  libsqlite3_ic.a
+```
+
+CIでは、
+
+```bash
+sha256sum -c vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+を実行する。
+
+---
+
+## 14. CI設計
+
+### 14.1 source test
+
+通常のNim testを実行する。
+
+### 14.2 prebuilt archive reproduction test
+
+CI上で、
+
+```bash
+cp vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a /tmp/committed.a
+
+./scripts/build_sqlite.sh
+
+cmp \
+  /tmp/committed.a \
+  vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+を実行する。
+
+deterministic archiveが完全再現できる場合はbinary compareを行う。
+
+環境差により完全binary reproducibilityが難しい場合は、少なくとも以下を検証する。
+
+- SQLite version
+- build-flags
+- archive target
+- exported symbol set
+- functional integration test
+
+### 14.3 symbol audit
+
+例:
+
+```bash
+llvm-nm vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+により、必要なSQLite symbolsが存在することを確認する。
+
+### 14.4 consumer integration test
+
+CI内で小さなconsumer projectを作る。
+
+例:
+
+```text
+integration/
+└── consumer/
+    ├── consumer.nimble
+    └── src/
+        └── main.nim
+```
+
+`main.nim`:
 
 ```nim
 import ic_sqlite
 
-echo IcSqliteVersion
+discard IcSqliteVersion
 ```
 
-実行:
+実際にcanister targetでcompileし、consumerが独自のlink path設定なしでbuildできることを確認する。
 
-```bash
-nim c -r test_import.nim
-```
-
-少なくともモジュール探索が成功し、`ic_sqlite` が import できることを確認する。
-
-### 7.3 Git URL からのクリーンインストール
-
-既存の develop link やローカル checkout に依存して成功するのを防ぐため、可能ならクリーンな Nimble home で試験する。
-
-```bash
-TMP_NIMBLE_DIR="$(mktemp -d)"
-NIMBLE_DIR="$TMP_NIMBLE_DIR" \
-  nimble install https://github.com/dumblepy/nim-ic-sqlite -y
-```
-
-Nimble のバージョンによって環境変数/オプション名が異なる場合は、その環境でサポートされる isolated package directory を使う。
-
-インストール後に別ディレクトリから再度 import test を実行する。
-
-### 7.4 `bin` が生成されないことの確認
-
-ライブラリなので `ic_sqlite` という CLI executable が `$HOME/.nimble/bin` 等に生成されないことを確認する。
-
-```bash
-command -v ic_sqlite && echo "unexpected binary" || true
-```
-
-### 7.5 依存関係の確認
-
-`nicp_cdk` が registry dependency として解決できるか確認する。
-
-```bash
-nimble install nicp_cdk
-```
-
-これが解決できない場合は `.nimble` の dependency を Git URL に変更する。
-
-### 7.6 test task
-
-```bash
-nimble test
-```
-
-`./scripts/test.sh` が repository root から正常に動くことを確認する。
+このtestが最も重要である。
 
 ---
 
-## 8. CI に追加すべきテスト
+## 15. GitHub Release設計
 
-GitHub Actions では、通常の source checkout 内での test だけでなく、**Git URL からの利用者視点の install test** を追加する。
+GitHub Releaseは主distribution channelではなく、補助distribution channelとする。
+
+### 15.1 Release artifact
+
+tag `v0.1.0` の場合:
+
+```text
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1.tar.gz
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1.tar.gz.sha256
+```
+
+tarball内容:
+
+```text
+ic-sqlite-prebuilt-v0.1.0-wasm32-wasip1/
+├── lib/
+│   └── libsqlite3_ic.a
+├── include/
+│   ├── sqlite3.h
+│   ├── ic_sqlite_vfs_shim.h
+│   └── sqlite_helpers.h
+├── manifest.json
+└── SHA256SUMS
+```
+
+### 15.2 Release用途
+
+Release artifactは以下に利用する。
+
+- Nim以外の言語・toolchainからの利用
+- CI cache
+- binary provenance確認
+- checksum検証
+- manual debugging
+- source checkout不要のbinary-only integration
+
+Nimble packageの通常利用ではdownload不要とする。
+
+---
+
+## 16. `nicp cHeaders` 方式との差異
+
+`nicp_cdk` の `cHeaders` はheaderをdownloadするためのcommandである。
+
+同様に `ic-sqlite libs` のようなcommandを作ることも技術的には可能だが、標準distribution方式にはしない。
+
+理由:
+
+1. binary artifactはsource revisionとの整合性要求が高い
+2. `main` branchからdownloadするとdependency revisionと一致しない可能性がある
+3. offline buildができなくなる
+4. GitHub availabilityへbuildが依存する
+5. checksum/version mappingを別途管理する必要がある
+
+`nicp cHeaders` 型commandを将来追加するとしても、
+
+```bash
+ic-sqlite fetch-prebuilt --version 0.1.0
+```
+
+のような明示的な補助commandとし、通常のNimble consumer pathでは使わない。
+
+---
+
+## 17. `humandebri/ic-sqlite-vfs` から参考にする点
+
+参考にすべき設計は2つある。
+
+### 17.1 precompiled SQLite archiveをsource packageに含める
+
+同projectはprecompiled SQLite static libraryをvendor directoryに含める設計を採用している。
+
+この考え方は `nim-ic-sqlite` にも適している。
+
+### 17.2 GitHub Releaseで最終Wasmを配布する
+
+最終canister/Wasmはtag release時にbuildし、Release artifactとして配布する。
+
+ただし `nim-ic-sqlite` はlibraryであり、consumer application自身が最終Wasmを生成する。
+
+したがって、`nim-ic-sqlite` がReleaseで配布すべき主artifactは最終Wasmではなく、再利用可能なSQLite static archiveである。
+
+---
+
+## 18. Nimble packageに含めるファイル
+
+Nimble install後に最低限以下が残る必要がある。
+
+```text
+src/**
+c/**
+vendor/sqlite/sqlite3.h
+vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+vendor/sqlite/wasm32-wasip1/manifest.json
+vendor/sqlite/wasm32-wasip1/SHA256SUMS
+```
+
+`sqlite3.c` をconsumer packageにも含めるかは選択肢である。
+
+### 案A: 含める
+
+利点:
+
+- sourceからarchiveを再build可能
+- source distributionとして完全
+- auditしやすい
+
+欠点:
+
+- package sizeが大きい
+
+### 案B: 含めない
+
+利点:
+
+- Nimble packageが小さくなる
+
+欠点:
+
+- installed package単体ではSQLite archiveを再生成できない
+
+初期段階では案Aを推奨する。
+
+理由は、prebuilt binaryを配布する以上、そのsourceを同revisionに含めておく方がprovenanceが明確だからである。
+
+---
+
+## 19. optional bundled build mode
+
+将来的には2モードを用意してもよい。
+
+### precompiled mode
+
+default:
+
+```text
+link vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a
+```
+
+### bundled mode
+
+developer/debug/reproducibility用:
+
+```text
+compile sqlite3.c at application build
+```
+
+例えばNim defineを使用する。
+
+```bash
+nim c -d:icSqliteBundled ...
+```
+
+概念コード:
+
+```nim
+when defined(icSqliteBundled):
+  {.compile: sqliteDir / "sqlite3.c".}
+else:
+  {.passL: artifactDir / "libsqlite3_ic.a".}
+```
+
+ただしSQLite compile flagsを `.compile` pragmaだけで完全再現できるようにする必要があるため、初期releaseではprecompiled onlyでもよい。
+
+---
+
+## 20. versioning policy
+
+以下が変更された場合はprebuilt archiveを必ず再生成する。
+
+- SQLite version
+- SQLite compile flags
+- WASI target
+- WASI SDK compatibility requirement
+- compiler options
+- `SQLITE_OS_OTHER`
+- thread mode
+- FTS/JSONなどcompile-time feature
+- ABIに影響するSQLite configuration
+
+`libsqlite3_ic.a` の変更は `nim-ic-sqlite` package version変更と一体で管理する。
+
+---
+
+## 21. security / supply chain
+
+prebuilt binaryをrepositoryに含めるため、以下をCIで保証する。
+
+- sourceがrepositoryに含まれる
+- build scriptがrepositoryに含まれる
+- build flagsがrepositoryに含まれる
+- checksumがrepositoryに含まれる
+- release artifactとrepository artifactが一致する
+- release buildはGitHub Actions等のCIで行う
+- tagとpackage versionを一致させる
+
+Release workflowでは、
+
+```text
+git checkout tag
+    |
+    v
+build libsqlite3_ic.a
+    |
+    v
+compare with committed archive
+    |
+    v
+run integration tests
+    |
+    v
+package
+    |
+    v
+upload release artifact
+```
+
+の順序とする。
+
+---
+
+## 22. failure policy
+
+consumer build時に `libsqlite3_ic.a` が存在しない場合、曖昧なlinker errorにせず、可能ならNim compile時に明示的に失敗させる。
 
 概念例:
 
-```yaml
-- name: Install package from Git URL
-  run: |
-    cd /tmp
-    nimble install https://github.com/dumblepy/nim-ic-sqlite -y
-
-- name: Compile external import smoke test
-  run: |
-    tmpdir="$(mktemp -d)"
-    cd "$tmpdir"
-    cat > main.nim <<'NIM'
-    import ic_sqlite
-    echo IcSqliteVersion
-    NIM
-    nim c -r main.nim
+```nim
+static:
+  if defined(wasm32):
+    doAssert fileExists(artifactDir / "libsqlite3_ic.a"),
+      "ic-sqlite prebuilt SQLite archive is missing: " &
+      artifactDir / "libsqlite3_ic.a"
 ```
 
-PR の checkout 自体を URL install したい場合は、default branch ではなく対象 commit/ref を指定できる形にして、CI が未マージ変更をテストするよう調整する。
+同様にheader/sourceの存在も必要に応じて検証する。
 
 ---
 
-## 9. 実行環境で今回確認できたこと / できなかったこと
+## 23. 非推奨案
 
-今回の実行環境でコマンドを実際に試した結果:
+### 23.1 毎回GitHub Releaseからdownload
 
-```text
-nimble --version
--> nimble: command not found
+非推奨。
 
-nim --version
--> nim: command not found
+理由:
 
-git ls-remote https://github.com/dumblepy/nim-ic-sqlite.git HEAD
--> Could not resolve host: github.com
-```
+- branch/commit dependencyとversionが一致しない
+- network-required buildになる
+- offline reproducibilityが低下する
 
-したがって、この環境では実際の `nimble install` の最終成功/失敗までは再現できなかった。
+### 23.2 `main` branch raw URLからdownload
 
-一方、GitHub 上の現在のファイルは確認できており、以下は確定している。
+強く非推奨。
 
-- repository root に `.nimble` はない。
-- `ic-sqlite/ic_sqlite.nimble` が存在する。
-- その `srcDir` は `src`。
-- `ic-sqlite/src/ic_sqlite.nim` が公開 entry module。
-- `.nimble` に `bin = @["ic_sqlite"]` が入っている。
-- README の現行 install 手順は `cd nim-ic-sqlite/ic-sqlite && nimble develop`。
+source dependencyがtag/commit固定でもbinaryだけ最新 `main` になる可能性がある。
+
+### 23.3 `.a/.o` すべてをrepositoryにcommit
+
+動作はするが推奨しない。
+
+shim/helper `.o` は小さく、sourceからconsumer build時に生成した方がABI同期が容易。
+
+### 23.4 consumerに絶対pathを書かせる
+
+非推奨。
+
+Nimble package install先は環境ごとに異なり、複数version coexistenceにも弱い。
 
 ---
 
-## 10. 結論
+## 24. 実装タスク
 
-目標が厳密に
+推奨実装順:
+
+1. target directoryを `wasm32-wasip1` に統一する。
+2. `libsqlite3_ic.a` をGit管理対象に変更する。
+3. `.o` はGit管理しない。
+4. `build-flags.txt` を追加する。
+5. `manifest.json` を追加する。
+6. `SHA256SUMS` を追加する。
+7. `src/ic_sqlite/ffi/linkage.nim` を実装する。
+8. `ic_sqlite.nim` から `linkage.nim` をimportする。
+9. consumer-side buildでC shim/helperが自動compileされることを確認する。
+10. consumer-side buildで `libsqlite3_ic.a` が自動linkされることを確認する。
+11. dummy consumer integration testをCIに追加する。
+12. release workflowを追加する。
+13. Release tarballを生成する。
+14. repository archiveとRelease archiveのchecksum一致を検証する。
+15. READMEへconsumer usageを記載する。
+
+---
+
+## 25. Acceptance Criteria
+
+以下をすべて満たせば本設計を完了とする。
+
+### install
 
 ```bash
 nimble install https://github.com/dumblepy/nim-ic-sqlite
 ```
 
-であるなら、**方針A: `ic-sqlite/` の package 本体を repository root に移す**ことを推奨する。
+またはbranch/tag/commit指定でinstallできる。
 
-最低限の修正は次の2点。
+### consumer source
 
-```text
-1. ic-sqlite/ic_sqlite.nimble と src/, scripts/, vendor 等の package 本体を repository root へ移動
-2. ic_sqlite.nimble の `bin = @["ic_sqlite"]` を削除
+```nim
+import ic_sqlite
 ```
 
-`srcDir = "src"` は、package 本体を丸ごと root に移す設計なら変更不要である。
+のみでC linkageに必要な設定が有効になる。
 
-ディレクトリを維持したいなら、URL を次に変更する。
+### consumer config
 
-```bash
-nimble install "https://github.com/dumblepy/nim-ic-sqlite?subdir=ic-sqlite"
-```
+consumer自身の `config.nims` に以下を書かなくてよい。
 
-こちらが Nimble の公式な subdirectory package の指定方法であり、最小変更で済む。
+- SQLite include path
+- shim include path
+- `libsqlite3_ic.a` path
+- shim `.o` path
+- helper `.o` path
+
+### network independence
+
+install後のapplication buildではGitHubから追加artifactをdownloadしない。
+
+### branch consistency
+
+branch dependencyを利用した場合、そのbranchのNim/C/binary artifactが一体で使用される。
+
+### release consistency
+
+Release assetに含まれる `libsqlite3_ic.a` とtag checkout内のarchiveが同一checksumである。
+
+### reproducibility
+
+CI上でprebuilt archiveがsourceとbuild flagsから再生成可能である。
 
 ---
 
-## 11. 実装記録（2026-10-01）
+## 26. 最終アーキテクチャ
 
-方針Aを採用し、パッケージ本体をリポジトリルートへ移動した。
+```text
+GitHub: dumblepy/nim-ic-sqlite
+|
++-- Nim source
+|
++-- C source
+|    +-- ic_sqlite_vfs_shim.c
+|    +-- sqlite_helpers.c
+|
++-- SQLite source/header
+|
++-- prebuilt
+|    +-- libsqlite3_ic.a
+|
++-- CI
+|    +-- rebuild SQLite archive
+|    +-- verify checksum
+|    +-- consumer integration test
+|
++-- GitHub Release
+     +-- versioned prebuilt tarball
+```
 
-### 進捗
+consumer:
 
-- [x] `ic-sqlite/` 配下のパッケージ本体をルートへ移動
-      (`src/`, `scripts/`, `tests/`, `examples/`, `benchmarks/`, `vendor/`, `c/`,
-      `build/`, `config.nims`, `ic_sqlite.nimble`, `LICENSE`)
-- [x] `bin = @["ic_sqlite"]` を削除
-- [x] ハードコードされた `/application/ic-sqlite` を `/application` へ更新
-- [x] `scripts/install.sh` の `repository_root` をルート基準 (`..`) へ修正
-- [x] `tests/config.nims` の `nicp_cdk` 探索をルート基準へ修正
-- [x] README のインストール手順を
-      `nimble install https://github.com/dumblepy/nim-ic-sqlite` へ更新
-- [x] CI / `.gitignore` / `AGENTS.md` の更新
-- [x] `./scripts/test.sh` による全検証
-- [x] `nimble install <URL>@#17-fix-dir` の検証と `nicp_cdk` の Git URL 依存化
+```text
+Nim application
+     |
+     | import ic_sqlite
+     v
+nim-ic-sqlite
+     |
+     +-- compile ic_sqlite_vfs_shim.c
+     +-- compile sqlite_helpers.c
+     +-- link libsqlite3_ic.a
+     |
+     v
+final canister Wasm
+```
 
-### 検証結果
+---
 
-- `nimble check` 成功。
-- ルートで `nimble install -y` が成功し、`bin` 未指定のため実行ファイルは生成されない。
-- 一時ディレクトリ（リポジトリ外）で `import ic_sqlite` をコンパイル・実行し `0.1.0` を確認。
-- ルートから `./scripts/test.sh` が完走: Testament `34/34` 成功、skip `0`、終了コード `0`。
-- `nimble install https://github.com/dumblepy/nim-ic-sqlite@#17-fix-dir`:
-  - クリーンな `NIMBLE_DIR` では `nicp_cdk` が registry 未登録のため失敗（3.4 節）。
-  - `requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"` へ変更後、
-    `nicp_cdk` を導入済みの環境では指定コマンド（リモートブランチ）も成功。
-  - 修正を `17-fix-dir` へプッシュ後 (`00721132`)、クリーンな `NIMBLE_DIR` で
-    指定コマンドが `EXIT=0`。`nicp_cdk` も Git URL から解決され、外部
-    `import ic_sqlite` が `0.1.0` を返すことを確認。
-  - 注意: Nimble は Git URL＋ブランチ単位で `pkgcache` を再利用するため、ブランチを
-    上書きした直後は古いキャッシュで失敗することがある。キャッシュ削除で解消。
+## 27. 推奨方針まとめ
 
-### 補足
+`nim-ic-sqlite` のC依存配布は、
 
-- パッケージ内部の相対パスは移動後も変わらないため、修正は絶対パスと
-  ルート位置を仮定した2箇所のパス計算に限定できた。
-- `nicp_cdk` の registry 解決可否はネットワーク非接続のため最終確認できない。
-  解決できない場合は 3.4 節に従い Git URL 依存へ切り替える。
+> SQLite本体だけをprebuilt static archiveとしてGit/Nimble packageに同梱し、IC固有shim/helperはC sourceで配布してconsumer build時にコンパイルする
+
+方式を採用する。
+
+GitHub Releaseは、同じprebuilt archiveをversioned artifactとして公開する補助distribution channelとする。
+
+この構成により、
+
+- Git branch / tag / commitとの整合性
+- offline build
+- ABI同期
+- consumer側設定の最小化
+- reproducible build
+- release provenance
+
+を同時に満たせる。

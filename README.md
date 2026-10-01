@@ -28,15 +28,19 @@ example additionally requires:
 
 The repository Dockerfile contains the complete toolchain used by CI.
 
-Before compiling a canister, build the target-specific SQLite link inputs:
+Before compiling a canister, ensure the prebuilt SQLite archive is present:
 
 ```sh
-WASI_SDK_PATH=/root/.wasi-sdk ./scripts/build_sqlite.sh
+WASI_SDK_PATH=/root/.wasi-sdk ./scripts/verify_prebuilt.sh
 ```
 
-This creates the SQLite archive and C shim objects under
-`vendor/sqlite/wasm32-wasi/`. The example canister configurations link from
-that directory, so they do not depend on transient files in `build/`.
+The repository commits `vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a` together
+with its `manifest.json` and `SHA256SUMS`. `verify_prebuilt.sh` rebuilds the
+archive from `vendor/sqlite/sqlite3.c` and `vendor/sqlite/build-flags.txt` and
+checks that the result is byte-for-byte reproducible. The archive is only about
+1.1 MiB, so it is tracked as a normal Git object; no extra tooling is needed to
+install the package. The IC VFS shim and the SQLite helpers are shipped as C
+source and compiled during the consumer build, so no `.o` files are committed.
 
 ## Install
 
@@ -45,6 +49,10 @@ Install the package directly from its Git repository:
 ```sh
 nimble install https://github.com/dumblepy/nim-ic-sqlite
 ```
+
+The prebuilt `libsqlite3_ic.a` is committed at the same Git revision, so the
+install fetches it as part of the normal clone; no extra download or tool is
+required.
 
 For local development, clone this repository and register the package with
 Nimble from the repository root:
@@ -60,6 +68,29 @@ Your Nim project can then import the public module:
 ```nim
 import ic_sqlite
 ```
+
+### C dependency linkage is automatic
+
+Importing `ic_sqlite` is all a consumer needs for the C dependency. The package
+resolves its own location and, for wasm32 canister builds, adds the SQLite
+include directories, compiles `c/ic_sqlite_vfs_shim.c` and
+`c/sqlite_helpers.c`, and links the prebuilt
+`vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a`.
+
+Do not add any of the following to a consumer `config.nims`:
+
+- SQLite include path
+- shim/helper include path
+- `libsqlite3_ic.a` path
+- shim/helper object paths
+
+The prebuilt archive is committed at the same Git revision as the Nim and C
+source, so branch, tag, and commit installs all use a matching archive. The
+build does not download anything after install.
+
+CI compiles [`integration/consumer/`](./integration/consumer/), a small canister
+that only does `import ic_sqlite`, to prove this works without consumer link
+configuration.
 
 ## Database initialization and migrations
 
@@ -435,11 +466,11 @@ submodule):
 ./scripts/test.sh
 ```
 
-The script installs the Nim package dependencies, runs native tests with
-Testament, builds the wasm32-wasi SQLite archive, and starts
-the local IC network for the example-canister integration test. The integration
-test verifies migrations, CRUD calls, and data persistence through a canister
-upgrade.
+The script installs the Nim package dependencies, verifies the committed
+wasm32-wasip1 SQLite archive is reproducible, runs native tests with Testament,
+and starts the local IC network for the example-canister integration test. The
+integration test verifies migrations, CRUD calls, and data persistence through a
+canister upgrade.
 
 Native tests use `VecStableBackend` to verify overlay, superblock, VFS, and
 MemoryManager logic without a local replica. The `MGR` layout, non-overlapping
@@ -451,10 +482,16 @@ explicit legacy offset) are covered by `tests/test_storage_mode.nim`.
 To build only the SQLite archive:
 
 ```sh
-./scripts/build_sqlite.sh
+WASI_SDK_PATH=/root/.wasi-sdk ./scripts/build_sqlite.sh
 ```
 
-Set `WASI_SDK_PATH` before running that command.
+To verify the committed archive is reproducible and to create a versioned
+release tarball:
+
+```sh
+WASI_SDK_PATH=/root/.wasi-sdk ./scripts/verify_prebuilt.sh
+./scripts/package_prebuilt.sh            # writes dist/*.tar.gz and .sha256
+```
 
 ## Nim / Rust comparison benchmarks
 

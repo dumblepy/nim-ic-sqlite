@@ -14,3 +14,14 @@ suite "ic_sqlite project scaffold":
       "examples/minimal_kv"
     ]:
       check dirExists(path)
+
+  test "prebuilt C distribution artifacts exist":
+    for path in [
+      "vendor/sqlite/build-flags.txt",
+      "vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a",
+      "vendor/sqlite/wasm32-wasip1/manifest.json",
+      "vendor/sqlite/wasm32-wasip1/SHA256SUMS",
+      "src/ic_sqlite/ffi/linkage.nim",
+      "integration/consumer/src/main.nim"
+    ]:
+      check fileExists(path)

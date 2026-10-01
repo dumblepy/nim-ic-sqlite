@@ -7,3 +7,10 @@ nimcache
 .diff
 /ic_sqlite
 /testresults/
+/dist/
+# Install whitelist helpers: symlinks so `nimble install` carries the
+# package-root `c/` and `vendor/` directories into the flattened install tree.
+!/src/c
+!/src/vendor
+# Prebuilt artifact checksum manifest (committed distribution metadata).
+!SHA256SUMS

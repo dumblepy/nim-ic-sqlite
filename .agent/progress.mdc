@@ -3,6 +3,11 @@
 最終ゴール: `nimble install https://github.com/dumblepy/nim-ic-sqlite` がクエリなしで成功し、
 `import ic_sqlite` が一貫して解決できるパッケージ構成にする（ブランチルールの方針A）。
 
+> 追記: ブランチルールは「C成果物 配布・リンク設計書」へ更新された。現在の
+> 最終ゴールは次とする: `import ic_sqlite` だけで C shim の自動 compile と
+> prebuilt `libsqlite3_ic.a` の自動 link が有効になり、consumer が SQLite 用の
+> パス設定を一切書かなくてよい構成にする（下記「C成果物 配布・リンク実装」）。
+
 ## 進捗
 
 - [x] プロジェクトルール・ブランチルール・現状構成の確認
@@ -93,3 +98,84 @@ Nimble は Git URL＋ブランチ単位で `/root/.nimble/pkgcache/<url>_<ref>` 
 ブランチが更新されても自動再取得しない場合がある。検証中、修正前 (`b371305`) の
 キャッシュが残っていて最初は古い依存のまま失敗した。キャッシュ削除後に再取得され
 成功した。ブランチを上書きした直後に検証する場合はキャッシュに注意する。
+
+## C成果物 配布・リンク実装（ブランチルール §24 タスク）
+
+ブランチルールが「nim-ic-sqlite C成果物 配布・リンク設計書」へ更新されたため、
+§24 の実装タスクを上から順に実施した。
+
+- [x] 1. target directory を `wasm32-wasip1` に統一
+      (`vendor/sqlite/wasm32-wasi/` → `vendor/sqlite/wasm32-wasip1/`)
+- [x] 2. `libsqlite3_ic.a` を Git 管理対象に変更（`*.o` のみ ignore）
+- [x] 3. `.o` は Git 管理しない（ビルド中間物は mktemp へ出力）
+- [x] 4. `vendor/sqlite/build-flags.txt` を追加
+- [x] 5. `vendor/sqlite/wasm32-wasip1/manifest.json` を追加
+- [x] 6. `vendor/sqlite/wasm32-wasip1/SHA256SUMS` を追加
+- [x] 7. `src/ic_sqlite/ffi/linkage.nim` を実装
+- [x] 8. `ic_sqlite.nim` から `linkage.nim` を import
+- [x] 9. consumer build で C shim/helper が自動 compile されることを確認
+- [x] 10. consumer build で `libsqlite3_ic.a` が自動 link されることを確認
+- [x] 11. dummy consumer integration test を CI に追加
+      (`integration/consumer/` + `ci.yml` の compile step)
+- [x] 12. release workflow を追加 (`.github/workflows/release.yml`)
+- [x] 13. Release tarball を生成 (`scripts/package_prebuilt.sh`)
+- [x] 14. repository archive と Release archive の checksum 一致を検証
+      (`package_prebuilt.sh` 内で `cmp`)
+- [x] 15. README へ consumer usage を記載
+
+## 調査結果・設計まとめ（追記）
+
+- `linkage.nim` は `currentSourcePath()` から package root を上方探索して
+  `vendor/sqlite/sqlite3.h` と `c/` を持つディレクトリを特定する。これにより
+  repository レイアウト (`src/ic_sqlite/ffi`) と `nimble install` の flatten
+  レイアウト (`<pkg>/ic_sqlite/ffi`) の両方で解決できる。
+- Nimble は whitelist mode（`installDirs`/`installExt` 指定時）で、global
+  install 時に `srcDir` を flatten する。package root の `c/`・`vendor/` を
+  同梱するため `installExt = @["nim"]` と `installDirs = @["c", "vendor"]` を
+  指定した。
+- `installDirs` は whitelist 検査では `srcDir` 基準、実際のコピーでは package
+  root 基準という二重解釈になる（nimble 0.24.1）。`src/c`・`src/vendor` を
+  `../c`・`../vendor` への symlink にして「Missing directory」prompt を回避。
+  symlink は `.gitignore` の例外で追跡対象にする。
+- prebuilt archive は `llvm-ar rcsD`（deterministic）で生成し、
+  `scripts/verify_prebuilt.sh` が再ビルドして byte 比較・checksum・symbol
+  audit を行う。
+- `config.nims`（root）は削除し、consumer/example の link 設定は linkage
+  module へ一本化した。examples と benchmark の `config.nims` から SQLite
+  の include/archive/`.o` 指定を削除した。
+
+## 検証結果（C成果物 配布・リンク）
+
+- `WASI_SDK_PATH=/root/.wasi-sdk ./scripts/verify_prebuilt.sh` 成功:
+  checksum OK、再ビルド `cmp` 一致、`manifest.json` target 一致、
+  `sqlite3_*` symbol audit OK。
+- `./scripts/package_prebuilt.sh` 成功: `dist/ic-sqlite-prebuilt-v0.1.0-
+  wasm32-wasip1.tar.gz` と `.sha256` を生成し、repository archive と一致。
+- `nimble install -y` 後のインストール先に `ic_sqlite.nim`・`ic_sqlite/`・
+  `c/`・`vendor/sqlite/wasm32-wasip1/libsqlite3_ic.a` が存在。
+- repository 外の一時 dir に `integration/consumer` をコピーし、
+  `nim c src/main.nim` が SQLite パス設定なしで成功（`ic_sqlite_register_vfs`
+  の link を確認）。
+- `examples/minimal_kv/backend` で `nicp developmentBuild` が成功（linkage に
+  よる C shim compile と archive link を確認）。
+- ネイティブ test (`test_project_layout`, `test_sqlite_api`, `test_vfs_exports`,
+  `test_db_api`) 成功。
+- `./scripts/test.sh` 全完走: `verify_prebuilt.sh` 成功、Testament
+  `34 / 34` 成功、skip `0`。`tests/test_example_canister.nim` を含み、
+  linkage 経由でビルドした kv_crud キャニスターの deploy / CRUD / upgrade が
+  成功した。終了コード `0`。
+
+## Git LFS 検討と撤回（追加要望）
+
+- 一時 `libsqlite3_ic.a` を Git LFS で管理する変更を入れた（`.gitattributes`、
+  CI の `lfs: true`、linkage / verify の pointer 検出）。
+- 検討の結果、`nimble install` は Git URL 依存を `git clone` で取得するため、
+  LFS 化すると consumer 環境に `git-lfs`（smudge 有効）が必須になることが判明。
+  「追加ツール無しで install」という目標と衝突する。
+- ユーザー判断により **LFS を撤回し、通常の Git object として管理** する方針へ
+  戻した。`.gitattributes` を削除し、CI の `lfs: true`、linkage / verify の
+  LFS pointer 検出、README / 設計の LFS 記述を撤去した。
+- archive は約 1.1 MiB で通常追跡に十分小さい。再現性は `verify_prebuilt.sh`
+  の再ビルド `cmp` と checksum で担保する。
+- LFS 撤回後の `./scripts/test.sh` 全完走: `34 / 34` 成功、skip `0`、終了コード `0`。
+  `nimble install` に git-lfs は不要。

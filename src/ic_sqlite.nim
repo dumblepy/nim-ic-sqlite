@@ -5,6 +5,7 @@
 
 import ic_sqlite/db
 import ic_sqlite/transaction
+import ic_sqlite/ffi/linkage
 import ic_sqlite/lifecycle
 import ic_sqlite/value
 import ic_sqlite/typed

@@ -1,0 +1,18 @@
+# SQLite compile-time configuration for the ICP canister build.
+# One flag per line, without the leading -D. Read by scripts/build_sqlite.sh.
+# Changing any flag here requires regenerating libsqlite3_ic.a (see
+# 17-fix-dir branch rule section 20).
+SQLITE_CORE
+SQLITE_DEFAULT_FOREIGN_KEYS=1
+SQLITE_ENABLE_API_ARMOR
+SQLITE_ENABLE_FTS5
+SQLITE_USE_URI
+SQLITE_OS_OTHER=1
+SQLITE_THREADSAFE=0
+SQLITE_OMIT_WAL
+SQLITE_TEMP_STORE=3
+SQLITE_OMIT_LOCALTIME
+SQLITE_OMIT_DEPRECATED
+SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_OMIT_SHARED_CACHE
+SQLITE_DEFAULT_MEMSTATUS=0

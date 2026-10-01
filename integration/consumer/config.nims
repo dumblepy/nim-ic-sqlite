@@ -1,9 +1,10 @@
+# Dummy consumer canister project.
+#
+# This project exists only for CI (17-fix-dir branch rule section 14.4). It
+# imports the public `ic_sqlite` module and provides no SQLite include path,
+# no C shim path, and no archive path. If it compiles, the package's own
+# linkage module has supplied every C build and link setting.
 import std/os
-
-# SQLite include paths, C shim compilation, and the prebuilt archive are set up
-# by ic_sqlite/ffi/linkage.nim when `import ic_sqlite` is used.
-let icSqliteRoot = "/application"
-switch("path", icSqliteRoot / "src")
 
 --mm: "orc"
 --threads: "off"
