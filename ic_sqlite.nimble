@@ -10,6 +10,7 @@ requires "nim >= 2.2.12"
 # Consumers building canisters provide nicp_cdk through their Nimble environment.
 # nicp_cdk is not published to the Nimble registry, so pin it as a Git URL
 # dependency to keep `nimble install <this repo>` self-contained.
+# requires "nicp_cdk >= 0.1.0"
 requires "https://github.com/dumblepy/nicp_cdk >= 0.1.0"
 
 task test, "Run the full test suite with Testament":
